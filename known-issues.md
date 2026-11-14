@@ -154,3 +154,15 @@ to reach it. Valid SPIR-V, wrong value, so a fix needs a produced-value read-bac
   right operand's struct and lowers the member of a value.
 - `(n, t) = 3;` is now rejected as "assigning to a comma expression is not lowered yet"
   (probe `comma_assignment_target_rejected`).
+
+## An overloaded helper's Linkage name depends on the overload set this unit sees (#266)
+
+A helper name with one signature in a unit keeps its plain Linkage name (`scaled`), as
+before. A name that has two or more signatures in the unit exports each as
+`name(parameter types)`, built from the canonical signature (`mixed(float3)`,
+`mixed(float,thread const int&)`). The choice is made per unit, so two units of one link
+have to see the same overloads of a name: a library that defines `f(float)` alone exports
+`f`, and a caller whose own headers also declare `f(float3)` imports `f(float)`, which
+does not meet it. Importing one overload of an overloaded name (declared here, defined in
+another unit) is refused for the same reason. Apple's own AIR symbols are Itanium-mangled
+for every function, which mslc does not follow.

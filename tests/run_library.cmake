@@ -296,6 +296,17 @@ endif()
 run_mslc(output 1 -o "${OUT_DIR}/helpers_executable.spv" "${helpers}")
 expect_contains("${output}" "no kernel, vertex or fragment entry point" "default mode on helpers")
 
+# Overloaded helpers (#266): one Linkage name per signature, and a plain name where there is one.
+set(overloads_spv "${OUT_DIR}/overloads.spv")
+file(REMOVE "${overloads_spv}")
+run_mslc(output 0 --compile-library -o "${overloads_spv}" "${TEST_DIR}/library/overloads.metal")
+validate_file("${overloads_spv}" spv1.5 TRUE "--compile-library on overloaded helpers")
+disassemble("${overloads_spv}" overloads_dis)
+expect_contains("${overloads_dis}" "LinkageAttributes \"mixed(float)\" Export" "overloaded helpers")
+expect_contains("${overloads_dis}" "LinkageAttributes \"mixed(float3)\" Export" "overloaded helpers")
+expect_contains("${overloads_dis}" "LinkageAttributes \"mixed(float,thread const int&)\" Export" "overloaded helpers")
+expect_contains("${overloads_dis}" "LinkageAttributes \"solo\" Export" "overloaded helpers")
+
 # The helpers link with a real shader into a valid Vulkan executable.
 set(linked_helpers "${OUT_DIR}/linked_helpers.spv")
 file(REMOVE "${linked_helpers}")
