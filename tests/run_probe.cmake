@@ -12,6 +12,18 @@
 #   // DISASM-ORDER: <text>      a later DISASM-ORDER line appears after this one
 #   // DISASM-MATCH: <regex>      spirv-dis output matches <regex>
 #   // DISASM-NO-MATCH: <regex>   spirv-dis output does not match <regex>
+#   // DISASM-CAPTURE: <regex>    matches <regex>, which holds capture groups, once
+#                                 in the spirv-dis output and keeps what each group
+#                                 matched. Groups are numbered $1, $2, ... across
+#                                 all CAPTURE lines in file order. Fails when the
+#                                 regex does not match or a group is empty.
+#   // DISASM-MATCH-CAPTURED: <regex>
+#                                 as DISASM-MATCH, after every $N in <regex> is
+#                                 replaced by the text group N captured, escaped
+#                                 so it matches literally. This is how a probe says
+#                                 two instructions name the same id, which a plain
+#                                 regex cannot. Fails when $N names a group no
+#                                 CAPTURE line produced.
 #   // DISASM-ASCENDING: <text>   every instruction starting with <text> lists ids
 #                                 that rise left to right; says nothing about the
 #                                 literal indices of the extracts that feed it
@@ -116,7 +128,7 @@ if(expectation STREQUAL "valid")
 	foreach(line IN LISTS disasmLines)
 		# The collectors below want a colon and exactly one space, except ORDER and the
 		# ENTRY kinds, which take any whitespace after the colon.
-		if(NOT line MATCHES "^// DISASM(-NOT|-MATCH|-NO-MATCH|-ASCENDING|-LANES|-BRANCH-FALLTHROUGH|-LOOP-MERGE-REACHED)?: "
+		if(NOT line MATCHES "^// DISASM(-NOT|-MATCH|-NO-MATCH|-CAPTURE|-MATCH-CAPTURED|-ASCENDING|-LANES|-BRANCH-FALLTHROUGH|-LOOP-MERGE-REACHED)?: "
 			AND NOT line MATCHES "^// DISASM-(ORDER|ENTRY-MODES|ENTRY-BUILTINS):[ \t]")
 			message(FATAL_ERROR "${name}: \"${line}\" is not a disassembly needle; the prefix is \"// DISASM<-KIND>: \" with a single space after the colon")
 		endif()
@@ -126,6 +138,8 @@ if(expectation STREQUAL "valid")
 	file(STRINGS "${PROBE}" unwanted REGEX "^// DISASM-NOT: ")
 	file(STRINGS "${PROBE}" wantedPatterns REGEX "^// DISASM-MATCH: ")
 	file(STRINGS "${PROBE}" unwantedPatterns REGEX "^// DISASM-NO-MATCH: ")
+	file(STRINGS "${PROBE}" captureNeedles REGEX "^// DISASM-CAPTURE: ")
+	file(STRINGS "${PROBE}" capturedPatterns REGEX "^// DISASM-MATCH-CAPTURED: ")
 	file(STRINGS "${PROBE}" ascendingNeedles REGEX "^// DISASM-ASCENDING: ")
 	file(STRINGS "${PROBE}" laneNeedles REGEX "^// DISASM-LANES: ")
 	file(STRINGS "${PROBE}" fallthroughNeedles REGEX "^// DISASM-BRANCH-FALLTHROUGH: ")
@@ -138,7 +152,7 @@ if(expectation STREQUAL "valid")
 	# below, since the REGEX above cannot see it.
 	file(STRINGS "${PROBE}" orderNeedles REGEX "^// DISASM-ORDER:[ \t]")
 	file(STRINGS "${PROBE}" malformedOrder REGEX "^// *DISASM-ORDER")
-	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR ascendingNeedles OR laneNeedles OR fallthroughNeedles OR loopMergeNeedles OR entryModeNeedles OR entryBuiltinNeedles OR orderNeedles OR malformedOrder)
+	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR captureNeedles OR capturedPatterns OR ascendingNeedles OR laneNeedles OR fallthroughNeedles OR loopMergeNeedles OR entryModeNeedles OR entryBuiltinNeedles OR orderNeedles OR malformedOrder)
 		if(NOT SPIRV_DIS)
 			message(FATAL_ERROR "${name}: spirv-dis not found; install SPIRV-Tools and re-run cmake")
 		endif()
@@ -181,6 +195,40 @@ if(expectation STREQUAL "valid")
 			string(REGEX MATCH "${needle}" found "${disassembly}")
 			if(NOT found STREQUAL "")
 				message(FATAL_ERROR "${name}: disassembly matches \"${needle}\":\n${disassembly}")
+			endif()
+		endforeach()
+		# Capture groups let one probe line name an id and a later line require the same
+		# id, which a regex has no backreference for. Groups are numbered across lines.
+		set(captureCount 0)
+		foreach(line IN LISTS captureNeedles)
+			string(REGEX REPLACE "^// DISASM-CAPTURE: " "" needle "${line}")
+			string(REGEX MATCH "${needle}" found "${disassembly}")
+			if(found STREQUAL "")
+				message(FATAL_ERROR "${name}: disassembly does not match \"${needle}\":\n${disassembly}")
+			endif()
+			foreach(group RANGE 1 9)
+				if(NOT DEFINED CMAKE_MATCH_${group} OR "${CMAKE_MATCH_${group}}" STREQUAL "")
+					break()
+				endif()
+				math(EXPR captureCount "${captureCount} + 1")
+				set(capture_${captureCount} "${CMAKE_MATCH_${group}}")
+			endforeach()
+		endforeach()
+		foreach(line IN LISTS capturedPatterns)
+			string(REGEX REPLACE "^// DISASM-MATCH-CAPTURED: " "" needle "${line}")
+			string(REGEX MATCHALL "[$][0-9]+" references "${needle}")
+			list(REMOVE_DUPLICATES references)
+			foreach(reference IN LISTS references)
+				string(SUBSTRING "${reference}" 1 -1 group)
+				if(group LESS 1 OR group GREATER captureCount)
+					message(FATAL_ERROR "${name}: \"${line}\" uses ${reference}, but only ${captureCount} groups were captured")
+				endif()
+				string(REGEX REPLACE "([^A-Za-z0-9_% ])" "\\\\\\1" escaped "${capture_${group}}")
+				string(REPLACE "${reference}" "${escaped}" needle "${needle}")
+			endforeach()
+			string(REGEX MATCH "${needle}" found "${disassembly}")
+			if(found STREQUAL "")
+				message(FATAL_ERROR "${name}: disassembly does not match \"${needle}\":\n${disassembly}")
 			endif()
 		endforeach()
 		# A regex cannot compare two ids, so the id order of a construct is checked
