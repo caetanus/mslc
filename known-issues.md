@@ -60,3 +60,17 @@ and update or remove this entry.
 for indium and is validated by `spirv-val`, but a driver may not implement it.
 Where a read-back is required for such a module, confirm the driver supports
 the addressing model before treating a failure as an mslc defect.
+
+## An anonymous enum's enumerator converts to a named enum (#261)
+
+`typedef enum { TA, TB } Anon; constant Mode km = TB;` (and the same through an
+argument, a brace leaf, a conditional or a return) compiles. Apple rejects it:
+"cannot initialize a variable of type 'const constant Mode' with an rvalue of
+type 'Anon'". `requireEnumValue` lets `"<anonymous>"` through at every target,
+because mslc cannot tell an untagged enumerator from the target enum's own one;
+closing it needs anonymous-enum identity tracking, which does not exist.
+Pinned by `tests/probes/enum_element_argument_and_brace_accepted.metal`.
+
+A file-scope enum constant initialised with a conditional
+(`constant Mode km = c ? MA : MB;`) is also refused as "not a value that can be
+worked out", where Apple accepts it; the folder has no conditional.

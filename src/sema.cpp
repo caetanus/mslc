@@ -6120,6 +6120,32 @@ namespace {
 
 			case ExpressionKind::Binary: return foldBinary(expression);
 			case ExpressionKind::Unary: return foldUnary(expression);
+			case ExpressionKind::Construct:
+				// (Mode)1, Mode(1) and static_cast<Mode>(1): the value converts to the
+				// enum's integer type, whatever enum or integer it was.
+				if (expression.constructType && !expression.constructType->enumName.empty()
+					&& !expression.constructType->isPointer && !expression.constructType->arrayLength
+					&& expression.arguments.size() == 1) {
+					FoldedConstant operand = foldExpression(*expression.arguments.front());
+					if (operand.isComposite) {
+						throw CompileError("a constant's initialiser has to be a value that can be worked out "
+							"from the declarations before it, and this is not one");
+					}
+					if (operand.scalar == ScalarKind::Bool) {
+						operand.integer = operand.boolean ? 1 : 0;
+						operand.scalar = ScalarKind::Int;
+					} else if (isFloatKind(operand.scalar)) {
+						// Converting a float outside the integer range is undefined in C++.
+						if (!(operand.number > -9.2e18 && operand.number < 9.2e18)) {
+							throw CompileError("a float outside the integer range cannot be converted to the enum "
+								+ expression.constructType->enumName + " in a constant");
+						}
+						operand.integer = static_cast<uint64_t>(static_cast<int64_t>(operand.number));
+						operand.scalar = ScalarKind::Int;
+					}
+					return convertConstant(operand, expression.constructType->scalar);
+				}
+				break;
 			default: break;
 		}
 
@@ -6699,6 +6725,10 @@ namespace {
 			throw CompileError("constexpr variable \"" + declaration.name
 				+ "\" must be initialized by a constant expression");
 		}
+		if (!declaration.type.enumName.empty() && declaration.initializer->kind != ExpressionKind::InitList) {
+			requireEnumValue(declaration.type.enumName, *declaration.initializer,
+				"the constant \"" + declaration.name + "\"");
+		}
 		_foldDomainError = false;
 		const FoldedConstant folded = foldInitializer(declaration.type, *declaration.initializer);
 		if (_foldDomainError && declaration.type.isConstexpr) {
@@ -6753,6 +6783,9 @@ namespace {
 		leaves.element = [&](const Type& leaf, const Expression* entry) {
 			if (!entry) {
 				return _types.zero(declaredTypeOf(leaf));
+			}
+			if (!leaf.enumName.empty()) {
+				requireEnumValue(leaf.enumName, *entry, "an element of the initializer list");
 			}
 			_foldDomainError = false;
 			const FoldedConstant folded = foldInitializer(leaf, *entry);
