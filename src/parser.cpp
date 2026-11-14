@@ -20,6 +20,31 @@ namespace {
 		return out;
 	}
 
+	// Whether the standard library has a namespace or enum "scope" ("metal", "metal::precise",
+	// "metal::access"), and a name in it: stdlib_names.inc holds one line per scope, led by it.
+	struct StdlibLookup {
+		bool scopeExists = false;
+		bool hasName = false;
+	};
+
+	StdlibLookup stdlibLookup(std::string_view scope, std::string_view name) {
+		static const std::string_view table =
+#include "stdlib_names.inc"
+			;
+		StdlibLookup result;
+		const std::string lead = std::string(scope) + " ";
+		const std::string needle = " " + std::string(name) + " ";
+		for (size_t at = 0; at < table.size();) {
+			const size_t end = std::min(table.find('\n', at), table.size());
+			const std::string line = " " + std::string(table.substr(at, end - at)) + " ";
+			if (line.compare(1, lead.size(), lead) == 0) {
+				result.scopeExists = true;
+				result.hasName = result.hasName || line.find(needle, lead.size()) != std::string::npos;
+			}
+			at = end + 1;
+		}
+		return result;
+	}
 
 	// Bare type keywords, mapped to their scalar kind. MSL spells these
 	// without a typedef, so they are lexed as identifiers and recognised here.
@@ -630,6 +655,31 @@ void Parser::parseUsing() {
 	}
 	expect(TokenKind::Semicolon, "after a using declaration");
 	const std::string resolved = resolveName(name);
+	// [namespace.udecl]: the library's namespace has to have the name, and each namespace on
+	// the way to it, as for any other one. A namespace the file added to metal is its own.
+	const std::string libraryPrefix = std::string(kStdlibNamespace) + "::";
+	if (resolved.rfind(libraryPrefix, 0) == 0 && !_declared.count(resolved)) {
+		std::string scope = kStdlibNamespace;
+		size_t at = libraryPrefix.size();
+		while (true) {
+			const size_t end = resolved.find("::", at);
+			const bool last = end == std::string::npos;
+			const std::string member = resolved.substr(at, last ? end : end - at);
+			const std::string inner = scope + "::" + member;
+			const bool libraryHas = stdlibLookup(scope, member).hasName;
+			const bool namespaceOfFile = _namespaces.count(inner) > 0;
+			if (last ? !libraryHas : !namespaceOfFile && !(libraryHas && stdlibLookup(inner, "").scopeExists)) {
+				throw CompileError(std::string(libraryHas || namespaceOfFile ? "\"" + inner + "\" is not a namespace"
+					: "no member named \"" + member + "\" in the namespace \"" + scope + "\"")
+					+ " (in the using declaration of \"" + resolved + "\")");
+			}
+			if (last) {
+				break;
+			}
+			scope = inner;
+			at = end + 2;
+		}
+	}
 	if (_blocks.empty() && !_declared.count(resolved) && resolved != "metal::discard_fragment") {
 		_scopes[scope].stdlibDeclarations.insert(name.parts.back());
 		return; // a name of the standard library, which is visible already
