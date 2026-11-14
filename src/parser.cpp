@@ -1548,7 +1548,7 @@ namespace {
 		return a.scalar == b.scalar && a.vectorWidth == b.vectorWidth
 			&& a.matrixColumns == b.matrixColumns && a.isPacked == b.isPacked
 			&& a.namedType == b.namedType && a.isConst == b.isConst
-			&& a.enumName == b.enumName;
+			&& a.enumName == b.enumName && a.isAtomic == b.isAtomic;
 	}
 
 	// Names the typedef and enum support has to keep distinct from everything else.
@@ -1622,6 +1622,7 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	out.isPacked = alias->second.isPacked;
 	out.namedType = alias->second.namedType;
 	out.enumName = alias->second.enumName;
+	out.isAtomic = alias->second.isAtomic;
 	out.isConst = out.isConst || alias->second.isConst;
 	return true;
 }
