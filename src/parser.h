@@ -276,7 +276,8 @@ private:
 	// opening parenthesis, so a file-scope constant still reaches its own parser.
 	bool tryParseHelperFunction();
 	size_t _functionOrder = 0;
-	VariableDeclaration parseGlobalDeclaration();
+	void parseGlobalDeclaration();
+	VariableDeclaration parseGlobalDeclarator(VariableDeclaration declaration);
 
 	// Reads a bare identifier used as a name, such as a struct field's.
 	void expectFieldName(std::string& out);
@@ -290,10 +291,13 @@ private:
 	// allowResource is true where a texture or sampler type may be spelled: an
 	// entry point parameter, and a local declaration, which only a sampler may be.
 	// allowAuto is true only for a local, the one place an auto type is lowered.
-	Type parseType(bool allowResource = false, bool allowAuto = false);
+	// base, when given, receives the type before any star, for the declarators that follow the first.
+	Type parseType(bool allowResource = false, bool allowAuto = false, Type* base = nullptr);
+	void parseDeclaratorStars(Type& type);
 	size_t parseSpecifierRun(Type& type);
 	void parseResourceType(Type& type);
 	bool parseQualifier(Type& type, bool afterPointer);
+	VariableDeclaration parseNextLocalDeclarator(const Type& base);
 	void parseSamplerLocal(VariableDeclaration& declaration);
 	void parseLocalInitializer(VariableDeclaration& declaration);
 	void parseAutoInitializer(VariableDeclaration& declaration);
