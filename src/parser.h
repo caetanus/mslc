@@ -233,6 +233,12 @@ private:
 	void parseNamespace(bool isInline = false);
 	void parseNamespaceAlias();
 	std::vector<std::string> inlineClosure(const std::string& scope) const;
+	// Whether "path" is a namespace: one the file declares, or the library's metal.
+	bool isNamespacePath(const std::string& path) const;
+	// How many leading parts of the name ahead spell the library's namespace metal by an
+	// alias (or by a leading "::"), and the tokens they take with the "::" after them; the
+	// plain, nearest "metal::" is the literal branches' and counts as none.
+	size_t libraryPrefixParts(const QualifiedName& name) const;
 	void parseUsing();
 
 	bool peekQualifiedName(QualifiedName& out) const;

@@ -610,7 +610,12 @@ void Parser::parseNamespaceAlias() {
 	}
 	expect(TokenKind::Semicolon, "after a namespace alias");
 	const std::string spelled = (spelledTarget.global ? "::" : "") + joinParts(spelledTarget.parts, 0, spelledTarget.parts.size());
-	const std::string target = namespaceOf(spelledTarget, spelledTarget.parts.size(), NamespaceLookup::NamespaceOnly);
+	std::string target = namespaceOf(spelledTarget, spelledTarget.parts.size(), NamespaceLookup::NamespaceOnly);
+	// A lone "metal" no file namespace answers for is the library's, and an alias of it
+	// carries that identity (kStdlibNamespace) through chains and nested aliases.
+	if (target.empty() && spelledTarget.parts.size() == 1 && spelledTarget.parts.front() == kStdlibNamespace) {
+		target = kStdlibNamespace;
+	}
 	if (target.empty()) {
 		throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
 	}
@@ -1996,6 +2001,28 @@ std::string Parser::namespacePrefix(size_t depth) const {
 	return joinParts(_namespacePath, 0, depth);
 }
 
+bool Parser::isNamespacePath(const std::string& path) const {
+	return path == kStdlibNamespace || _namespaces.count(path) > 0;
+}
+
+size_t Parser::libraryPrefixParts(const QualifiedName& name) const {
+	for (size_t count = 1; count < name.parts.size(); ++count) {
+		const bool literal = name.parts[0] == kStdlibNamespace && count == 1;
+		if (literal && !name.global) {
+			continue;
+		}
+		if (literal) {
+			return count;
+		}
+		QualifiedName prefix = name;
+		prefix.parts.resize(count);
+		if (namespaceOf(prefix, count, NamespaceLookup::NamespaceOnly) == kStdlibNamespace) {
+			return count;
+		}
+	}
+	return 0;
+}
+
 std::string Parser::canonicalNamespace(const std::string& path) const {
 	if (const auto alias = _namespaceAliases.find(path); alias != _namespaceAliases.end()) {
 		return alias->second;
@@ -2071,7 +2098,7 @@ std::string Parser::childNamespace(const std::string& scope, const std::string& 
 	// A struct, enum or typedef namespacesNamed found (not a namespace) is not an answer
 	// here, only a competitor for ambiguity above: whatever named it is resolved through
 	// resolveName's own fallback instead.
-	if (found.empty() || !_namespaces.count(*found.begin())) {
+	if (found.empty() || !isNamespacePath(*found.begin())) {
 		return std::string();
 	}
 	return *found.begin();
@@ -2208,10 +2235,10 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 	};
 	if (!name.global) {
 		if (const std::string candidate = blockQualifier(parts[0], mode); !candidate.empty()) {
-			return _namespaces.count(candidate) ? rest(candidate) : std::string();
+			return isNamespacePath(candidate) ? rest(candidate) : std::string();
 		}
 	} else if (const std::string candidate = aliasQualifier(name, mode); !candidate.empty()) {
-		return _namespaces.count(candidate) ? rest(candidate) : std::string();
+		return isNamespacePath(candidate) ? rest(candidate) : std::string();
 	}
 	// The innermost level that names the first part decides, and two namespaces at one
 	// level are ambiguous, as for every other unqualified lookup.
@@ -2245,6 +2272,16 @@ std::string Parser::resolveName(const QualifiedName& name, std::vector<std::stri
 		}
 		return *found.begin();
 	};
+
+	// An alias of the library's namespace spells its names as "::metal::" does.
+	if (const size_t library = libraryPrefixParts(name);
+		library && !(name.global && library == 1 && name.parts[0] == kStdlibNamespace)) {
+		QualifiedName canonical;
+		canonical.global = true;
+		canonical.parts.push_back(kStdlibNamespace);
+		canonical.parts.insert(canonical.parts.end(), name.parts.begin() + library, name.parts.end());
+		return resolveName(canonical);
+	}
 
 	const std::string& last = name.parts.back();
 	if (name.parts.size() == 1 && !name.global) {
