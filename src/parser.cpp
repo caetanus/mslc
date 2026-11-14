@@ -465,7 +465,7 @@ void Parser::parseDeclaration() {
 			|| isResourceTypeName(current().text)
 			|| (current().text == "metal" && lookahead().kind == TokenKind::ColonColon
 				&& lookahead(2).kind == TokenKind::Identifier && isResourceTypeName(lookahead(2).text)))) {
-		_unit.globals.push_back(parseGlobalDeclaration());
+		parseGlobalDeclaration();
 		return;
 	}
 
@@ -782,10 +782,11 @@ bool Parser::tryParseHelperFunction() {
 	return true;
 }
 
-VariableDeclaration Parser::parseGlobalDeclaration() {
+void Parser::parseGlobalDeclaration() {
 	VariableDeclaration declaration;
 
-	declaration.type = parseType(true);
+	Type base;
+	declaration.type = parseType(true, false, &base);
 
 	// A sampler is the one resource lowered at file scope, as an embedded sampler.
 	// Apple takes it with or without constexpr, in the constant address space or
@@ -806,7 +807,8 @@ VariableDeclaration Parser::parseGlobalDeclaration() {
 		declaration.name = qualify(std::string(advance().text));
 		declareName(declaration.name, "variable");
 		parseSamplerLocal(declaration);
-		return declaration;
+		_unit.globals.push_back(std::move(declaration));
+		return;
 	}
 
 	if (declaration.type.addressSpace != AddressSpace::Constant) {
@@ -822,6 +824,27 @@ VariableDeclaration Parser::parseGlobalDeclaration() {
 	declaration.name = qualify(std::string(advance().text));
 	declareName(declaration.name, "variable");
 
+	_unit.globals.push_back(parseGlobalDeclarator(std::move(declaration)));
+
+	// "constant float a = 1, b = a;" : the stars and brackets of the first name
+	// stay with it, and each further name starts from the shared type.
+	while (match(TokenKind::Comma)) {
+		VariableDeclaration another;
+		another.type = base;
+		parseDeclaratorStars(another.type);
+		if (kind() != TokenKind::Identifier) {
+			throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
+		}
+		another.name = qualify(std::string(advance().text));
+		declareName(another.name, "variable");
+		_unit.globals.push_back(parseGlobalDeclarator(std::move(another)));
+	}
+
+	expect(TokenKind::Semicolon, "after a file-scope declaration");
+}
+
+// The array suffix and the required initialiser of one file-scope constant.
+VariableDeclaration Parser::parseGlobalDeclarator(VariableDeclaration declaration) {
 	bool deduceLength = false;
 	if (at(TokenKind::LBracket)) {
 		if (declaration.type.isPointer || declaration.type.arrayLength) {
@@ -840,7 +863,6 @@ VariableDeclaration Parser::parseGlobalDeclaration() {
 		deduceArrayLength(declaration);
 	}
 
-	expect(TokenKind::Semicolon, "after a file-scope declaration");
 	return declaration;
 }
 
@@ -921,32 +943,49 @@ void Parser::parseStructBody(StructDecl& decl) {
 			continue;
 		}
 
-		StructField field;
-		field.type = parseType();
-		if (field.type.isAtomic && !field.type.isPointer) {
-			throw CompileError("an atomic member of a struct (\"" + decl.name + "\") is not lowered yet; "
-				"mslc lowers a device atomic_uint or atomic_int pointer parameter");
-		}
-		expectFieldName(field.name);
-		if (field.type.isStatic) {
-			throw CompileError("a static data member is not supported (\"" + field.name + "\" in \""
-				+ decl.name + "\")");
-		}
-		if (at(TokenKind::LParen)) {
-			throw CompileError("a member function is not lowered yet (\"" + field.name + "\" in \"" + decl.name + "\")");
-		}
-		if (field.name == "operator") {
-			throw CompileError("an operator overload is not lowered (in \"" + decl.name + "\")");
-		}
+		// "float x, y;" : each declarator after the first starts from the type
+		// before the first one's stars, and has its own attributes.
+		Type base;
+		const Type shared = parseType(false, false, &base);
+		for (bool first = true;; first = false) {
+			StructField field;
+			field.type = shared;
+			if (!first) {
+				field.type = base;
+				parseDeclaratorStars(field.type);
+			}
+			if (field.type.isAtomic && !field.type.isPointer) {
+				throw CompileError("an atomic member of a struct (\"" + decl.name + "\") is not lowered yet; "
+					"mslc lowers a device atomic_uint or atomic_int pointer parameter");
+			}
+			expectFieldName(field.name);
+			if (field.type.isStatic) {
+				throw CompileError("a static data member is not supported (\"" + field.name + "\" in \""
+					+ decl.name + "\")");
+			}
+			if (at(TokenKind::LParen)) {
+				throw CompileError("a member function is not lowered yet (\"" + field.name + "\" in \"" + decl.name + "\")");
+			}
+			if (field.name == "operator") {
+				throw CompileError("an operator overload is not lowered (in \"" + decl.name + "\")");
+			}
+			if (field.type.isPointer && (!first || at(TokenKind::Comma))) {
+				throw CompileError("a pointer member (\"" + field.name + "\" in \"" + decl.name + "\") declared "
+					"with several declarators is not lowered yet; declare each on its own line");
+			}
 
-		// An attribute list and an array suffix both open with a bracket, but an
-		// attribute list opens with two, which is what tells them apart.
-		if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
-			field.attributes = parseFieldAttributes();
+			// An attribute list and an array suffix both open with a bracket, but an
+			// attribute list opens with two, which is what tells them apart.
+			if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+				field.attributes = parseFieldAttributes();
+			}
+			decl.fields.push_back(std::move(field));
+			if (!match(TokenKind::Comma)) {
+				break;
+			}
 		}
 
 		match(TokenKind::Semicolon);
-		decl.fields.push_back(std::move(field));
 	}
 
 	expect(TokenKind::RBrace, "to close a struct body");
@@ -2640,7 +2679,28 @@ size_t Parser::parseSpecifierRun(Type& type) {
 	return words;
 }
 
-Type Parser::parseType(bool allowResource, bool allowAuto) {
+// The stars of one declarator. A star binds to the name it precedes, so in
+// "float *p, q;" the second declarator starts again from the type before the stars.
+void Parser::parseDeclaratorStars(Type& type) {
+	while (at(TokenKind::Star)) {
+		if (type.isPointer) {
+			throw CompileError("a pointer to a pointer is not supported");
+		}
+		advance();
+		type.isPointer = true;
+
+		while (parseQualifier(type, true)) {
+		}
+	}
+
+	// constexpr makes the variable const, and on a pointer that is the pointer
+	// rather than what it points at, which is what isConst means there.
+	if (type.isConstexpr && !type.isPointer) {
+		type.isConst = true;
+	}
+}
+
+Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	Type type;
 
 	// MSL writes the address space and the const qualifier in either order, and
@@ -2707,22 +2767,10 @@ Type Parser::parseType(bool allowResource, bool allowAuto) {
 	while (parseQualifier(type, false)) {
 	}
 
-	while (at(TokenKind::Star)) {
-		if (type.isPointer) {
-			throw CompileError("a pointer to a pointer is not supported");
-		}
-		advance();
-		type.isPointer = true;
-
-		while (parseQualifier(type, true)) {
-		}
+	if (base) {
+		*base = type;
 	}
-
-	// constexpr makes the variable const, and on a pointer that is the pointer
-	// rather than what it points at, which is what isConst means there.
-	if (type.isConstexpr && !type.isPointer) {
-		type.isConst = true;
-	}
+	parseDeclaratorStars(type);
 
 	if (auto length = tryParseArrayLength()) {
 		type.arrayLength = length;
@@ -3398,7 +3446,8 @@ StatementPtr Parser::parseStatement() {
 		if (looksLikeType) {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
-			declaration.type = parseType(true, true);
+			Type base;
+			declaration.type = parseType(true, true, &base);
 			if (declaration.type.arrayLength) {
 				throw CompileError("brackets are not allowed here; write the array length after the name, as float v[N]");
 			}
@@ -3458,30 +3507,18 @@ StatementPtr Parser::parseStatement() {
 				deduceArrayLength(declaration);
 			}
 
-			// "T a, b = 1, c;" declares each name with the type the first one has.
-			// A star binds to the name it precedes, so a pointer would need its own
-			// rule, and locals of pointer type are not lowered anyway.
+			// "T a, b = 1, c;" declares each name from the type before the first
+			// declarator's stars and brackets, which bind to that name alone.
 			while (at(TokenKind::Comma)) {
 				if (declaration.type.isAuto) {
 					throw CompileError("several declarators after auto are not lowered yet; Apple requires each to "
 						"deduce the same type, so declare each variable on its own line");
 				}
-				if (declaration.type.isPointer || declaration.type.arrayLength) {
-					throw CompileError("several declarators after a pointer or an array are not lowered yet");
-				}
 				advance();
 				auto next = std::make_unique<Statement>();
 				next->kind = StatementKind::DeclarationStatement;
 				next->line = line();
-				VariableDeclaration another;
-				another.type = declaration.type;
-				if (kind() != TokenKind::Identifier) {
-					throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
-				}
-				another.name = std::string(advance().text);
-				declareLocal(another.name);
-				parseLocalInitializer(another);
-				next->declaration = std::move(another);
+				next->declaration = parseNextLocalDeclarator(base);
 				_declaratorTail.push_back(std::move(next));
 			}
 
@@ -3496,6 +3533,35 @@ StatementPtr Parser::parseStatement() {
 	expect(TokenKind::Semicolon, "after an expression statement");
 
 	return statement;
+}
+
+// A declarator after the first in "T a, *b, c[2] = {...};", after its comma.
+VariableDeclaration Parser::parseNextLocalDeclarator(const Type& base) {
+	VariableDeclaration another;
+	if (at(TokenKind::Ampersand)) {
+		throw CompileError("a reference after the first declarator is not lowered yet; "
+			"references are not lowered in a declaration with several declarators");
+	}
+	another.type = base;
+	parseDeclaratorStars(another.type);
+	if (kind() != TokenKind::Identifier) {
+		throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
+	}
+	another.name = std::string(advance().text);
+	declareLocal(another.name);
+
+	bool deduceLength = false;
+	if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
+		if (another.type.isPointer) {
+			throw CompileError("an array of pointers is not lowered yet");
+		}
+		deduceLength = parseArrayDimensions(another.type);
+	}
+	parseLocalInitializer(another);
+	if (deduceLength) {
+		deduceArrayLength(another);
+	}
+	return another;
 }
 
 // A sampler declared in the shader: "constexpr sampler s(options);", with a
@@ -3694,6 +3760,7 @@ StatementPtr Parser::parseForStatement() {
 	expectKeyword("for", "at the start of a for");
 	expect(TokenKind::LParen, "after 'for'");
 
+	std::vector<StatementPtr> extraDeclarators;
 	{
 		Type probe;
 		size_t nameTokens = 0;
@@ -3710,7 +3777,8 @@ StatementPtr Parser::parseForStatement() {
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
-			declaration.type = parseType(false, true);
+			Type base;
+			declaration.type = parseType(false, true, &base);
 			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
 			if (declaration.type.isAuto && (declaration.type.isPointer || declaration.type.arrayLength)) {
 				throw CompileError("a pointer or an array declared with auto is not lowered yet");
@@ -3728,6 +3796,21 @@ StatementPtr Parser::parseForStatement() {
 				declaration.initializer = parseInitializerList();
 			}
 			statement->forInitializer = std::move(declaration);
+
+			// "for (int i = 0, j = 1; ...)" : the further declarators are declared
+			// ahead of the loop, in a block of its own, so the names stay its own.
+			while (at(TokenKind::Comma)) {
+				if (base.isAuto) {
+					throw CompileError("several declarators after auto are not lowered yet; Apple requires each "
+						"to deduce the same type, so declare each variable on its own line");
+				}
+				advance();
+				auto next = std::make_unique<Statement>();
+				next->kind = StatementKind::DeclarationStatement;
+				next->line = line();
+				next->declaration = parseNextLocalDeclarator(base);
+				extraDeclarators.push_back(std::move(next));
+			}
 		} else if (!at(TokenKind::Semicolon)) {
 			statement->expression = parseExpression();
 		}
@@ -3747,7 +3830,24 @@ StatementPtr Parser::parseForStatement() {
 
 	statement->forBody = parseBody();
 
-	return statement;
+	if (extraDeclarators.empty()) {
+		return statement;
+	}
+
+	auto block = std::make_unique<Statement>();
+	block->kind = StatementKind::Compound;
+	block->line = statement->line;
+	auto first = std::make_unique<Statement>();
+	first->kind = StatementKind::DeclarationStatement;
+	first->line = statement->line;
+	first->declaration = std::move(statement->forInitializer);
+	statement->forInitializer.reset();
+	block->children.push_back(std::move(first));
+	for (StatementPtr& extra: extraDeclarators) {
+		block->children.push_back(std::move(extra));
+	}
+	block->children.push_back(std::move(statement));
+	return block;
 }
 
 StatementPtr Parser::parseWhileStatement() {
