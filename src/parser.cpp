@@ -3055,6 +3055,15 @@ void Parser::parseResourceType(Type& type) {
 	std::string access = "sample";
 	if (match(TokenKind::Comma)) {
 		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
+			// A nearer namespace named metal supplies its own "access", not the library's (a file
+			// that reopens namespace metal itself has not shadowed anything).
+			QualifiedName qualifier;
+			qualifier.parts.push_back(std::string(current().text));
+			if (const std::string nearer = namespaceOf(qualifier, 1, NamespaceLookup::Qualifier);
+			!nearer.empty() && nearer != kStdlibNamespace) {
+				throw CompileError("\"metal::access\" names \"" + nearer + "::access\" here, not the library's "
+					"metal::access, which a texture's access qualifier has to be");
+			}
 			advance();
 			advance();
 		}
