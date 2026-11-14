@@ -1941,10 +1941,7 @@ std::set<std::string> Parser::namespacesNamed(const std::string& scope, const st
 		const std::string key = at.empty() ? part : at + "::" + part;
 		if (std::string found = canonicalNamespace(key); !found.empty()) {
 			own.insert(found);
-			if (!_namespaceAliases.count(key)) {
-				continue;
-			}
-			if (aliases) {
+			if (aliases && _namespaceAliases.count(key)) {
 				*aliases = true;
 			}
 		}
