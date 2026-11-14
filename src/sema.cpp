@@ -10203,6 +10203,9 @@ namespace {
 				// A helper is emitted once for each entry point that calls it, so the
 				// stage here is the caller's: OpKill in it drops that caller's fragment,
 				// and a helper called from a vertex or kernel function is refused below.
+				if (_entryPoint == &_libraryScope) {
+					throw StageError("discard_fragment() drops a fragment, which only a fragment function has");
+				}
 				if (_entryPoint->stage != Stage::Fragment) {
 					throw StageError(std::string("discard_fragment() is not allowed within a ")
 						+ (_entryPoint->stage == Stage::Vertex ? "vertex" : "kernel")

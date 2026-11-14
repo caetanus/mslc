@@ -431,6 +431,11 @@ expect_library_refused(implicit_lod_export
 expect_contains("${output}" "explicit level" "implicit_lod_export")
 expect_library_refused(barrier_export "void sync() { threadgroup_barrier(mem_flags::mem_none); }\n" "cannot be exported")
 expect_library_refused(discard_export "void kill() { discard_fragment(); }\n" "cannot be exported")
+expect_contains("${output}" "discard_fragment() drops a fragment, which only a fragment function has" "discard_export")
+string(FIND "${output}" "within a kernel" at)
+if(NOT at EQUAL -1)
+	message(FATAL_ERROR "discard_export: a library has no kernel, the diagnostic must not name one:\n${output}")
+endif()
 # An error that is not about the stage is passed through, not explained as one.
 function(expect_not_stage_error)
 	string(FIND "${output}" "does not know the stage" at)

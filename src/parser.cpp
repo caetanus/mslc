@@ -321,8 +321,7 @@ const Token& Parser::lookahead(size_t offset) const {
 bool Parser::isDiscardFragment(QualifiedName& name) const {
 	if (!peekQualifiedName(name) || name.parts.back() != "discard_fragment"
 		|| lookahead(name.tokens).kind != TokenKind::LParen
-		|| lookahead(name.tokens + 1).kind != TokenKind::RParen
-		|| (!name.global && name.parts.size() == 1 && isLocal("discard_fragment"))) {
+		|| lookahead(name.tokens + 1).kind != TokenKind::RParen) {
 		return false;
 	}
 	return resolveName(name) == "metal::discard_fragment";
