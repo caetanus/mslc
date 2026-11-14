@@ -452,6 +452,11 @@ void Parser::parseDeclaration() {
 		return;
 	}
 
+	if (atKeyword("template")) {
+		parseTemplateDeclaration();
+		return;
+	}
+
 	if (tryParseHelperFunction()) {
 		return;
 	}
@@ -714,13 +719,170 @@ void Parser::parseHelperParameters(FunctionDecl& decl, const std::string& quoted
 	expect(TokenKind::RParen, "to close a parameter list");
 }
 
+// Skips one bracketed group: the opener is the current token, and the token
+// after its closer is the current one on return.
+void Parser::skipBalanced(TokenKind open, TokenKind close) {
+	int depth = 0;
+	while (!at(TokenKind::EndOfFile)) {
+		if (at(open)) {
+			++depth;
+		} else if (at(close) && --depth == 0) {
+			advance();
+			return;
+		}
+		advance();
+	}
+	throw CompileError("unbalanced brackets in a template declaration");
+}
+
+// "template" at file scope: a function template. It is parsed far enough to know
+// its name and where it ends, and is not lowered. A body is only meaningful with
+// arguments (a dependent name has no type until then), so one that is never
+// instantiated needs nothing more, as in clang; a call to it is refused by the
+// emitter, never resolved to an unrelated overload.
+void Parser::parseTemplateDeclaration() {
+	advance();
+	if (!at(TokenKind::Less)) {
+		throw CompileError("an explicit template instantiation is not lowered");
+	}
+	if (lookahead().kind == TokenKind::Greater) {
+		throw CompileError("an explicit template specialization is not lowered; Apple accepts it, and "
+			"mslc refuses it so that the primary template is never silently used in its place");
+	}
+
+	// The parameter list, to its closing '>' at depth one. A default argument may
+	// hold angle brackets of its own, and ">>" closes two of them.
+	size_t templateDepth = 0;
+	do {
+		if (at(TokenKind::Less)) {
+			++templateDepth;
+		} else if (at(TokenKind::Greater)) {
+			--templateDepth;
+		} else if (at(TokenKind::ShiftRight)) {
+			if (templateDepth < 2) {
+				throw CompileError("unbalanced '>>' in a template parameter list");
+			}
+			templateDepth -= 2;
+		} else if (atKeyword("template")) {
+			throw CompileError("a template template parameter is not lowered");
+		} else if (at(TokenKind::Ellipsis)) {
+			throw CompileError("a template parameter pack is not lowered");
+		} else if (at(TokenKind::LParen)) {
+			skipBalanced(TokenKind::LParen, TokenKind::RParen);
+			continue;
+		} else if (at(TokenKind::EndOfFile)) {
+			throw CompileError("expected '>' to close a template parameter list");
+		}
+		advance();
+	} while (templateDepth > 0);
+
+	if (atKeyword("struct") || atKeyword("class") || atKeyword("union")) {
+		throw CompileError("a class template is not lowered");
+	}
+	if (atKeyword("using") || atKeyword("template")) {
+		throw CompileError("an alias template is not lowered");
+	}
+
+	// The declarator, up to the parameter list. The name is the identifier right before
+	// the first "(" outside angle brackets, and only a group that is followed by what a
+	// function can have after its parameters is taken as the list. Attributes are
+	// skipped whole, so their own parentheses are never mistaken for it. Any other shape
+	// (decltype or typeof in the return type, a parenthesised name) cannot be told apart
+	// from it by a rule, so it is refused: a wrong name would let a helper take the call.
+	std::string name;
+	size_t angles = 0;
+	for (;;) {
+		if (at(TokenKind::EndOfFile) || at(TokenKind::Semicolon) || at(TokenKind::LBrace)
+			|| at(TokenKind::Assign)) {
+			throw CompileError("a template declaration that is not a function is not lowered");
+		}
+		if (at(TokenKind::LParen)) {
+			if (angles == 0) {
+				break;
+			}
+			// A "(" inside the return type's own angle brackets, as in enable_if<(N > 2)>.
+			skipBalanced(TokenKind::LParen, TokenKind::RParen);
+			continue;
+		}
+		if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+			skipBalanced(TokenKind::LBracket, TokenKind::RBracket);
+			continue;
+		}
+		if (atKeyword("__attribute__") && lookahead().kind == TokenKind::LParen) {
+			advance();
+			skipBalanced(TokenKind::LParen, TokenKind::RParen);
+			continue;
+		}
+		if (atKeyword("operator")) {
+			throw CompileError("an operator template is not lowered");
+		}
+		if (at(TokenKind::Less)) {
+			++angles;
+		} else if (at(TokenKind::Greater) && angles > 0) {
+			--angles;
+		} else if (at(TokenKind::ShiftRight) && angles > 1) {
+			angles -= 2;
+		}
+		name = kind() == TokenKind::Identifier ? std::string(current().text) : std::string();
+		advance();
+	}
+	if (name.empty()) {
+		throw CompileError("a template declaration that is not a function is not lowered");
+	}
+	const auto notNameable = [&] {
+		return CompileError("the declarator of the template \"" + name + "\" is not a shape mslc can name "
+			"the function in (a decltype or typeof return type, or a parenthesised name); it is not lowered");
+	};
+	if (name == "decltype" || name == "__typeof__" || name == "typeof" || name == "sizeof"
+		|| name == "alignof" || name == "noexcept") {
+		throw notNameable();
+	}
+
+	skipBalanced(TokenKind::LParen, TokenKind::RParen);
+	if (!(at(TokenKind::EndOfFile) || at(TokenKind::LBrace) || at(TokenKind::Semicolon) || at(TokenKind::Assign)
+		|| at(TokenKind::Arrow) || atKeyword("__attribute__"))) {
+		throw notNameable();
+	}
+	// To the body or ';'. A real parameter list is never followed by a second group
+	// before a trailing return type, so one means the first was a decltype or a name.
+	while (!at(TokenKind::LBrace) && !at(TokenKind::Semicolon)) {
+		if (at(TokenKind::EndOfFile)) {
+			throw CompileError("expected a body or ';' after the template function \"" + name + "\"");
+		}
+		if (at(TokenKind::Arrow)) {
+			while (!at(TokenKind::LBrace) && !at(TokenKind::Semicolon) && !at(TokenKind::EndOfFile)) {
+				advance();
+			}
+			continue;
+		}
+		if (atKeyword("__attribute__") && lookahead().kind == TokenKind::LParen) {
+			advance();
+			skipBalanced(TokenKind::LParen, TokenKind::RParen);
+		} else if (at(TokenKind::LParen)) {
+			throw notNameable();
+		} else {
+			advance();
+		}
+	}
+	if (at(TokenKind::LBrace)) {
+		skipBalanced(TokenKind::LBrace, TokenKind::RBrace);
+	} else {
+		advance();
+	}
+
+	const std::string qualified = qualify(name);
+	if (const auto kinds = kindsOf(qualified); !kinds.empty() && std::any_of(kinds.begin(), kinds.end(),
+		[](std::string_view kindName) { return kindName != "function"; })) {
+		throw CompileError("the function template \"" + qualified + "\" shares its name with a type or a "
+			"variable, which is not lowered: a call spelled like a construction would not reach it");
+	}
+	declareName(qualified, "function");
+	_unit.functionTemplates.insert(qualified);
+}
+
 bool Parser::tryParseHelperFunction() {
 	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
 		return false;
-	}
-
-	if (atKeyword("template")) {
-		throw CompileError("a template is not lowered yet");
 	}
 
 	const size_t start = _position;
@@ -1414,6 +1576,10 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 }
 
 void Parser::declareName(const std::string& name, const char* what) {
+	if (_unit.functionTemplates.count(name) && std::string_view(what) != "function") {
+		throw CompileError("\"" + name + "\" is declared as " + what + " beside a function template of the "
+			"same name, which is not lowered: a call spelled like a construction would not reach the template");
+	}
 	// The simd names are global typedefs in Apple's compiler, so nothing at file
 	// scope can reuse one. The builtin MSL names are not: a struct may be called
 	// float2, and a typedef or an enumerator may not.
@@ -4670,6 +4836,11 @@ ExpressionPtr Parser::parsePrimary() {
 			negated->left = std::move(expression);
 			measure(*negated);
 			return negated;
+		}
+
+		if (_unit.functionTemplates.count(resolved) && lookahead(spelledTokens).kind == TokenKind::Less
+			&& !(spelledTokens == 1 && blockName(std::string(current().text)))) {
+			throw CompileError("explicit template arguments are not lowered yet (the call to \"" + resolved + "\")");
 		}
 
 		// A name that is also an MSL builtin is a plain identifier here. Whether

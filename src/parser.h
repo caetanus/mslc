@@ -275,6 +275,8 @@ private:
 	// restored, when the tokens ahead are not a function's return type, name and
 	// opening parenthesis, so a file-scope constant still reaches its own parser.
 	bool tryParseHelperFunction();
+	void parseTemplateDeclaration();
+	void skipBalanced(TokenKind open, TokenKind close);
 	size_t _functionOrder = 0;
 	void parseGlobalDeclaration();
 	VariableDeclaration parseGlobalDeclarator(VariableDeclaration declaration);
