@@ -286,6 +286,33 @@ add_test(NAME harness/unspaced_disasm_needle COMMAND ${CMAKE_COMMAND}
 set_tests_properties(harness/unspaced_disasm_needle PROPERTIES
 	PASS_REGULAR_EXPRESSION "DISASM-NOT:OpEntryPoint")
 
+# A capture reference to a group no DISASM-CAPTURE line produced, and a CAPTURE
+# regex that matches nothing, must each fail the probe rather than check nothing.
+foreach(case IN ITEMS unmatched_disasm_capture failed_disasm_capture empty_disasm_capture_group)
+	add_test(NAME harness/${case} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_VAL=${SPIRV_VAL}
+		-DSPIRV_DIS=${SPIRV_DIS}
+		-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/${case}.metal
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/harness
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
+endforeach()
+set_tests_properties(harness/unmatched_disasm_capture PROPERTIES
+	PASS_REGULAR_EXPRESSION "uses [$]2, but only 1 groups were captured")
+set_tests_properties(harness/failed_disasm_capture PROPERTIES
+	PASS_REGULAR_EXPRESSION "OpNoSuchInstruction")
+set_tests_properties(harness/empty_disasm_capture_group PROPERTIES
+	PASS_REGULAR_EXPRESSION "an optional group cannot be")
+
+# $10 must survive the replacement of $1; this one is expected to pass.
+add_test(NAME harness/capture_reference_ten COMMAND ${CMAKE_COMMAND}
+	-DMSLC=$<TARGET_FILE:mslc-cli>
+	-DSPIRV_VAL=${SPIRV_VAL}
+	-DSPIRV_DIS=${SPIRV_DIS}
+	-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/capture_reference_ten.metal
+	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/harness
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
+
 # The CLI's own paths: argument handling, --dump-tokens, and the exit codes. A
 # probe drives the library, so none of this runs otherwise, and --dump-tokens is
 # what a review reaches for when it has a lexing question.
