@@ -211,12 +211,13 @@ if(EXISTS "${OUT_DIR}/nonempty.spv")
 	message(FATAL_ERROR "--compile-library accepted a nonempty translation unit, or wrote output for a rejected one")
 endif()
 
+# A real kernel is a legal Linkage object too: it carries its entry point, and
+# an executable is only made by linking. What must not happen is a rejected
+# input leaving output behind, checked above with the nonempty file.
 set(realshader "${OUT_DIR}/library_kernel.metal")
 file(REMOVE "${OUT_DIR}/real.spv")
-run_mslc(output 1 --compile-library -o "${OUT_DIR}/real.spv" "${realshader}")
-if(EXISTS "${OUT_DIR}/real.spv")
-	message(FATAL_ERROR "--compile-library accepted a real shader, or wrote output for a rejected one")
-endif()
+run_mslc(output 0 --compile-library -o "${OUT_DIR}/real.spv" "${realshader}")
+validate_file("${OUT_DIR}/real.spv" spv1.5 TRUE "--compile-library on a kernel")
 
 # 8. A library links with a compiler-produced shader, and the result is a valid
 #    Vulkan executable. This is the property the capability exists for.
@@ -264,6 +265,46 @@ string(FIND "${disassembly}" "\"addone\"" at)
 if(at EQUAL -1)
 	message(FATAL_ERROR "the linked module lost the shader's entry point:\n${disassembly}")
 endif()
+
+# 10. A unit of helpers and no entry point (#330) is a Linkage object that exports
+#     each helper, default mode still refuses it, and it links with a shader.
+function(disassemble path out_variable)
+	execute_process(COMMAND "${SPIRV_DIS}" "${path}" OUTPUT_VARIABLE text ERROR_VARIABLE text)
+	set(${out_variable} "${text}" PARENT_SCOPE)
+endfunction()
+
+function(expect_contains text needle label)
+	string(FIND "${text}" "${needle}" at)
+	if(at EQUAL -1)
+		message(FATAL_ERROR "${label}: lacks \"${needle}\":\n${text}")
+	endif()
+endfunction()
+
+set(helpers "${TEST_DIR}/library/helpers_only.metal")
+set(helpers_spv "${OUT_DIR}/helpers_only.spv")
+file(REMOVE "${helpers_spv}")
+run_mslc(output 0 --compile-library -o "${helpers_spv}" "${helpers}")
+validate_file("${helpers_spv}" spv1.5 TRUE "--compile-library on helpers with no entry point")
+disassemble("${helpers_spv}" helpers_dis)
+expect_contains("${helpers_dis}" "OpCapability Linkage" "helpers library")
+expect_contains("${helpers_dis}" "LinkageAttributes \"scaled\" Export" "helpers library")
+expect_contains("${helpers_dis}" "LinkageAttributes \"scaled_twice\" Export" "helpers library")
+string(FIND "${helpers_dis}" "OpEntryPoint" at)
+if(NOT at EQUAL -1)
+	message(FATAL_ERROR "a library of helpers must declare no entry point:\n${helpers_dis}")
+endif()
+run_mslc(output 1 -o "${OUT_DIR}/helpers_executable.spv" "${helpers}")
+expect_contains("${output}" "no kernel, vertex or fragment entry point" "default mode on helpers")
+
+# The helpers link with a real shader into a valid Vulkan executable.
+set(linked_helpers "${OUT_DIR}/linked_helpers.spv")
+file(REMOVE "${linked_helpers}")
+execute_process(COMMAND "${SPIRV_LINK}" "${helpers_spv}" "${shader}" -o "${linked_helpers}"
+	RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE output)
+if(NOT status EQUAL 0)
+	message(FATAL_ERROR "spirv-link could not link the helpers with the shader:\n${output}")
+endif()
+validate_file("${linked_helpers}" vulkan1.3 TRUE "helpers linked with a shader")
 
 # 9. Each mode passes the target environment it claims.
 #
