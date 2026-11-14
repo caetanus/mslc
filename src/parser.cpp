@@ -726,6 +726,13 @@ void Parser::parseUsing() {
 		brought.insert(resolved);
 		return;
 	}
+	if (_blocks.back().sharesEnclosingScope && _blocks.size() >= 2) {
+		const auto& outer = _blocks[_blocks.size() - 2].names;
+		if (const auto found = outer.find(name.parts.back()); found != outer.end() && found->second != resolved) {
+			throw CompileError("the using declaration of \"" + resolved + "\" conflicts with \"" + name.parts.back()
+				+ "\" declared earlier in the same scope");
+		}
+	}
 	const auto [entry, inserted] = _blocks.back().names.emplace(name.parts.back(), resolved);
 	if (!inserted && entry->second != resolved) {
 		throw CompileError("the using declaration of \"" + resolved + "\" conflicts with \"" + name.parts.back()
@@ -989,7 +996,7 @@ bool Parser::tryParseHelperFunction() {
 		return true;
 	}
 
-	decl.body = parseCompoundStatement();
+	decl.body = parseCompoundStatement(true);
 	_unit.helpers.push_back(std::move(decl));
 	return true;
 }
@@ -1453,7 +1460,7 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 		return;
 	}
 
-	fn.body = parseCompoundStatement();
+	fn.body = parseCompoundStatement(true);
 	fn.isLocal = true;
 	if (!isConstructor) {
 		_unit.helpers.push_back(std::move(fn));
@@ -1758,6 +1765,12 @@ void Parser::declareLocal(const std::string& name) {
 
 	if (_blocks.empty()) {
 		return;
+	}
+	// The outermost block of a function or a for body is the same C++ scope as the
+	// parameters or the init declaration, so it cannot redeclare one. Lookup still walks
+	// the two blocks separately.
+	if (_blocks.back().sharesEnclosingScope && _blocks.size() >= 2 && _blocks[_blocks.size() - 2].names.count(name)) {
+		throw CompileError("redefinition of \"" + name + "\" in the same scope");
 	}
 	const auto [entry, inserted] = _blocks.back().names.emplace(name, "");
 	if (!inserted) {
@@ -3406,7 +3419,7 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 
 	// parseCompoundStatement consumes the opening brace itself, so consuming it
 	// here as well would make it look for a second one.
-	decl.body = parseCompoundStatement();
+	decl.body = parseCompoundStatement(true);
 
 	return decl;
 }
@@ -3515,13 +3528,14 @@ void Parser::appendStatement(std::vector<StatementPtr>& out) {
 	_declaratorTail.clear();
 }
 
-StatementPtr Parser::parseBody() {
+StatementPtr Parser::parseBody(bool sharesEnclosingScope) {
 	if (at(TokenKind::LBrace)) {
-		return parseCompoundStatement();
+		return parseCompoundStatement(sharesEnclosingScope);
 	}
 
 	const NestingScope scope(*this);
 	const LocalScope locals(*this);
+	_blocks.back().sharesEnclosingScope = sharesEnclosingScope;
 	StatementPtr body = parseStatement();
 	if (_declaratorTail.empty() && body->kind != StatementKind::DeclarationStatement) {
 		return body;
@@ -3540,12 +3554,13 @@ StatementPtr Parser::parseBody() {
 	return block;
 }
 
-StatementPtr Parser::parseCompoundStatement() {
+StatementPtr Parser::parseCompoundStatement(bool sharesEnclosingScope) {
 	const NestingScope scope(*this);
 	auto statement = std::make_unique<Statement>();
 	statement->kind = StatementKind::Compound;
 	statement->line = line();
 	const LocalScope locals(*this);
+	_blocks.back().sharesEnclosingScope = sharesEnclosingScope;
 
 	expect(TokenKind::LBrace, "to open a block");
 
@@ -4062,7 +4077,7 @@ StatementPtr Parser::parseForStatement() {
 	}
 	expect(TokenKind::RParen, "after a for header");
 
-	statement->forBody = parseBody();
+	statement->forBody = parseBody(true);
 
 	if (extraDeclarators.empty()) {
 		return statement;
