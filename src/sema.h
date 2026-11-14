@@ -40,6 +40,8 @@ private:
 	std::map<spirv::Id, MatrixInfo> _matrixInfo;
 	std::map<std::pair<spirv::Id, uint32_t>, spirv::Id> _arrays;
 	std::map<spirv::Id, spirv::Id> _arrayElement;
+	std::map<spirv::Id, uint32_t> _arrayLengths;
+	std::map<std::tuple<spirv::Id, uint32_t, uint32_t>, spirv::Id> _laidOutArrays;
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
@@ -84,6 +86,10 @@ public:
 	spirv::Id array(spirv::Id element, uint32_t length);
 	// The element type of an array this table made, or InvalidId for anything else.
 	spirv::Id arrayElement(spirv::Id type) const;
+	// The length of an array this table made, or 0 for anything else.
+	uint32_t arrayLength(spirv::Id type) const;
+	// An array of element with the given byte stride, as a laid-out struct holds one.
+	spirv::Id laidOutArray(spirv::Id element, uint32_t length, uint32_t stride);
 
 	// The image a texture2d, texturecube, texture3d or texture2d_array of float or
 	// half is declared as: a float sampled type, sampled by a sampler (Sampled 1),

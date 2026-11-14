@@ -974,6 +974,17 @@ void Parser::parseStructBody(StructDecl& decl) {
 					"with several declarators is not lowered yet; declare each on its own line");
 			}
 
+			// The brackets before the name, as in "float[2] a;", are not C++, and
+			// would otherwise be joined or dropped by the suffix read below.
+			if (field.type.arrayLength) {
+				throw CompileError("the array member \"" + field.name + "\" of \"" + decl.name
+					+ "\" puts its length before the name; write the length after it, as in float a[2]");
+			}
+			if (parseArrayDimensions(field.type)) {
+				throw CompileError("the array member \"" + field.name + "\" of \"" + decl.name
+					+ "\" needs a length: a member cannot be an array of unknown size");
+			}
+
 			// An attribute list and an array suffix both open with a bracket, but an
 			// attribute list opens with two, which is what tells them apart.
 			if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {

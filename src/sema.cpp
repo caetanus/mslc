@@ -87,6 +87,56 @@ namespace {
 		return (offset + alignment - 1) / alignment * alignment;
 	}
 
+	// The element a member is made of, before any array dimension: what Metal
+	// lays out for one scalar, vector or matrix of its type.
+	VectorLayout elementLayout(const Type& type) {
+		const uint32_t components = type.vectorWidth > 1 ? type.vectorWidth : 1;
+		const uint32_t scalarBytes = storageBytesOf(type.scalar);
+		return type.isMatrix() ? matrixLayoutFor(scalarBytes, type.matrixColumns, components)
+			: type.isPacked ? packedVectorLayoutFor(scalarBytes, components)
+			: vectorLayoutFor(scalarBytes, components);
+	}
+
+	// The byte step of each array dimension of a member, outermost first. An array
+	// steps by its element's size, which Metal has already rounded up to the
+	// element's alignment, so a float3[4] steps 16 and a float[4] steps 4.
+	std::vector<uint32_t> arrayStrides(const Type& type) {
+		std::vector<uint32_t> lengths;
+		if (type.arrayLength) {
+			lengths.push_back(*type.arrayLength);
+			lengths.insert(lengths.end(), type.innerArrayLengths.begin(), type.innerArrayLengths.end());
+		}
+
+		const VectorLayout element = elementLayout(type);
+		uint64_t stride = alignTo(element.size, element.alignment);
+		std::vector<uint32_t> strides(lengths.size());
+		for (size_t dimension = lengths.size(); dimension-- > 0;) {
+			strides[dimension] = static_cast<uint32_t>(stride);
+			stride *= lengths[dimension];
+			if (stride > UINT32_MAX) {
+				throw CompileError("an array member is larger than 4 GiB, which a buffer offset cannot hold");
+			}
+		}
+
+		return strides;
+	}
+
+	// A member's size and alignment in a laid-out struct: its element's alignment,
+	// and the element's step times every dimension for an array.
+	VectorLayout memberLayout(const Type& type) {
+		VectorLayout layout = elementLayout(type);
+		if (type.arrayLength) {
+			const std::vector<uint32_t> strides = arrayStrides(type);
+			const uint64_t size = uint64_t(strides.front()) * *type.arrayLength;
+			if (size > UINT32_MAX) {
+				throw CompileError("an array member is larger than 4 GiB, which a buffer offset cannot hold");
+			}
+			layout.size = static_cast<uint32_t>(size);
+		}
+
+		return layout;
+	}
+
 	bool isSignedInteger(ScalarKind kind) {
 		return kind == ScalarKind::Char || kind == ScalarKind::Short
 			|| kind == ScalarKind::Int || kind == ScalarKind::Long;
@@ -779,7 +829,21 @@ std::vector<Id> TypeTable::storageTypesFor(const std::string& name, const std::v
 	const StructDecl* decl = _unit.findStruct(name);
 	for (size_t i = 0; i < types.size(); ++i) {
 		const Type& field = decl->fields[i].type;
-		if (field.isPacked) {
+		if (field.arrayLength) {
+			// Only the array wrappers differ between the forms: a laid-out array
+			// carries ArrayStride, and the element is the same type in both.
+			const std::vector<uint32_t> strides = arrayStrides(field);
+			std::vector<uint32_t> lengths { *field.arrayLength };
+			lengths.insert(lengths.end(), field.innerArrayLengths.begin(), field.innerArrayLengths.end());
+			Id element = types[i];
+			for (size_t dimension = 0; dimension < lengths.size(); ++dimension) {
+				element = arrayElement(element);
+			}
+			for (size_t dimension = lengths.size(); dimension-- > 0;) {
+				element = laidOutArray(element, lengths[dimension], strides[dimension]);
+			}
+			types[i] = element;
+		} else if (field.isPacked) {
 			types[i] = packedStorage(field.scalar, field.vectorWidth);
 		} else if (field.scalar == ScalarKind::Bool && !field.isPointer && field.namedType.empty()) {
 			types[i] = boolStorage(types[i]);
@@ -795,6 +859,10 @@ const TypeTable::MatrixInfo* TypeTable::matrixInfo(Id type) const {
 }
 
 void TypeTable::decorateMatrixMember(Id structure, uint32_t member, Id type) {
+	// A matrix array's member carries the matrix's own ColMajor and MatrixStride.
+	for (Id element = arrayElement(type); element != InvalidId; element = arrayElement(type)) {
+		type = element;
+	}
 	const auto it = _matrixInfo.find(type);
 	if (it == _matrixInfo.end()) {
 		return;
@@ -1066,7 +1134,32 @@ spirv::Id TypeTable::array(spirv::Id element, uint32_t length) {
 	const Id id = _builder.emitDecl(spirv::OpTypeArray, { element, lengthId });
 	_arrays.emplace(key, id);
 	_arrayElement.emplace(id, element);
+	_arrayLengths.emplace(id, length);
 	return id;
+}
+
+// An array in a laid-out struct: the same element and length as array() and a
+// stride, which SPIR-V needs on a buffer's array and forbids on a Workgroup
+// one, so the value form and this are two types.
+spirv::Id TypeTable::laidOutArray(spirv::Id element, uint32_t length, uint32_t stride) {
+	const auto key = std::make_tuple(element, length, stride);
+	const auto cached = _laidOutArrays.find(key);
+	if (cached != _laidOutArrays.end()) {
+		return cached->second;
+	}
+
+	const Id lengthId = _builder.emitDeclTyped(spirv::OpConstant, scalar(ScalarKind::UInt), { length });
+	const Id id = _builder.emitDecl(spirv::OpTypeArray, { element, lengthId });
+	_builder.emit(spirv::OpDecorate, { id, static_cast<uint32_t>(spirv::Decoration::ArrayStride), stride });
+	_laidOutArrays.emplace(key, id);
+	_arrayElement.emplace(id, element);
+	_arrayLengths.emplace(id, length);
+	return id;
+}
+
+uint32_t TypeTable::arrayLength(spirv::Id type) const {
+	const auto found = _arrayLengths.find(type);
+	return found == _arrayLengths.end() ? 0 : found->second;
 }
 
 spirv::Id TypeTable::arrayElement(spirv::Id type) const {
@@ -1182,13 +1275,7 @@ uint32_t TypeTable::alignmentOf(Id type, bool packed) const {
 
 		uint32_t alignment = 1;
 		for (const StructField& field: decl->fields) {
-			const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
-			const uint32_t scalarBytes = storageBytesOf(field.type.scalar);
-			const VectorLayout layout = field.type.isMatrix()
-				? matrixLayoutFor(scalarBytes, field.type.matrixColumns, components)
-				: field.type.isPacked ? packedVectorLayoutFor(scalarBytes, components)
-				: vectorLayoutFor(scalarBytes, components);
-			alignment = std::max(alignment, layout.alignment);
+			alignment = std::max(alignment, memberLayout(field.type).alignment);
 		}
 
 		return alignment;
@@ -1340,7 +1427,7 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 		return false;
 	}
 
-	uint32_t offset = 0;
+	uint64_t offset = 0;
 	uint32_t alignment = 1;
 
 	for (const StructField& field: decl->fields) {
@@ -1349,21 +1436,36 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 				"a struct, which mslc cannot represent yet (\"" + field.name + "\")");
 		}
 
-		const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
-		const uint32_t scalarBytes = storageBytesOf(field.type.scalar);
-		const VectorLayout layout = field.type.isMatrix()
-			? matrixLayoutFor(scalarBytes, field.type.matrixColumns, components)
-			: field.type.isPacked ? packedVectorLayoutFor(scalarBytes, components)
-			: vectorLayoutFor(scalarBytes, components);
+		if (field.type.arrayLength && (field.type.isPacked || field.type.scalar == ScalarKind::Bool)) {
+			throw CompileError("the array member \"" + field.name + "\" of \"" + decl->name + "\" is an array of "
+				+ (field.type.isPacked ? "a packed vector" : "bool") + ", which mslc does not lay out yet");
+		}
+		if (field.type.arrayLength && field.type.isPointer) {
+			throw CompileError("the array member \"" + field.name + "\" of \"" + decl->name
+				+ "\" is an array of pointers, which mslc does not lower");
+		}
 
-		outTypes.push_back(field.type.isMatrix()
+		const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
+		const VectorLayout layout = memberLayout(field.type);
+
+		Id valueType = field.type.isMatrix()
 			? matrix(field.type.scalar, field.type.matrixColumns, field.type.vectorWidth)
 			: components > 1
 			? vector(field.type.scalar, field.type.vectorWidth)
-			: scalar(field.type.scalar));
+			: scalar(field.type.scalar);
+		if (field.type.arrayLength) {
+			for (auto inner = field.type.innerArrayLengths.rbegin(); inner != field.type.innerArrayLengths.rend(); ++inner) {
+				valueType = array(valueType, *inner);
+			}
+			valueType = array(valueType, *field.type.arrayLength);
+		}
+		outTypes.push_back(valueType);
 
-		offset = alignTo(offset, layout.alignment);
-		outOffsets.push_back(offset);
+		offset = (offset + layout.alignment - 1) / layout.alignment * layout.alignment;
+		if (offset + layout.size > UINT32_MAX) {
+			throw CompileError("struct \"" + decl->name + "\" is larger than 4 GiB, which a buffer offset cannot hold");
+		}
+		outOffsets.push_back(static_cast<uint32_t>(offset));
 		offset += layout.size;
 
 		// The struct's alignment is the largest among its members, and its size is
@@ -1372,7 +1474,11 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 		alignment = std::max(alignment, layout.alignment);
 	}
 
-	outSize = alignTo(offset, alignment);
+	offset = (offset + alignment - 1) / alignment * alignment;
+	if (offset > UINT32_MAX) {
+		throw CompileError("struct \"" + decl->name + "\" is larger than 4 GiB, which a buffer offset cannot hold");
+	}
+	outSize = static_cast<uint32_t>(offset);
 	return true;
 }
 
@@ -1420,16 +1526,22 @@ Id TypeTable::valueStruct(const std::string& name) {
 	_valueStructs.emplace(name, InvalidId);
 	std::vector<Id> fieldTypes;
 	for (const StructField& field: decl->fields) {
-		if (field.type.isPointer || field.type.arrayLength) {
-			throw CompileError(std::string(field.type.isPointer ? "a pointer" : "an array")
+		if (field.type.isPointer || (field.type.arrayLength && !field.type.namedType.empty())) {
+			throw CompileError(std::string(field.type.isPointer ? "a pointer" : "an array of structs")
 				+ " field in value struct \"" + name + "\" is not lowered yet");
 		}
-		const Id fieldType = !field.type.namedType.empty() ? valueStruct(field.type.namedType)
+		Id fieldType = !field.type.namedType.empty() ? valueStruct(field.type.namedType)
 			: field.type.isMatrix() ? matrix(field.type.scalar, field.type.matrixColumns, field.type.vectorWidth)
 			: field.type.vectorWidth > 1 ? vector(field.type.scalar, field.type.vectorWidth)
 			: scalar(field.type.scalar);
 		if (fieldType == InvalidId) {
 			throw CompileError("undeclared type \"" + field.type.namedType + "\"");
+		}
+		if (field.type.arrayLength) {
+			for (auto inner = field.type.innerArrayLengths.rbegin(); inner != field.type.innerArrayLengths.rend(); ++inner) {
+				fieldType = array(fieldType, *inner);
+			}
+			fieldType = array(fieldType, *field.type.arrayLength);
 		}
 		fieldTypes.push_back(fieldType);
 	}
@@ -2352,6 +2464,8 @@ namespace {
 		Id wordIndex(Id index, const char* what);
 		Id stepIndex(const Expression& expression, const char* what);
 		Id emitMember(const Expression& expression);
+		size_t arrayMemberRank(const Expression& expression, size_t& outIndices);
+		std::optional<Id> emitArrayMemberElement(const Expression& expression, bool asAddress);
 		Id emitMemberAddress(const Expression& expression, Id& outFieldType);
 
 		// The file-scope constant an expression names, or null when it names
@@ -2405,6 +2519,7 @@ namespace {
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id promotedTo(uint32_t components) const;
 		Id convert(Id value, Id fromType, Id toType);
+		Id convertArray(Id value, Id fromType, Id toType);
 		Id convertStruct(Id value, const TypeTable::StructForm& from, const TypeTable::StructForm& to, Id toType);
 		Id convertImplicit(Id value, Id toType);
 		Id asCondition(Id value);
@@ -2575,6 +2690,22 @@ namespace {
 	// pulled out of the source and the target is built from them, with a packed
 	// vector turned between the array of components a laid-out struct stores and
 	// the vector a local holds.
+	// An array of one form as the same array of the other: the elements are the
+	// same type, and only the array types differ, by the stride a laid-out one has.
+	Id Emitter::convertArray(Id value, Id fromType, Id toType) {
+		const Id fromElement = _types.arrayElement(fromType);
+		const Id toElement = _types.arrayElement(toType);
+		std::vector<uint32_t> elements;
+		for (uint32_t i = 0; i < _types.arrayLength(fromType); ++i) {
+			Id element = _builder.emitTyped(spirv::OpCompositeExtract, fromElement, { value, i });
+			if (fromElement != toElement) {
+				element = convertArray(element, fromElement, toElement);
+			}
+			elements.push_back(element);
+		}
+		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, elements);
+	}
+
 	Id Emitter::convertStruct(Id value, const TypeTable::StructForm& from,
 		const TypeTable::StructForm& to, Id toType) {
 		if (from.name != to.name) {
@@ -2587,7 +2718,9 @@ namespace {
 			Id member = _builder.emitTyped(spirv::OpCompositeExtract, from.declared[i],
 				{ value, static_cast<uint32_t>(i) });
 
-			if (from.declared[i] != to.declared[i] && _types.isBool(from.value[i])) {
+			if (from.declared[i] != to.declared[i] && _types.arrayElement(from.declared[i]) != InvalidId) {
+				member = convertArray(member, from.declared[i], to.declared[i]);
+			} else if (from.declared[i] != to.declared[i] && _types.isBool(from.value[i])) {
 				// A bool member is bytes in the laid-out form and a bool in the value
 				// form, whichever way the copy goes.
 				member = from.declared[i] == from.value[i]
@@ -2937,6 +3070,10 @@ namespace {
 		size_t depth = 0;
 		if (arrayRootBinding(expression, depth)) {
 			return emitLocalArrayIndex(expression, asAddress);
+		}
+
+		if (const auto element = emitArrayMemberElement(expression, asAddress)) {
+			return *element;
 		}
 
 		if (isElementAccess(expression)) {
@@ -3403,6 +3540,55 @@ namespace {
 			_types.withWidth(type, static_cast<uint32_t>(indices.size())), operands);
 	}
 
+	// The array member s.field[i][j] names, when the base of this index chain is a
+	// member of a struct and the field is an array: its rank, else zero.
+	size_t Emitter::arrayMemberRank(const Expression& expression, size_t& outIndices) {
+		outIndices = 0;
+		const Expression* base = &expression;
+		while (base->kind == ExpressionKind::Index) {
+			++outIndices;
+			base = base->left.get();
+		}
+		if (base->kind != ExpressionKind::Member) {
+			return 0;
+		}
+		const StructDecl* decl = structOf(*base->left);
+		if (!decl) {
+			return 0;
+		}
+		std::string declName;
+		const size_t field = fieldIndexOf(*decl, base->memberName, declName);
+		return field == decl->fields.size() ? 0 : decl->fields[field].type.arrayRank();
+	}
+
+	// s.field[i]: the index is a step of the member's own access chain. With more
+	// indices than the member has dimensions, the extra ones index its element,
+	// and the inner expression arrives here with exactly the dimensions. Nothing
+	// when the expression is not an index into an array member.
+	std::optional<Id> Emitter::emitArrayMemberElement(const Expression& expression, bool asAddress) {
+		size_t indices = 0;
+		const size_t rank = arrayMemberRank(expression, indices);
+		if (rank == 0 || indices > rank) {
+			return std::nullopt;
+		}
+		if (indices < rank) {
+			throw CompileError("an array member indexed this far is still an array, which is not a value: "
+				"index it down to an element");
+		}
+		Id fieldType = InvalidId;
+		const Id address = emitMemberAddress(expression, fieldType);
+		if (asAddress) {
+			return address;
+		}
+		std::string rootName;
+		std::vector<AccessStep> steps;
+		accessChain(expression, rootName, steps);
+		const auto root = _bindings.find(rootName);
+		return root != _bindings.end() && (root->second.bufferPointeeType != InvalidId
+				|| root->second.storageClass == spirv::StorageClass::PhysicalStorageBuffer)
+			? loadFromBuffer(address, fieldType) : loadFrom(address, fieldType);
+	}
+
 	Id Emitter::emitMember(const Expression& expression) {
 		if (!structOf(*expression.left)) {
 			return emitSwizzle(expression);
@@ -3499,9 +3685,22 @@ namespace {
 		}
 
 		outFieldType = InvalidId;
+		bool inMember = false;
 
 		for (const AccessStep& step: steps) {
 			if (step.isIndex) {
+				// An element of an array member: one more step of the same chain, in
+				// whichever storage class the struct lives.
+				if (inMember && current.arrayLength) {
+					if (const auto literal = literalIndex(*step.index); literal && *literal >= *current.arrayLength) {
+						throw CompileError("the index " + std::to_string(*literal) + " is outside the array member of "
+							+ std::to_string(*current.arrayLength));
+					}
+					operands.push_back(stepIndex(*step.index, "array element"));
+					current.dropOuterDimension();
+					continue;
+				}
+
 				// Only a pointer names a buffer, and only a buffer is an array. A
 				// struct reached directly is one value, whether through a reference
 				// or through the address a buffer of scalars put in a register.
@@ -3529,7 +3728,7 @@ namespace {
 			}
 
 			// "p->m" on a pointer parameter bound to a local array names element zero.
-			if (!fromBuffer && current.arrayLength && isLocalStorage(binding.storageClass)) {
+			if (!fromBuffer && !inMember && current.arrayLength && isLocalStorage(binding.storageClass)) {
 				if (!step.isArrow) {
 					throw CompileError("\"" + rootName + "\" is an array, so \"." + step.memberName
 						+ "\" needs an element: index it, as " + rootName + "[i]." + step.memberName);
@@ -3554,10 +3753,15 @@ namespace {
 
 			operands.push_back(constantU32(static_cast<uint32_t>(field)));
 			current = decl->fields[field].type;
+			inMember = true;
 		}
 
-		if (current.namedType.empty() && steps.back().isIndex) {
+		if (current.namedType.empty() && steps.back().isIndex && !inMember) {
 			throw CompileError("a member access has to end at a struct field");
+		}
+		if (current.arrayLength) {
+			throw CompileError("an array member is used as a whole value, "
+				"which mslc does not lower; index it down to an element");
 		}
 
 		outFieldType = declaredTypeOf(current);
@@ -3900,6 +4104,11 @@ namespace {
 			if (decl.hasConstructors) {
 				throw CompileError("brace initialization of " + spelled + " with declared constructors is not lowered yet");
 			}
+			const bool hasArrayMember = std::any_of(decl.fields.begin(), decl.fields.end(),
+				[](const StructField& field) { return field.type.arrayLength.has_value(); });
+			if (hasArrayMember && list.elements.empty()) {
+				return _types.zero(toType);
+			}
 			std::optional<Id> singleValue;
 			if (list.elements.size() == 1 && list.elements.front().fieldName.empty()
 				&& list.elements.front().value->kind != ExpressionKind::InitList) {
@@ -3908,6 +4117,10 @@ namespace {
 				if (sourceName && *sourceName == target.namedType) {
 					return convertImplicit(*singleValue, toType);
 				}
+			}
+			if (hasArrayMember) {
+				throw CompileError("brace initialization of " + spelled + ", which has an array member, "
+					"is not lowered yet; assign the members one by one");
 			}
 			Expression empty;
 			empty.kind = ExpressionKind::InitList;
