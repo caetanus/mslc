@@ -422,12 +422,26 @@ function(expect_library_refused label source needle)
 	file(REMOVE "${OUT_DIR}/refused_${label}.spv")
 	run_mslc(output 1 --compile-library -o "${OUT_DIR}/refused_${label}.spv" "${OUT_DIR}/refused_${label}.metal")
 	expect_contains("${output}" "${needle}" "${label}")
+	set(output "${output}" PARENT_SCOPE)
 endfunction()
 
 expect_library_refused(fwidth_export "float edge(float v) { return fwidth(v); }\n" "cannot be exported")
 expect_library_refused(implicit_lod_export
-	"float4 look(texture2d<float> t, sampler s, float2 uv) { return t.sample(s, uv); }\n" "explicit level")
+	"float4 look(texture2d<float> t, sampler s, float2 uv) { return t.sample(s, uv); }\n" "cannot be exported")
+expect_contains("${output}" "explicit level" "implicit_lod_export")
+expect_library_refused(barrier_export "void sync() { threadgroup_barrier(mem_flags::mem_none); }\n" "cannot be exported")
+expect_library_refused(discard_export "void kill() { discard_fragment(); }\n" "cannot be exported")
+# An error that is not about the stage is passed through, not explained as one.
+function(expect_not_stage_error)
+	string(FIND "${output}" "does not know the stage" at)
+	if(NOT at EQUAL -1)
+		message(FATAL_ERROR "a non-stage error was explained as a stage error:\n${output}")
+	endif()
+endfunction()
 expect_library_refused(unrelated_error_unwrapped "float bad(float v) { return undeclared_name; }\n" "undeclared_name")
+expect_not_stage_error()
+expect_library_refused(unrelated_error_nothere "float g(float v) { return v + nothere; }\n" "nothere")
+expect_not_stage_error()
 expect_library_refused(pointer_export "float first(thread float* p) { return p[0]; }\n" "pointer parameter")
 expect_library_refused(pointer_import
 	"float first(thread float* p);\nkernel void k(device float* o [[buffer(0)]]) { float a[2] = {1.0, 2.0}; o[0] = first(a); }\n"
@@ -437,8 +451,10 @@ expect_library_refused(pointer_import
 # symbols: each is a diagnostic, never a crash (run_mslc fails on a signal).
 expect_library_refused(metal_prototype_qualified
 	"namespace metal { float myfunc(float v); }\nfloat g(float v) { return metal::myfunc(v); }\n" "myfunc")
+expect_not_stage_error()
 expect_library_refused(metal_prototype_unqualified
 	"namespace metal { float myfunc(float v); }\nfloat g(float v) { return myfunc(v); }\n" "myfunc")
+expect_not_stage_error()
 expect_library_refused(member_declared_only
 	"struct S { float v; float get() const; };\nfloat use(S s) { return s.get(); }\n" "get")
 
