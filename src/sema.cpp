@@ -6183,6 +6183,39 @@ namespace {
 
 			case ExpressionKind::Binary: return foldBinary(expression);
 			case ExpressionKind::Unary: return foldUnary(expression);
+			case ExpressionKind::Construct:
+				// (Mode)1, Mode(1) and static_cast<Mode>(1): the value converts to the
+				// enum's integer type, whatever enum or integer it was.
+				if (expression.constructType && !expression.constructType->enumName.empty()
+					&& !expression.constructType->isPointer && !expression.constructType->arrayLength
+					&& expression.arguments.size() == 1) {
+					FoldedConstant operand = foldExpression(*expression.arguments.front());
+					if (operand.isComposite) {
+						throw CompileError("a constant's initialiser has to be a value that can be worked out "
+							"from the declarations before it, and this is not one");
+					}
+					if (operand.scalar == ScalarKind::Bool) {
+						operand.integer = operand.boolean ? 1 : 0;
+						operand.scalar = ScalarKind::Int;
+					} else if (isFloatKind(operand.scalar)) {
+						// A truncated value outside the enum's underlying type is undefined in C++, and
+						// Apple folds it through LLVM's undefined-behaviour rules; refuse it.
+						const ScalarKind underlying = expression.constructType->scalar;
+						const int width = mappingFor(underlying).width;
+						const bool isSigned = isSignedInteger(underlying);
+						const double truncated = std::trunc(operand.number);
+						// An enum with no negative enumerator has an unsigned type in Apple's compiler
+						// whatever mslc records, so a negative value is refused as well.
+						if (!(truncated >= 0.0 && truncated < std::ldexp(1.0, isSigned ? width - 1 : width))) {
+							throw CompileError("a float whose value does not fit the non-negative range of the enum "
+								+ expression.constructType->enumName + " cannot be converted to it in a constant");
+						}
+						operand.integer = static_cast<uint64_t>(truncated);
+						operand.scalar = ScalarKind::Int;
+					}
+					return convertConstant(operand, expression.constructType->scalar);
+				}
+				break;
 			default: break;
 		}
 
@@ -6762,6 +6795,10 @@ namespace {
 			throw CompileError("constexpr variable \"" + declaration.name
 				+ "\" must be initialized by a constant expression");
 		}
+		if (!declaration.type.enumName.empty() && declaration.initializer->kind != ExpressionKind::InitList) {
+			requireEnumValue(declaration.type.enumName, *declaration.initializer,
+				"the constant \"" + declaration.name + "\"");
+		}
 		_foldDomainError = false;
 		const FoldedConstant folded = foldInitializer(declaration.type, *declaration.initializer);
 		if (_foldDomainError && declaration.type.isConstexpr) {
@@ -6816,6 +6853,9 @@ namespace {
 		leaves.element = [&](const Type& leaf, const Expression* entry) {
 			if (!entry) {
 				return _types.zero(declaredTypeOf(leaf));
+			}
+			if (!leaf.enumName.empty()) {
+				requireEnumValue(leaf.enumName, *entry, "an element of the initializer list");
 			}
 			_foldDomainError = false;
 			const FoldedConstant folded = foldInitializer(leaf, *entry);

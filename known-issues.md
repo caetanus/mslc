@@ -81,3 +81,31 @@ Not supported: atomic pointers received as helper parameters, atomics held in
 struct members, a `device atomic_uint&` reference, pointer arithmetic on the
 atomic pointer, threadgroup atomic arrays, `atomic<uint>`, and an alias
 declared with `using A = atomic_uint` (a `typedef` alias is supported).
+
+## An anonymous enum's enumerator converts to a named enum (#261)
+
+`typedef enum { TA, TB } Anon; constant Mode km = TB;` (and the same through an
+argument, a brace leaf, a conditional or a return) compiles. Apple rejects it:
+"cannot initialize a variable of type 'const constant Mode' with an rvalue of
+type 'Anon'". `requireEnumValue` lets `"<anonymous>"` through at every target,
+because mslc cannot tell an untagged enumerator from the target enum's own one;
+closing it needs anonymous-enum identity tracking, which does not exist.
+Pinned by `tests/probes/enum_element_argument_and_brace_accepted.metal`.
+
+A file-scope enum constant initialised with a conditional
+(`constant Mode km = c ? MA : MB;`) is also refused as "not a value that can be
+worked out", where Apple accepts it; the folder has no conditional.
+
+## A float cast to an enum in a file-scope constant is refused when it does not fit (#261)
+
+`constant Mode km = (Mode)1e30f;` (also `(Mode)2147483648.0f`, `(Mode)-2.7f`, NaN
+and infinities) is refused: the truncated value is outside the enum's range,
+which C++ leaves undefined. mslc takes the range as 0 up to INT_MAX (it records
+an int underlying type unless an enumerator is past INT_MAX); Apple's enum
+without a negative enumerator is unsigned, so the refusal is slightly wider than
+Apple's range for values in [2^31, 2^32) and for enums with negative
+enumerators. Apple accepts the out-of-range casts and folds them through LLVM's
+undefined-behaviour rules to host- and pass-dependent values (`(Mode)9e18f` is
+-1, `(Mode)-2.7f` is 0), not a language rule mslc could match. Truncations that
+fit (`1.5f`, `-0.5f`, `1e-40f`) fold as Apple does. Pinned by the
+`file_scope_constant_enum_cast_float_*` probes.
