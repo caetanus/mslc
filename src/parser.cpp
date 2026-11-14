@@ -603,14 +603,13 @@ void Parser::parseUsing() {
 
 		std::vector<std::string>& directives = _blocks.empty() ? _scopes[scope].directives : _blocks.back().directives;
 
-		// Nothing is looked up through the standard library's own namespace, and a
-		// file that adds names to it is found by the same spelling.
-		if (name.parts.front() == kStdlibNamespace && name.parts.size() == 1) {
+		const std::string target = namespaceOf(name, name.parts.size(), NamespaceLookup::NamespaceOnly);
+		// A lone "metal" no file namespace answers for is the standard library's own namespace,
+		// which nothing is looked up through; a nearer namespace of that name wins over it.
+		if (target.empty() && name.parts.size() == 1 && name.parts.front() == kStdlibNamespace) {
 			directives.push_back(kStdlibNamespace);
 			return;
 		}
-
-		const std::string target = namespaceOf(name, name.parts.size(), NamespaceLookup::NamespaceOnly);
 		if (target.empty()) {
 			throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
 		}
