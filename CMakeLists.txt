@@ -89,6 +89,13 @@ else()
 	set_tests_properties(indium-corpus PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 endif()
 
+add_test(NAME corpus-keep-output-same-basename COMMAND ${CMAKE_COMMAND}
+	-DCORPUS=$<TARGET_FILE:mslc-corpus>
+	-DROOT=${CMAKE_CURRENT_SOURCE_DIR}/tests/corpus_same_basename
+	-DSPIRV_VAL=${SPIRV_VAL}
+	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/corpus_same_basename
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_corpus_keep_output.cmake)
+
 add_test(NAME validate-failure-exits-nonzero COMMAND ${CMAKE_COMMAND}
 	-DMSLC=$<TARGET_FILE:mslc-cli>
 	-DFAKE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/failing-spirv-val
