@@ -492,11 +492,11 @@ void Parser::parseDeclaration() {
 	// A file-scope constant. An address space or a type qualifier ahead of the
 	// type is what marks one, since a bare "float kX" at file scope is not valid
 	// MSL and would otherwise be read as the start of a function's return type.
-	if (at(TokenKind::Identifier)
+	if (libraryResourcePrefixTokens() || (at(TokenKind::Identifier)
 		&& (isTypeQualifier(current().text) || addressSpaceFor(current().text)
 			|| isResourceTypeName(current().text)
 			|| (current().text == "metal" && lookahead().kind == TokenKind::ColonColon
-				&& lookahead(2).kind == TokenKind::Identifier && isResourceTypeName(lookahead(2).text)))) {
+				&& lookahead(2).kind == TokenKind::Identifier && isResourceTypeName(lookahead(2).text))))) {
 		parseGlobalDeclaration();
 		return;
 	}
@@ -1859,6 +1859,11 @@ bool Parser::peekQualifiedName(QualifiedName& out) const {
 	while (lookahead(at).kind == TokenKind::Identifier) {
 		out.parts.emplace_back(lookahead(at).text);
 		++at;
+		// A qualifier or address space is a keyword, not a namespace: in "constexpr ::metal::sampler"
+		// the "::" begins the next name.
+		if (out.parts.size() == 1 && !out.global && (isTypeQualifier(out.parts[0]) || addressSpaceFor(out.parts[0]))) {
+			break;
+		}
 		if (lookahead(at).kind != TokenKind::ColonColon || lookahead(at + 1).kind != TokenKind::Identifier) {
 			break;
 		}
@@ -2021,6 +2026,21 @@ size_t Parser::libraryPrefixParts(const QualifiedName& name) const {
 		}
 	}
 	return 0;
+}
+
+size_t Parser::libraryPrefixTokens() const {
+	QualifiedName name;
+	if (!peekQualifiedName(name)) {
+		return 0;
+	}
+	const size_t parts = libraryPrefixParts(name);
+	return parts ? (name.global ? 1 : 0) + 2 * parts : 0;
+}
+
+size_t Parser::libraryResourcePrefixTokens() const {
+	const size_t tokens = libraryPrefixTokens();
+	return tokens && lookahead(tokens).kind == TokenKind::Identifier && isResourceTypeName(lookahead(tokens).text)
+		&& lookahead(tokens + 1).kind != TokenKind::ColonColon ? tokens : 0;
 }
 
 std::string Parser::canonicalNamespace(const std::string& path) const {
@@ -3066,6 +3086,10 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 		&& lookahead(2).kind == TokenKind::Identifier && isResourceTypeName(lookahead(2).text)) {
 		advance();
 		advance();
+	} else if (const size_t prefix = libraryResourcePrefixTokens()) {
+		for (size_t i = 0; i < prefix; ++i) {
+			advance();
+		}
 	}
 
 	size_t nameTokens = 0;
@@ -3188,6 +3212,11 @@ void Parser::parseResourceType(Type& type) {
 			}
 			advance();
 			advance();
+		} else if (const size_t prefix = libraryPrefixTokens();
+			prefix && lookahead(prefix).kind == TokenKind::Identifier && lookahead(prefix).text == "access") {
+			for (size_t i = 0; i < prefix; ++i) {
+				advance();
+			}
 		}
 		if (kind() != TokenKind::Identifier || current().text != "access") {
 			throw CompileError("expected an access qualifier after the sampled type of " + name);
@@ -3988,6 +4017,10 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
 			advance();
 			advance();
+		} else if (const size_t prefix = libraryPrefixTokens(); prefix && lookahead(prefix).kind == TokenKind::Identifier) {
+			for (size_t i = 0; i < prefix; ++i) {
+				advance();
+			}
 		}
 		if (kind() != TokenKind::Identifier) {
 			throw CompileError("expected a sampler option, found " + std::string(tokenKindName(kind())));

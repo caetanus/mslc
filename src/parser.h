@@ -239,6 +239,9 @@ private:
 	// alias (or by a leading "::"), and the tokens they take with the "::" after them; the
 	// plain, nearest "metal::" is the literal branches' and counts as none.
 	size_t libraryPrefixParts(const QualifiedName& name) const;
+	size_t libraryPrefixTokens() const;
+	// The library's resource type name that a library prefix qualifies, or 0.
+	size_t libraryResourcePrefixTokens() const;
 	void parseUsing();
 
 	bool peekQualifiedName(QualifiedName& out) const;
