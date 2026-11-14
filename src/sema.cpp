@@ -2023,6 +2023,10 @@ namespace {
 		return overloaded.count(helper.name) ? helper.name + "(" + parameterSignature(helper) + ")" : helper.name;
 	}
 
+	// What it costs an argument to reach a parameter of another type, as Apple ranks it (measured):
+	// the C++ order, with a scalar's splat into a vector below every scalar conversion.
+	enum ConversionRank : int { kExact, kPromotion, kConversion, kSplat, kNoConversion };
+
 	void validateHelpers(const TranslationUnit& unit, bool allowImports) {
 		const std::set<std::string> overloaded = overloadedNames(unit);
 		std::map<std::string, const FunctionDecl*> first;
@@ -2537,6 +2541,7 @@ namespace {
 		const HelperFunction* returningHelper(const Expression& call, std::string (*aspect)(const Type&));
 		size_t callerOrder() const { return (_helper ? _helper : _entryPoint)->order; }
 		void noteCall(const FunctionDecl& callee);
+		int conversionRank(Id from, const std::optional<std::string>& tag, const Parameter& parameter);
 		std::string linkageName(const FunctionDecl& helper) const {
 			return _overloadedNames.count(helper.name) ? helperKey(helper, _overloadedNames) : helper.name;
 		}
@@ -5525,45 +5530,106 @@ namespace {
 			return chosen(candidates.front());
 		}
 
+		bool enumParameter = false;
 		for (const HelperFunction* entry: candidates) {
 			for (const Parameter& parameter: entry->definition->parameters) {
 				if (parameter.type.isPointer || parameter.type.arrayLength || parameter.isMutableReference()
-					|| parameter.type.resource != ResourceKind::None || !parameter.type.enumName.empty()) {
+					|| parameter.type.resource != ResourceKind::None) {
 					throw CompileError("the call to \"" + name + "\" chooses among overloads with the same "
-						"number of arguments, and one takes a pointer, a mutable reference, an enum or a "
-						"texture or sampler; that is not lowered yet (candidates: " + describe(candidates) + ")");
+						"number of arguments, and one takes a pointer, a mutable reference or a texture or "
+						"sampler; that is not lowered yet (candidates: " + describe(candidates) + ")");
 				}
+				enumParameter = enumParameter || !parameter.type.enumName.empty();
 			}
 		}
-		for (const ExpressionPtr& argument: call.arguments) {
-			if (const auto tag = enumOf(*argument); tag && !tag->empty()) {
-				throw CompileError("the call to \"" + name + "\" passes an enum to a choice among overloads, "
-					"which is not lowered yet");
+		// Whether an argument is an enum decides its rank, and enumOf only knows what it can see.
+		std::vector<std::optional<std::string>> tags;
+		for (size_t i = 0; i < call.arguments.size(); ++i) {
+			tags.push_back(enumOf(*call.arguments[i]));
+			if (enumParameter && (!tags.back() || *tags.back() == "<anonymous>")) {
+				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \"" + name
+					+ "\" is not known to be a particular enum, and an overload takes an enum; that is not "
+					"lowered yet");
+			}
+		}
+		for (const HelperFunction* entry: candidates) {
+			for (const Parameter& parameter: entry->definition->parameters) {
+				if (parameter.type.enumName == "<anonymous>") {
+					throw CompileError("an overload of \"" + name + "\" takes a parameter of an anonymous enum, "
+						"which cannot be told from another anonymous enum here; that is not lowered yet");
+				}
 			}
 		}
 
 		for (const ExpressionPtr& argument: call.arguments) {
 			prepared.push_back(emitExpression(*argument));
 		}
-		std::vector<HelperFunction*> exact;
+		std::vector<std::pair<HelperFunction*, std::vector<int>>> viable;
 		for (HelperFunction* entry: candidates) {
-			bool matches = true;
+			std::vector<int> ranks;
 			for (size_t i = 0; i < prepared.size(); ++i) {
-				matches = matches
-					&& declaredTypeOf(entry->definition->parameters[i].type) == _builder.typeOf(prepared[i]);
+				ranks.push_back(conversionRank(_builder.typeOf(prepared[i]), tags[i],
+					entry->definition->parameters[i]));
 			}
-			if (matches) {
-				exact.push_back(entry);
+			if (std::none_of(ranks.begin(), ranks.end(), [](int rank) { return rank == kNoConversion; })) {
+				viable.emplace_back(entry, std::move(ranks));
 			}
 		}
-		if (exact.size() > 1) {
-			throw CompileError("call to \"" + name + "\" is ambiguous; candidates: " + describe(exact));
+		if (viable.empty()) {
+			throw CompileError("no matching function for call to \"" + name + "\"; candidates: "
+				+ describe(candidates));
 		}
-		if (exact.empty()) {
-			throw CompileError("no overload of \"" + name + "\" takes exactly these argument types, and choosing "
-				"by implicit conversion is not lowered yet; candidates: " + describe(candidates));
+
+		// One wins when it is no worse on any argument and better on one, than every other.
+		const auto beats = [&](const std::vector<int>& a, const std::vector<int>& b) {
+			bool better = false;
+			for (size_t i = 0; i < a.size(); ++i) {
+				if (a[i] > b[i]) {
+					return false;
+				}
+				better = better || a[i] < b[i];
+			}
+			return better;
+		};
+		for (const auto& [entry, ranks]: viable) {
+			if (std::all_of(viable.begin(), viable.end(), [&](const auto& other) {
+				return other.first == entry || beats(ranks, other.second);
+			})) {
+				return chosen(entry);
+			}
 		}
-		return chosen(exact.front());
+		std::vector<HelperFunction*> tied;
+		for (const auto& [entry, ranks]: viable) {
+			tied.push_back(entry);
+		}
+		throw CompileError("call to \"" + name + "\" is ambiguous; candidates: " + describe(tied));
+	}
+
+	// How an argument of one type reaches a parameter, per the ranks above. A vector, a matrix or a
+	// struct converts to nothing else; an enum is an int that converts to no enum but its own.
+	int Emitter::conversionRank(Id from, const std::optional<std::string>& tag, const Parameter& parameter) {
+		const Id to = declaredTypeOf(parameter.type);
+		const bool enumArgument = tag && !tag->empty();
+		if (!parameter.type.enumName.empty()) {
+			return enumArgument && *tag == parameter.type.enumName ? kExact : kNoConversion;
+		}
+		if (!enumArgument && from == to) {
+			return kExact;
+		}
+		const std::optional<ScalarKind> fromKind = _types.scalarKindOf(from);
+		if (!fromKind) {
+			return kNoConversion;
+		}
+		if (_types.vectorWidth(to) > 1) {
+			return _types.scalarKindOf(_types.componentOf(to)) ? kSplat : kNoConversion;
+		}
+		const std::optional<ScalarKind> toKind = _types.scalarKindOf(to);
+		if (!toKind) {
+			return kNoConversion;
+		}
+		const bool promotes = enumArgument || *fromKind == ScalarKind::Bool || *fromKind == ScalarKind::Char
+			|| *fromKind == ScalarKind::UChar || *fromKind == ScalarKind::Short || *fromKind == ScalarKind::UShort;
+		return promotes && *toKind == ScalarKind::Int ? kPromotion : kConversion;
 	}
 
 	// A call is an edge of the call graph. validateHelpers sees the edges whose callee a name
