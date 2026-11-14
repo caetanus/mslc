@@ -1931,7 +1931,11 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 	const std::string aliasOwner = !name.global && parts.front() == kStdlibNamespace
 		? blockQualifier(parts.front(), NamespaceLookup::Qualifier) : std::string();
 	if (parts.size() == 1) {
-		// "::x" names a file-scope declaration, or a builtin.
+		// "::x" names a file-scope declaration, or a builtin. A using declaration at file
+		// scope adds a name there too, and beside a declaration of its own it is ambiguous.
+		if (std::set<std::string> own; collectOwn("", last, own), !own.empty()) {
+			return pick(own, spelled);
+		}
 		return last;
 	}
 	if (!found && parts.size() > 1) {
