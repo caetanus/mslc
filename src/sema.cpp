@@ -2541,7 +2541,34 @@ namespace {
 		const HelperFunction* returningHelper(const Expression& call, std::string (*aspect)(const Type&));
 		size_t callerOrder() const { return (_helper ? _helper : _entryPoint)->order; }
 		void noteCall(const FunctionDecl& callee);
-		int conversionRank(Id from, const std::optional<std::string>& tag, const Parameter& parameter);
+		bool isPlainVariable(const Expression& expression) const;
+		struct PointerFit {
+			Type element;
+			Type wanted;
+			std::vector<uint32_t> shape;
+			std::vector<uint32_t> wantedShape;
+			bool matches = false;
+		};
+		PointerFit pointerFit(const Binding& array, const Type& parameter);
+		// What a call's argument is, as far as choosing an overload cares: a value, a variable
+		// (a place a reference can bind), a local array (what a pointer parameter takes), or a
+		// texture or sampler. Only the first two are evaluated.
+		struct OverloadArgument {
+			enum class Kind { Value, Variable, Array, Resource } kind = Kind::Value;
+			const Expression* expression = nullptr;
+			const Binding* binding = nullptr;
+			Id value = InvalidId;
+			std::optional<std::string> tag;
+			// A non-const local of this function, which a mutable reference can name.
+			bool changeable = false;
+			// Names a pointer or a buffer that is not a local array: not lowered as an argument.
+			bool pointerLike = false;
+		};
+		OverloadArgument classifyArgument(const Expression& argument);
+		// Qualification orders two references or two pointers of one conversion rank (the one to a
+		// non-const object is better); -1 where it does not apply.
+		struct ConversionCost { int rank = kNoConversion; int qualification = -1; };
+		ConversionCost conversionCost(const OverloadArgument& argument, const Parameter& parameter);
 		std::string linkageName(const FunctionDecl& helper) const {
 			return _overloadedNames.count(helper.name) ? helperKey(helper, _overloadedNames) : helper.name;
 		}
@@ -5530,49 +5557,60 @@ namespace {
 			return chosen(candidates.front());
 		}
 
+		std::vector<OverloadArgument> arguments;
+		for (const ExpressionPtr& argument: call.arguments) {
+			arguments.push_back(classifyArgument(*argument));
+		}
 		bool enumParameter = false;
 		for (const HelperFunction* entry: candidates) {
 			for (const Parameter& parameter: entry->definition->parameters) {
-				if (parameter.type.isPointer || parameter.type.arrayLength || parameter.isMutableReference()
-					|| parameter.type.resource != ResourceKind::None) {
-					throw CompileError("the call to \"" + name + "\" chooses among overloads with the same "
-						"number of arguments, and one takes a pointer, a mutable reference or a texture or "
-						"sampler; that is not lowered yet (candidates: " + describe(candidates) + ")");
-				}
 				enumParameter = enumParameter || !parameter.type.enumName.empty();
-			}
-		}
-		// Whether an argument is an enum decides its rank, and enumOf only knows what it can see.
-		std::vector<std::optional<std::string>> tags;
-		for (size_t i = 0; i < call.arguments.size(); ++i) {
-			tags.push_back(enumOf(*call.arguments[i]));
-			if (enumParameter && (!tags.back() || *tags.back() == "<anonymous>")) {
-				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \"" + name
-					+ "\" is not known to be a particular enum, and an overload takes an enum; that is not "
-					"lowered yet");
-			}
-		}
-		for (const HelperFunction* entry: candidates) {
-			for (const Parameter& parameter: entry->definition->parameters) {
 				if (parameter.type.enumName == "<anonymous>") {
 					throw CompileError("an overload of \"" + name + "\" takes a parameter of an anonymous enum, "
 						"which cannot be told from another anonymous enum here; that is not lowered yet");
 				}
 			}
 		}
-
-		for (const ExpressionPtr& argument: call.arguments) {
-			prepared.push_back(emitExpression(*argument));
-		}
-		std::vector<std::pair<HelperFunction*, std::vector<int>>> viable;
-		for (HelperFunction* entry: candidates) {
-			std::vector<int> ranks;
-			for (size_t i = 0; i < prepared.size(); ++i) {
-				ranks.push_back(conversionRank(_builder.typeOf(prepared[i]), tags[i],
-					entry->definition->parameters[i]));
+		for (size_t i = 0; i < arguments.size(); ++i) {
+			OverloadArgument& argument = arguments[i];
+			if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
+				|| argument.pointerLike) {
+				continue;
 			}
-			if (std::none_of(ranks.begin(), ranks.end(), [](int rank) { return rank == kNoConversion; })) {
-				viable.emplace_back(entry, std::move(ranks));
+			const bool bound = std::any_of(candidates.begin(), candidates.end(), [&](const HelperFunction* entry) {
+				return entry->definition->parameters[i].isMutableReference();
+			});
+			if (bound && argument.kind == OverloadArgument::Kind::Variable && !isPlainVariable(*argument.expression)) {
+				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \"" + name
+					+ "\" is evaluated to choose among overloads and is also bound to a reference by one; "
+					"name a local variable instead");
+			}
+			// Whether an argument is an enum decides its rank, and enumOf only knows what it can see.
+			argument.tag = enumOf(*argument.expression);
+			if (enumParameter && (!argument.tag || *argument.tag == "<anonymous>")) {
+				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \"" + name
+					+ "\" is not known to be a particular enum, and an overload takes an enum; that is not "
+					"lowered yet");
+			}
+			argument.value = emitExpression(*argument.expression);
+			prepared.push_back(argument.value);
+		}
+		// Positions that are not evaluated keep their place, so prepared[i] is argument i.
+		if (!prepared.empty() && prepared.size() != arguments.size()) {
+			prepared.clear();
+			for (const OverloadArgument& argument: arguments) {
+				prepared.push_back(argument.value);
+			}
+		}
+
+		std::vector<std::pair<HelperFunction*, std::vector<ConversionCost>>> viable;
+		for (HelperFunction* entry: candidates) {
+			std::vector<ConversionCost> costs;
+			for (size_t i = 0; i < arguments.size(); ++i) {
+				costs.push_back(conversionCost(arguments[i], entry->definition->parameters[i]));
+			}
+			if (std::none_of(costs.begin(), costs.end(), [](const ConversionCost& cost) { return cost.rank == kNoConversion; })) {
+				viable.emplace_back(entry, std::move(costs));
 			}
 		}
 		if (viable.empty()) {
@@ -5581,55 +5619,158 @@ namespace {
 		}
 
 		// One wins when it is no worse on any argument and better on one, than every other.
-		const auto beats = [&](const std::vector<int>& a, const std::vector<int>& b) {
+		const auto beats = [&](const std::vector<ConversionCost>& a, const std::vector<ConversionCost>& b) {
 			bool better = false;
 			for (size_t i = 0; i < a.size(); ++i) {
-				if (a[i] > b[i]) {
+				const bool ranked = a[i].rank != b[i].rank;
+				const bool qualified = !ranked && a[i].qualification >= 0 && b[i].qualification >= 0
+					&& a[i].qualification != b[i].qualification;
+				if (ranked ? a[i].rank > b[i].rank : qualified && a[i].qualification > b[i].qualification) {
 					return false;
 				}
-				better = better || a[i] < b[i];
+				better = better || (ranked ? a[i].rank < b[i].rank : qualified);
 			}
 			return better;
 		};
-		for (const auto& [entry, ranks]: viable) {
+		for (const auto& winner: viable) {
 			if (std::all_of(viable.begin(), viable.end(), [&](const auto& other) {
-				return other.first == entry || beats(ranks, other.second);
+				return other.first == winner.first || beats(winner.second, other.second);
 			})) {
-				return chosen(entry);
+				return chosen(winner.first);
 			}
 		}
 		std::vector<HelperFunction*> tied;
-		for (const auto& [entry, ranks]: viable) {
-			tied.push_back(entry);
+		for (const auto& candidate: viable) {
+			tied.push_back(candidate.first);
 		}
 		throw CompileError("call to \"" + name + "\" is ambiguous; candidates: " + describe(tied));
 	}
 
+	// A name, an element or a member of one, with nothing in it that evaluating twice would repeat.
+	bool Emitter::isPlainVariable(const Expression& expression) const {
+		switch (expression.kind) {
+			case ExpressionKind::Identifier: return true;
+			case ExpressionKind::Member: return isPlainVariable(*expression.left);
+			case ExpressionKind::Index:
+				return isPlainVariable(*expression.left) && expression.arguments.size() == 1
+					&& (expression.arguments[0]->kind == ExpressionKind::IntLiteral
+						|| expression.arguments[0]->kind == ExpressionKind::Identifier);
+			default: return false;
+		}
+	}
+
+	Emitter::OverloadArgument Emitter::classifyArgument(const Expression& expression) {
+		OverloadArgument argument;
+		argument.expression = &expression;
+		const bool place = expression.kind == ExpressionKind::Identifier || expression.kind == ExpressionKind::Index
+			|| expression.kind == ExpressionKind::Member;
+		argument.kind = place ? OverloadArgument::Kind::Variable : OverloadArgument::Kind::Value;
+		if (expression.kind == ExpressionKind::Identifier) {
+			if (const Binding* binding = findResourceBinding(expression.name)) {
+				const bool array = binding->isPointer && binding->pointeeMsl.arrayLength
+					&& binding->storageClass == spirv::StorageClass::Function && !binding->isAddress;
+				if (binding->pointeeMsl.resource != ResourceKind::None) {
+					argument.kind = OverloadArgument::Kind::Resource;
+				} else if (array) {
+					argument.kind = OverloadArgument::Kind::Array;
+				}
+				argument.binding = binding;
+				argument.pointerLike = argument.kind == OverloadArgument::Kind::Variable
+					&& (binding->pointeeMsl.isPointer || binding->pointeeMsl.arrayLength || binding->isBuffer
+						|| binding->bufferPointeeType != InvalidId);
+			}
+		} else if (expression.kind == ExpressionKind::Unary && expression.unaryOperator == UnaryOperator::AddressOf) {
+			argument.pointerLike = true;
+		}
+		if (argument.kind == OverloadArgument::Kind::Variable) {
+			const Expression& root = storeRoot(expression);
+			const Binding* local = root.kind == ExpressionKind::Identifier ? findResourceBinding(root.name) : nullptr;
+			argument.changeable = local && !local->readOnly && !local->isBuffer && local->bufferPointeeType == InvalidId
+				&& local->storageClass == spirv::StorageClass::Function
+				&& !(expression.kind == ExpressionKind::Member && !structOf(*expression.left));
+		}
+		return argument;
+	}
+
 	// How an argument of one type reaches a parameter, per the ranks above. A vector, a matrix or a
 	// struct converts to nothing else; an enum is an int that converts to no enum but its own.
-	int Emitter::conversionRank(Id from, const std::optional<std::string>& tag, const Parameter& parameter) {
-		const Id to = declaredTypeOf(parameter.type);
-		const bool enumArgument = tag && !tag->empty();
-		if (!parameter.type.enumName.empty()) {
-			return enumArgument && *tag == parameter.type.enumName ? kExact : kNoConversion;
+	Emitter::ConversionCost Emitter::conversionCost(const OverloadArgument& argument, const Parameter& parameter) {
+		const Type& type = parameter.type;
+		const auto exact = [](int qualification) { return ConversionCost { kExact, qualification }; };
+		const ConversionCost none;
+
+		if (type.resource != ResourceKind::None) {
+			const Binding* binding = argument.kind == OverloadArgument::Kind::Resource ? argument.binding : nullptr;
+			return binding && binding->pointeeMsl.resource == type.resource
+				&& (!type.isTexture() || (binding->pointeeMsl.scalar == type.scalar
+					&& binding->pointeeMsl.textureAccess == type.textureAccess)) ? exact(-1) : none;
+		}
+		if (type.isPointer || type.arrayLength) {
+			if (argument.kind != OverloadArgument::Kind::Array) {
+				if (argument.pointerLike) {
+					throw CompileError("a pointer argument other than a local array (&x, a + n, a pointer or a "
+						"buffer) chooses among overloads, which is not lowered yet");
+				}
+				return none;
+			}
+			return !pointerFit(*argument.binding, type).matches || (argument.binding->readOnly && !type.isConst)
+				? none : exact(type.isConst ? 1 : 0);
+		}
+		if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
+			|| argument.pointerLike) {
+			return none;
+		}
+
+		const Id to = declaredTypeOf(type);
+		const Id from = _builder.typeOf(argument.value);
+		const bool enumArgument = argument.tag && !argument.tag->empty();
+		if (parameter.isMutableReference()) {
+			// A reference names its argument as it is: same type, a non-const local of this function.
+			return argument.changeable && from == to
+				&& type.enumName == (argument.tag ? *argument.tag : std::string()) ? exact(0) : none;
+		}
+		const int qualification = parameter.isReference ? 1 : -1;
+		if (!type.enumName.empty()) {
+			return enumArgument && *argument.tag == type.enumName ? exact(qualification) : none;
 		}
 		if (!enumArgument && from == to) {
-			return kExact;
+			return exact(qualification);
 		}
 		const std::optional<ScalarKind> fromKind = _types.scalarKindOf(from);
 		if (!fromKind) {
-			return kNoConversion;
+			return none;
 		}
 		if (_types.vectorWidth(to) > 1) {
-			return _types.scalarKindOf(_types.componentOf(to)) ? kSplat : kNoConversion;
+			return _types.scalarKindOf(_types.componentOf(to)) ? ConversionCost { kSplat, -1 } : none;
 		}
 		const std::optional<ScalarKind> toKind = _types.scalarKindOf(to);
 		if (!toKind) {
-			return kNoConversion;
+			return none;
 		}
 		const bool promotes = enumArgument || *fromKind == ScalarKind::Bool || *fromKind == ScalarKind::Char
 			|| *fromKind == ScalarKind::UChar || *fromKind == ScalarKind::Short || *fromKind == ScalarKind::UShort;
-		return promotes && *toKind == ScalarKind::Int ? kPromotion : kConversion;
+		return { promotes && *toKind == ScalarKind::Int ? kPromotion : kConversion, -1 };
+	}
+
+	// An array parameter's own length is not part of its type (it decays), but the
+	// lengths inside it are: float m[2][3] takes an array of rows of three.
+	Emitter::PointerFit Emitter::pointerFit(const Binding& array, const Type& parameter) {
+		PointerFit fit;
+		fit.element = array.pointeeMsl;
+		fit.element.dropOuterDimension();
+		fit.shape = fit.element.innerArrayLengths;
+		if (fit.element.arrayLength) {
+			fit.shape.insert(fit.shape.begin(), *fit.element.arrayLength);
+		}
+		fit.element.arrayLength.reset();
+		fit.element.innerArrayLengths.clear();
+		fit.wanted = parameter;
+		fit.wanted.isPointer = false;
+		fit.wantedShape = fit.wanted.innerArrayLengths;
+		fit.wanted.innerArrayLengths.clear();
+		fit.matches = declaredTypeOf(fit.element) == declaredTypeOf(fit.wanted)
+			&& fit.element.namedType == fit.wanted.namedType && fit.shape == fit.wantedShape;
+		return fit;
 	}
 
 	// A call is an edge of the call graph. validateHelpers sees the edges whose callee a name
@@ -5888,22 +6029,12 @@ namespace {
 					"&x, a + n and pointers into a buffer are not lowered yet");
 			}
 
-			// An array parameter's own length is not part of its type (it decays), but the
-			// lengths inside it are: float m[2][3] takes an array of rows of three.
-			Type element = binding->second.pointeeMsl;
-			element.dropOuterDimension();
-			std::vector<uint32_t> shape = element.innerArrayLengths;
-			if (element.arrayLength) {
-				shape.insert(shape.begin(), *element.arrayLength);
-			}
-			element.arrayLength.reset();
-			element.innerArrayLengths.clear();
-			Type wanted = parameter.type;
-			wanted.isPointer = false;
-			const std::vector<uint32_t> wantedShape = wanted.innerArrayLengths;
-			wanted.innerArrayLengths.clear();
-			if (declaredTypeOf(element) != declaredTypeOf(wanted) || element.namedType != wanted.namedType
-				|| shape != wantedShape) {
+			const PointerFit fit = pointerFit(binding->second, parameter.type);
+			const Type& element = fit.element;
+			const Type& wanted = fit.wanted;
+			const std::vector<uint32_t>& shape = fit.shape;
+			const std::vector<uint32_t>& wantedShape = fit.wantedShape;
+			if (!fit.matches) {
 				const auto spelled = [&](const Type& base, const std::vector<uint32_t>& lengths) {
 					std::string name = typeName(base);
 					for (const uint32_t length: lengths) { name += "[" + std::to_string(length) + "]"; }
