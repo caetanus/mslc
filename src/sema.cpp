@@ -2424,7 +2424,7 @@ namespace {
 		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
 		void emitReferenceDeclaration(const VariableDeclaration& declaration);
-		void emitLocalArray(const VariableDeclaration& declaration, bool storageOnly);
+		void emitLocalArray(const VariableDeclaration& declaration, const Type& type, bool storageOnly);
 		void declareThreadgroupLocal(const VariableDeclaration& declaration, const Type& type, Id typeId);
 		Id arrayTypeOf(const Type& type);
 		struct ArrayLeaves {
@@ -3870,13 +3870,12 @@ namespace {
 				"mslc builds a scalar or a vector value");
 		}
 
-		// An address space on a local is not something mslc can declare. Apple
-		// rejects one outright ("automatic variable qualified with an address
-		// space"), except for threadgroup, which is legal and needs StorageClass
-		// ThreadGroup. mslc declares every local in Function storage, so
+		// Apple rejects device and constant on a local and takes thread (the function's own
+		// storage, so a construct of one is plain) and threadgroup, which needs StorageClass
+		// Workgroup. mslc declares these in Function storage, so
 		// "threadgroup float3 v(0);" would be a thread-private local in a module
 		// whose source says the value is shared, and that validates.
-		if (target.addressSpace != AddressSpace::None) {
+		if (target.addressSpace != AddressSpace::None && target.addressSpace != AddressSpace::Thread) {
 			throw CompileError("a local in the " + std::string(addressSpaceName(target.addressSpace))
 				+ " address space is not lowered yet; every local mslc declares is "
 					"thread-private");
@@ -9214,9 +9213,7 @@ namespace {
 	// const float3 d[3] = {...} and a[] = {...}. A shorter list zero-fills the rest, as in
 	// C++, and a longer one is an error. An index is not checked at run time, and a
 	// constant one past the end is refused.
-	void Emitter::emitLocalArray(const VariableDeclaration& declaration, bool storageOnly) {
-		const Type& type = declaration.type;
-
+	void Emitter::emitLocalArray(const VariableDeclaration& declaration, const Type& type, bool storageOnly) {
 		// A threadgroup array is shared by every invocation of the workgroup, so it
 		// lives in Workgroup storage rather than the function's own. Nothing else
 		// changes: the type, the initialiser and the index paths are the same, which
@@ -9246,6 +9243,7 @@ namespace {
 			// module it had just made invalid.
 			checkThreadgroupLocal(declaration);
 		} else if (type.resource != ResourceKind::None || type.addressSpace != AddressSpace::None) {
+			// Thread was dropped by emitValueDeclaration; device and constant are not a local's.
 			throw CompileError("an array of " + typeName(type) + " is not lowered yet; mslc lowers an array "
 				"of scalars, vectors, matrices and structs in the function's own storage or in "
 				"threadgroup storage");
@@ -9415,6 +9413,17 @@ namespace {
 			return;
 		}
 
+		// "thread float3 v", "thread S s = {..}" and "thread float a[4]" are the function's own
+		// storage, which is what an unqualified local is, so the qualifier is dropped here once
+		// for every value local. A pointer or a reference keeps it: the address space is part of
+		// what it points at.
+		if (type.addressSpace == AddressSpace::Thread && !type.isPointer && !declaration.isReference) {
+			Type plain = type;
+			plain.addressSpace = AddressSpace::None;
+			emitValueDeclaration(declaration, plain, deduced, storageOnly);
+			return;
+		}
+
 		if (type.isAtomic && !type.isPointer
 			&& (type.addressSpace != AddressSpace::Threadgroup || type.arrayLength || declaration.isReference)) {
 			throw CompileError("a local atomic \"" + declaration.name + "\" is not allowed: an atomic lives in a "
@@ -9440,7 +9449,7 @@ namespace {
 		}
 
 		if (type.arrayLength) {
-			emitLocalArray(declaration, storageOnly);
+			emitLocalArray(declaration, type, storageOnly);
 			return;
 		}
 
