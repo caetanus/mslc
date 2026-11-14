@@ -10192,6 +10192,7 @@ namespace {
 			// Loops share one shape: the header evaluates the condition and
 			// declares the merge and continue targets, the body branches to the
 			// continue block, and that block alone branches back to the header.
+			// A do-while moves the condition into the continue block.
 			case StatementKind::For:
 			case StatementKind::While: {
 				const BindingScope scope(_bindings);
@@ -10210,6 +10211,7 @@ namespace {
 				const Id continueLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 
+				const bool isDoWhile = !isFor && statement.isDoWhile;
 				terminate(spirv::OpBranch, { headerLabel });
 				beginBlock(headerLabel);
 				const ControlDepthScope depth(_controlDepth);
@@ -10223,9 +10225,9 @@ namespace {
 
 				// A &&, || or ?: in the condition splits it over several blocks, and
 				// OpLoopMerge has to end the header, so it goes in front of them.
-				const bool splitsCondition = condition && containsBranchingOperator(*condition);
+				const bool splitsCondition = condition && !isDoWhile && containsBranchingOperator(*condition);
 				Id conditionValue = InvalidId;
-				if (condition && !splitsCondition) {
+				if (condition && !splitsCondition && !isDoWhile) {
 					conditionValue = asCondition(emitExpression(*condition));
 				}
 				_builder.emit(spirv::OpLoopMerge, { mergeLabel, continueLabel, kLoopControlNone });
@@ -10235,7 +10237,9 @@ namespace {
 					beginBlock(conditionLabel);
 					conditionValue = asCondition(emitExpression(*condition));
 				}
-				if (condition) {
+				if (isDoWhile) {
+					terminate(spirv::OpBranch, { bodyLabel });
+				} else if (condition) {
 					terminate(spirv::OpBranchConditional, { conditionValue, bodyLabel, mergeLabel });
 				} else {
 					terminate(spirv::OpBranch, { bodyLabel });
@@ -10249,7 +10253,12 @@ namespace {
 				if (isFor && statement.forIncrement) {
 					emitExpressionStatement(*statement.forIncrement);
 				}
-				terminate(spirv::OpBranch, { headerLabel });
+				if (isDoWhile) {
+					const Id again = asCondition(emitExpression(*condition));
+					terminate(spirv::OpBranchConditional, { again, headerLabel, mergeLabel });
+				} else {
+					terminate(spirv::OpBranch, { headerLabel });
+				}
 
 				beginBlock(mergeLabel);
 				return;

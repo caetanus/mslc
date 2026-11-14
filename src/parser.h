@@ -338,6 +338,7 @@ private:
 	StatementPtr parseIfStatement();
 	StatementPtr parseForStatement();
 	StatementPtr parseWhileStatement();
+	StatementPtr parseDoWhileStatement();
 	StatementPtr parseSwitchStatement();
 	StatementPtr parseReturnStatement();
 

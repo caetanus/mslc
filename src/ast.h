@@ -381,9 +381,10 @@ struct Statement {
 	ExpressionPtr forIncrement;
 	StatementPtr forBody;
 
-	// While
+	// While, and do-while when isDoWhile is set: the condition runs after the body
 	ExpressionPtr whileCondition;
 	StatementPtr whileBody;
+	bool isDoWhile = false;
 
 	// Switch: the selector is `expression`. Statements before the first label
 	// are unreachable, as C++ says, and the preamble is where they are kept.
