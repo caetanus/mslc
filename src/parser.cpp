@@ -3623,6 +3623,10 @@ StatementPtr Parser::parseStatement() {
 		return parseWhileStatement();
 	}
 
+	if (atKeyword("do")) {
+		return parseDoWhileStatement();
+	}
+
 	if (atKeyword("switch")) {
 		return parseSwitchStatement();
 	}
@@ -4114,6 +4118,23 @@ StatementPtr Parser::parseWhileStatement() {
 	expect(TokenKind::RParen, "after a while condition");
 
 	statement->whileBody = parseBody();
+
+	return statement;
+}
+
+StatementPtr Parser::parseDoWhileStatement() {
+	auto statement = std::make_unique<Statement>();
+	statement->kind = StatementKind::While;
+	statement->isDoWhile = true;
+	statement->line = line();
+
+	expectKeyword("do", "at the start of a do statement");
+	statement->whileBody = parseBody();
+	expectKeyword("while", "after the body of a do statement");
+	expect(TokenKind::LParen, "after 'while'");
+	statement->whileCondition = parseExpression();
+	expect(TokenKind::RParen, "after a do-while condition");
+	expect(TokenKind::Semicolon, "after a do-while statement");
 
 	return statement;
 }
