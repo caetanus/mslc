@@ -33,6 +33,27 @@
 #                              says a break goes to the merge block and not, say,
 #                              the continue block. It does not say which loop the
 #                              break leaves.
+#   // DISASM-ENTRY-MODES: <entry> [<mode>[, <mode>]...]
+#                              the OpExecutionMode and OpExecutionModeId
+#                              instructions of the entry point named <entry> are
+#                              exactly the listed modes, in any order. A mode is
+#                              the text after the entry id with every %id replaced
+#                              by a bare %, so a kernel's workgroup size is
+#                              "LocalSizeId % % %" and a fragment's origin is
+#                              "OriginUpperLeft". An entry name alone means no
+#                              modes. Unlike DISASM, a mode that belongs to a
+#                              different entry point does not count, and a mode
+#                              the entry should not have fails. It fails when no
+#                              entry point has that name.
+#   // DISASM-ENTRY-BUILTINS: <entry> [<builtin>[, <builtin>]...]
+#                              the interface variables listed on the OpEntryPoint
+#                              of <entry> carry exactly these BuiltIn decorations
+#                              (for example SampleMask, FragDepth), so a built-in
+#                              owned by another entry point does not count and one
+#                              the entry should not have fails. An entry name alone
+#                              means none. Says nothing about stores to them.
+#   A line like "// DISASM-X:" that is not one of the forms above is an error, so
+#   a misspelt or unspaced prefix cannot be silently ignored.
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
 #   // REFLECT-NOT: <substring>   the reflection JSON does not contain <substring>
 #
@@ -88,6 +109,19 @@ if(expectation STREQUAL "valid")
 		message(FATAL_ERROR "${name}: spirv-val rejected the module:\n${output}")
 	endif()
 
+	# A needle with a misspelt or unspaced prefix matches none of the collectors
+	# below, so the probe would pass without checking it. Any line that starts like
+	# a DISASM needle must be one of the known forms.
+	file(STRINGS "${PROBE}" disasmLines REGEX "^//[ \t]*DISASM[A-Z-]*:")
+	foreach(line IN LISTS disasmLines)
+		# The collectors below want a colon and exactly one space, except ORDER and the
+		# ENTRY kinds, which take any whitespace after the colon.
+		if(NOT line MATCHES "^// DISASM(-NOT|-MATCH|-NO-MATCH|-ASCENDING|-LANES|-BRANCH-FALLTHROUGH|-LOOP-MERGE-REACHED)?: "
+			AND NOT line MATCHES "^// DISASM-(ORDER|ENTRY-MODES|ENTRY-BUILTINS):[ \t]")
+			message(FATAL_ERROR "${name}: \"${line}\" is not a disassembly needle; the prefix is \"// DISASM<-KIND>: \" with a single space after the colon")
+		endif()
+	endforeach()
+
 	file(STRINGS "${PROBE}" wanted REGEX "^// DISASM: ")
 	file(STRINGS "${PROBE}" unwanted REGEX "^// DISASM-NOT: ")
 	file(STRINGS "${PROBE}" wantedPatterns REGEX "^// DISASM-MATCH: ")
@@ -96,13 +130,15 @@ if(expectation STREQUAL "valid")
 	file(STRINGS "${PROBE}" laneNeedles REGEX "^// DISASM-LANES: ")
 	file(STRINGS "${PROBE}" fallthroughNeedles REGEX "^// DISASM-BRANCH-FALLTHROUGH: ")
 	file(STRINGS "${PROBE}" loopMergeNeedles REGEX "^// DISASM-LOOP-MERGE-REACHED: ")
+	file(STRINGS "${PROBE}" entryModeNeedles REGEX "^// DISASM-ENTRY-MODES:")
+	file(STRINGS "${PROBE}" entryBuiltinNeedles REGEX "^// DISASM-ENTRY-BUILTINS:")
 	# Collected on whitespace after the prefix rather than one literal space, so a
 	# tab-separated needle is collected instead of silently skipped. A line whose
 	# prefix is not followed by whitespace is not a needle at all and is reported
 	# below, since the REGEX above cannot see it.
 	file(STRINGS "${PROBE}" orderNeedles REGEX "^// DISASM-ORDER:[ \t]")
 	file(STRINGS "${PROBE}" malformedOrder REGEX "^// *DISASM-ORDER")
-	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR ascendingNeedles OR laneNeedles OR fallthroughNeedles OR loopMergeNeedles OR orderNeedles OR malformedOrder)
+	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR ascendingNeedles OR laneNeedles OR fallthroughNeedles OR loopMergeNeedles OR entryModeNeedles OR entryBuiltinNeedles OR orderNeedles OR malformedOrder)
 		if(NOT SPIRV_DIS)
 			message(FATAL_ERROR "${name}: spirv-dis not found; install SPIRV-Tools and re-run cmake")
 		endif()
@@ -189,6 +225,58 @@ if(expectation STREQUAL "valid")
 					message(FATAL_ERROR "${name}: \"${found}\" takes lane ${index} where lane ${expected} is due")
 				endif()
 				math(EXPR position "${position} + 1")
+			endforeach()
+		endforeach()
+		foreach(kind IN ITEMS MODES BUILTINS)
+			if(kind STREQUAL "MODES")
+				set(kindNeedles ${entryModeNeedles})
+			else()
+				set(kindNeedles ${entryBuiltinNeedles})
+			endif()
+			foreach(line IN LISTS kindNeedles)
+				string(REGEX REPLACE "^// DISASM-ENTRY-${kind}:[ \t]*" "" value "${line}")
+				string(REGEX MATCH "^([A-Za-z_][A-Za-z0-9_]*)[ \t]*(.*)$" ignored "${value}")
+				set(entryName "${CMAKE_MATCH_1}")
+				if(entryName STREQUAL "")
+					message(FATAL_ERROR "${name}: \"${line}\" is not \"// DISASM-ENTRY-${kind}: <entry> [<item>[, <item>]...]\"")
+				endif()
+				# Items are comma separated, so a mode keeps its operands.
+				string(REPLACE "," ";" wantedItems "${CMAKE_MATCH_2}")
+				set(expected "")
+				foreach(item IN LISTS wantedItems)
+					string(STRIP "${item}" item)
+					if(NOT item STREQUAL "")
+						string(REGEX REPLACE "%[A-Za-z0-9_]+" "%" item "${item}")
+						list(APPEND expected "${item}")
+					endif()
+				endforeach()
+				list(SORT expected)
+				if(NOT disassembly MATCHES "OpEntryPoint [A-Za-z]+ (%[^ ]+) \"${entryName}\"([^\n]*)")
+					message(FATAL_ERROR "${name}: no entry point named \"${entryName}\":\n${disassembly}")
+				endif()
+				set(entryId "${CMAKE_MATCH_1}")
+				set(interface "${CMAKE_MATCH_2}")
+				set(actual "")
+				if(kind STREQUAL "MODES")
+					string(REGEX MATCHALL "OpExecutionMode(Id)? ${entryId} [^\n]*" modeLines "${disassembly}")
+					foreach(modeLine IN LISTS modeLines)
+						string(REGEX REPLACE "^OpExecutionMode(Id)? ${entryId} " "" mode "${modeLine}")
+						string(STRIP "${mode}" mode)
+						string(REGEX REPLACE "%[A-Za-z0-9_]+" "%" mode "${mode}")
+						list(APPEND actual "${mode}")
+					endforeach()
+				else()
+					string(REGEX MATCHALL "%[A-Za-z0-9_]+" interfaceIds "${interface}")
+					foreach(variable IN LISTS interfaceIds)
+						if(disassembly MATCHES "OpDecorate ${variable} BuiltIn ([A-Za-z0-9_]+)")
+							list(APPEND actual "${CMAKE_MATCH_1}")
+						endif()
+					endforeach()
+				endif()
+				list(SORT actual)
+				if(NOT "${actual}" STREQUAL "${expected}")
+					message(FATAL_ERROR "${name}: entry point \"${entryName}\" has ${kind} [${actual}], expected exactly [${expected}]:\n${disassembly}")
+				endif()
 			endforeach()
 		endforeach()
 		foreach(line IN LISTS loopMergeNeedles)

@@ -132,6 +132,8 @@ leading comment block:
 | `DISASM: <text>` | the disassembly contains `<text>` |
 | `DISASM-NOT: <text>` | the disassembly does not contain `<text>` |
 | `DISASM-MATCH: <regex>` / `DISASM-NO-MATCH: <regex>` | as above, by regex |
+| `DISASM-ENTRY-MODES: <entry> <mode>, ...` | the named entry point has exactly these execution modes (not module-wide); ids in a mode are written `%`, e.g. `LocalSizeId % % %`; no modes after the name means none |
+| `DISASM-ENTRY-BUILTINS: <entry> <builtin>, ...` | the named entry point's interface variables carry exactly these BuiltIn decorations (e.g. `SampleMask`, `FragDepth`) |
 | `REFLECT: <text>` / `REFLECT-NOT: <text>` | the reflection JSON does or does not contain `<text>` |
 
 A probe that pins a rejection pins the **reject** path. If a change only lands the

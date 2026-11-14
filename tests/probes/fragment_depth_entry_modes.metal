@@ -2,6 +2,10 @@
 // DISASM: DepthReplacing
 // DISASM: DepthLess
 // DISASM: DepthGreater
+// DISASM-ENTRY-MODES: fa OriginUpperLeft, DepthReplacing
+// DISASM-ENTRY-MODES: fl OriginUpperLeft, DepthReplacing, DepthLess
+// DISASM-ENTRY-MODES: fg OriginUpperLeft, DepthReplacing, DepthGreater
+// DISASM-ENTRY-MODES: fc OriginUpperLeft
 struct A { float d [[depth(any)]]; };
 struct L { float d [[depth(less)]]; };
 struct G { float d [[depth(greater)]]; };

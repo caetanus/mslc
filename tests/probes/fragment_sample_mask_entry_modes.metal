@@ -3,6 +3,20 @@
 // DISASM: DepthLess
 // DISASM: DepthGreater
 // DISASM-NOT: SampleRateShading
+// DISASM-ENTRY-MODES: fa OriginUpperLeft
+// DISASM-ENTRY-MODES: fb OriginUpperLeft
+// DISASM-ENTRY-MODES: fl OriginUpperLeft, DepthReplacing, DepthLess
+// DISASM-ENTRY-MODES: fg OriginUpperLeft, DepthReplacing, DepthGreater
+// DISASM-ENTRY-MODES: fd OriginUpperLeft, DepthReplacing
+// DISASM-ENTRY-MODES: fc OriginUpperLeft
+// DISASM-ENTRY-MODES: v
+// DISASM-ENTRY-BUILTINS: fa SampleMask
+// DISASM-ENTRY-BUILTINS: fb SampleMask
+// DISASM-ENTRY-BUILTINS: fl FragDepth, SampleMask
+// DISASM-ENTRY-BUILTINS: fg FragDepth, SampleMask
+// DISASM-ENTRY-BUILTINS: fd FragDepth
+// DISASM-ENTRY-BUILTINS: fc
+// DISASM-ENTRY-BUILTINS: v Position
 struct M { uint m [[sample_mask]]; };
 struct L { float d [[depth(less)]]; uint m [[sample_mask]]; };
 struct G { uint m [[sample_mask]]; float d [[depth(greater)]]; };
