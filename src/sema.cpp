@@ -8814,7 +8814,9 @@ namespace {
 			}
 		} else {
 			const StageVariable& output = _outputs.front();
-			const Id returned = convert(value, _builder.typeOf(value), declared);
+			// A return converts as an initialiser does, as a helper's return already
+			// does: a scalar fills every component of a vector return type.
+			const Id returned = convertImplicit(value, declared);
 			_builder.emit(spirv::OpStore, { output.variable,
 				convert(returned, output.valueType, output.interfaceType) });
 		}
