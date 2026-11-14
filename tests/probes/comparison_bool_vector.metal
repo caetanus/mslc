@@ -1,6 +1,5 @@
-// EXPECT: error a bool operand is not lowered yet
-//
-// Apple accepts bool2 == bool2; mslc does not lower a bool operand yet.
+// EXPECT: valid
+// DISASM: OpLogicalEqual %v2bool
 kernel void comparison_bool_vector_rejected(device int2 *out [[buffer(0)]],
     constant int2 *a [[buffer(1)]], constant int2 *b [[buffer(2)]],
     uint i [[thread_position_in_grid]])

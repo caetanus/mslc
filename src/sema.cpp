@@ -4617,8 +4617,7 @@ namespace {
 
 		// A comparison or logical operator yields a bool regardless of operand
 		// type; an arithmetic one yields its operand type.
-		const bool isComparison = !isLogical && leftType != _boolType
-			&& isComparisonOperator(op);
+		const bool isComparison = !isLogical && isComparisonOperator(op);
 
 		if (isLogical) {
 			const uint16_t opcode = op == BinaryOperator::LogicalAnd
@@ -4744,8 +4743,17 @@ namespace {
 		const Id leftType = _builder.typeOf(left);
 		const Id rightType = _builder.typeOf(right);
 
+		// Two bool operands compare by value, as OpLogicalEqual does for scalars.
+		const bool logical = (op == BinaryOperator::Equal || op == BinaryOperator::NotEqual)
+			&& _types.isBool(leftType) && _types.isBool(rightType);
+
+		if (_types.isBool(leftType) != _types.isBool(rightType)
+			&& _types.vectorWidth(leftType) > 1 && _types.vectorWidth(rightType) > 1) {
+			throw CompileError("implicit conversions between vector types are not permitted");
+		}
+
 		for (const Id type: { leftType, rightType }) {
-			if (_types.bitWidth(type) == 0 || _types.isBool(type)) {
+			if (!logical && (_types.bitWidth(type) == 0 || _types.isBool(type))) {
 				throw CompileError("a comparison with a vector operand is lowered only for "
 					"numeric scalars and vectors; a bool operand is not lowered yet");
 			}
@@ -4776,6 +4784,11 @@ namespace {
 		}
 
 		const Id resultType = _types.vector(ScalarKind::Bool, _types.vectorWidth(operandType));
+		if (logical) {
+			return _builder.emitTyped(op == BinaryOperator::Equal
+				? spirv::OpLogicalEqual : spirv::OpLogicalNotEqual, resultType, { left, right });
+		}
+
 		return _builder.emitTyped(comparisonOpcode(op, _types.isFloat(operandType),
 			_types.isSignedInt(operandType)), resultType, { left, right });
 	}
