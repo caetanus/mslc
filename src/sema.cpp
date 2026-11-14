@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <set>
 
 namespace mslc {
@@ -1781,6 +1782,81 @@ namespace {
 		std::map<std::string, Binding> _saved;
 	};
 
+	// "::name" while a local of that name is in scope: for the length of one expression
+	// (the root of a member and index chain) the local is out of the map, so the lookup
+	// finds the file-scope name, which is the file-scope array of that name when there is
+	// one. Operands of the chain that are not the root (an index) are not "::name": they
+	// suspend the view, so a name there finds the local again.
+	class FileScopeView {
+	public:
+		using Stack = std::vector<FileScopeView*>;
+		// Nothing in force: no name is hidden.
+		explicit FileScopeView(Stack& views) : _views(views) {}
+		// Hides "name" until this view ends; views of other names stay in force beneath it.
+		FileScopeView(std::map<std::string, Binding>& bindings, Stack& views, const std::string& name,
+			const Binding* array)
+			: _bindings(&bindings), _views(views), _name(name), _hasArray(array != nullptr) {
+			_local = bindings.extract(name);
+			if (array) {
+				bindings.emplace(name, *array);
+			}
+			_engaged = true;
+			views.push_back(this);
+		}
+		// Puts every hidden local back, until this view ends, while an operand of a chain is
+		// evaluated: the operand is ordinary code, whichever "::" chains enclose it.
+		FileScopeView(Stack& views, bool suspend) : _views(views) {
+			if (!suspend) { return; }
+			for (auto view = views.rbegin(); view != views.rend(); ++view) {
+				if ((*view)->_hiding) {
+					(*view)->release();
+					_released.push_back(*view);
+				}
+			}
+		}
+		~FileScopeView() {
+			if (_engaged) {
+				release();
+				_views.pop_back();
+			}
+			for (auto view = _released.rbegin(); view != _released.rend(); ++view) {
+				(*view)->acquire();
+			}
+		}
+		FileScopeView(const FileScopeView&) = delete;
+		FileScopeView& operator=(const FileScopeView&) = delete;
+
+	private:
+		// The nodes are moved, never copied, so a reference into either stays valid across a
+		// suspension: an emitter that holds the file-scope array's binding while it evaluates
+		// an index still reads that binding afterwards.
+		void release() {
+			if (!_hiding) { return; }
+			if (_hasArray) { _file = _bindings->extract(_name); }
+			if (!_local.empty()) { _bindings->insert(std::move(_local)); }
+			_hiding = false;
+		}
+		void acquire() {
+			_local = _bindings->extract(_name);
+			if (_hasArray) { _bindings->insert(std::move(_file)); }
+			_hiding = true;
+		}
+
+		std::map<std::string, Binding>* _bindings = nullptr;
+		Stack& _views;
+		std::vector<FileScopeView*> _released;
+		std::map<std::string, Binding>::node_type _local;
+		std::map<std::string, Binding>::node_type _file;
+		std::string _name;
+		bool _hasArray = false;
+		bool _engaged = false;
+		bool _hiding = true;
+
+	public:
+		bool hides(const std::string& name) const { return _engaged && _hiding && _name == name; }
+		bool hiding() const { return _engaged && _hiding; }
+	};
+
 	// A value rather than a place, so there is no address to load through and a
 	// member is taken from the value itself.
 	struct ConstantBinding {
@@ -2502,6 +2578,8 @@ namespace {
 		const Binding* arrayRootBinding(const Expression& expression, size_t& depth) const;
 		void declareFileScopeArray(const VariableDeclaration& declaration, size_t position);
 		void bindFileScopeArrays(size_t declaredBefore);
+		std::unique_ptr<FileScopeView> viewFileScope(const Expression& expression);
+		FileScopeView::Stack _fileScopeViews;
 		struct FileScopeArray {
 			std::string name;
 			size_t position = 0;
@@ -2510,6 +2588,8 @@ namespace {
 			Type msl;
 		};
 		std::vector<FileScopeArray> _fileScopeArrays;
+		// The file-scope arrays the function being emitted sees, as bound before any local.
+		std::map<std::string, Binding> _fileScopeBound;
 		void validateConstexprInitializer(const VariableDeclaration& declaration);
 		void validateConstexprInitializer(const VariableDeclaration& declaration, const Type& type);
 		std::optional<std::string> enumOf(const Expression& expression);
@@ -4130,7 +4210,7 @@ namespace {
 			case ExpressionKind::FloatLiteral: return std::isfinite(foldExpression(expression).number);
 			case ExpressionKind::Identifier: {
 				if (expression.name == excluded) { return false; }
-				const auto local = _bindings.find(expression.name);
+				const auto local = expression.fileScope ? _bindings.end() : _bindings.find(expression.name);
 				if (local != _bindings.end()) { return _localFolded.count(local->second.id) != 0; }
 				const auto value = _folded.find(expression.name);
 				if (value == _folded.end() || value->second.isComposite
@@ -6794,7 +6874,7 @@ namespace {
 				return folded;
 
 			case ExpressionKind::Identifier: {
-				const auto local = _bindings.find(expression.name);
+				const auto local = expression.fileScope ? _bindings.end() : _bindings.find(expression.name);
 				if (local != _bindings.end()) {
 					const auto value = _localFolded.find(local->second.id);
 					if (value != _localFolded.end()) { return value->second; }
@@ -7606,6 +7686,7 @@ namespace {
 	// The arrays a function can see are the ones declared above it. A parameter or local
 	// of the same name is bound afterwards and wins.
 	void Emitter::bindFileScopeArrays(size_t declaredBefore) {
+		_fileScopeBound.clear();
 		for (const FileScopeArray& array: _fileScopeArrays) {
 			if (array.position >= declaredBefore) {
 				continue;
@@ -7618,10 +7699,37 @@ namespace {
 			binding.pointeeMsl = array.msl;
 			binding.readOnly = true;
 			_bindings[array.name] = binding;
+			_fileScopeBound[array.name] = binding;
 		}
 	}
 
+	// "::name" names what the file declares, so the entry that a local of that name
+	// holds is set aside for the expression; see FileScopeView.
+	// Evaluating anything else while any is in force suspends them all.
+	std::unique_ptr<FileScopeView> Emitter::viewFileScope(const Expression& expression) {
+		const Expression* root = &expression;
+		while ((root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) && root->left) {
+			root = root->left.get();
+		}
+		const auto hidden = [&](const std::string& name) {
+			return std::any_of(_fileScopeViews.begin(), _fileScopeViews.end(),
+				[&](const FileScopeView* view) { return view->hides(name); });
+		};
+		if (root->kind == ExpressionKind::Identifier && root->fileScope) {
+			if (hidden(root->name)) {
+				return std::make_unique<FileScopeView>(_fileScopeViews);
+			}
+			const auto array = _fileScopeBound.find(root->name);
+			return std::make_unique<FileScopeView>(_bindings, _fileScopeViews, root->name,
+				array == _fileScopeBound.end() ? nullptr : &array->second);
+		}
+		const bool anyHidden = std::any_of(_fileScopeViews.begin(), _fileScopeViews.end(),
+			[](const FileScopeView* view) { return view->hiding(); });
+		return std::make_unique<FileScopeView>(_fileScopeViews, anyHidden);
+	}
+
 	Id Emitter::emitExpression(const Expression& expression) {
+		const auto fileScopeView = viewFileScope(expression);
 		switch (expression.kind) {
 			case ExpressionKind::IntLiteral: {
 				// The literal's own type, which the parser took from its spelling:
@@ -9794,7 +9902,7 @@ namespace {
 				}
 				break;
 			case ExpressionKind::Identifier: {
-				const auto local = _bindings.find(expression.name);
+				const auto local = expression.fileScope ? _bindings.end() : _bindings.find(expression.name);
 				if (local == _bindings.end()) {
 					return false;
 				}
@@ -9901,7 +10009,7 @@ namespace {
 				// in the source in front of an enumerator is arithmetic and is not.
 				return std::optional<std::string>(expression.enumName);
 			case ExpressionKind::Identifier: {
-				const auto local = _bindings.find(expression.name);
+				const auto local = expression.fileScope ? _bindings.end() : _bindings.find(expression.name);
 				if (local != _bindings.end()) {
 					const Type& type = local->second.pointeeMsl;
 					if (type.isPointer || type.arrayLength) {

@@ -5009,11 +5009,9 @@ ExpressionPtr Parser::parsePrimary() {
 		// unless a parameter or local of that name is in scope.
 		size_t spelledTokens = 1;
 		QualifiedName spelled;
-		if (peekQualifiedName(spelled) && spelled.global && spelled.parts.size() == 1
-			&& isLocal(spelled.parts[0])) {
-			throw CompileError("\"::" + spelled.parts[0] + "\" names the file-scope declaration, which the local "
-				+ "of that name hides here; mslc keeps the two apart only under a namespace name");
-		}
+		// "::k" skips the local k: the identifier carries that, since both are named k.
+		const bool fileScoped = peekQualifiedName(spelled) && spelled.global && spelled.parts.size() == 1
+			&& isLocal(spelled.parts[0]);
 		if (_memberFields && kind() == TokenKind::Identifier && !blockName(std::string(current().text))
 			&& _memberFields->count(std::string(current().text)) && isLocal("this")
 			&& lookahead().kind != TokenKind::ColonColon) {
@@ -5070,7 +5068,7 @@ ExpressionPtr Parser::parsePrimary() {
 
 		// A struct's name and a braced list is a value of that struct: S{a, b} and
 		// S{.field = a}. It is spelled in a return, an argument or an initialiser.
-		if (!isLocal(resolved) && _unit.findStruct(resolved) && lookahead(spelledTokens).kind == TokenKind::LBrace) {
+		if ((fileScoped || !isLocal(resolved)) && _unit.findStruct(resolved) && lookahead(spelledTokens).kind == TokenKind::LBrace) {
 			consumeName();
 			ExpressionPtr list = parseInitializerList();
 			Type type;
@@ -5080,7 +5078,7 @@ ExpressionPtr Parser::parsePrimary() {
 		}
 
 		// A struct's name and an argument list call its constructor.
-		if (!isLocal(resolved) && _constructors.count(resolved) && lookahead(spelledTokens).kind == TokenKind::LParen) {
+		if ((fileScoped || !isLocal(resolved)) && _constructors.count(resolved) && lookahead(spelledTokens).kind == TokenKind::LParen) {
 			const size_t atLine = line();
 			consumeName();
 			advance();
@@ -5159,6 +5157,7 @@ ExpressionPtr Parser::parsePrimary() {
 		// An unqualified name in a call also finds the functions of its arguments' namespaces.
 		expression->unqualifiedCall = spelledTokens == 1 && lookahead(spelledTokens).kind == TokenKind::LParen
 			&& !isLocal(std::string(current().text));
+		expression->fileScope = fileScoped;
 		// A qualified call is looked up at the scope it WROTE, not at the scope the member
 		// it found happens to live in: "B::clamp" can resolve to "A::clamp" through a using
 		// declaration or directive in B, but it is still B's lookup that also reaches the

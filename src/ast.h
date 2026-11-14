@@ -275,6 +275,10 @@ struct Expression {
 	// adds the functions of its arguments' namespaces.
 	bool unqualifiedCall = false;
 
+	// Identifier: written "::name" while a local of that name is in scope, so the name
+	// is the file-scope declaration and the local does not hide it.
+	bool fileScope = false;
+
 	// InitList
 	std::vector<InitializerElement> elements;
 
