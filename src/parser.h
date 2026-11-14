@@ -78,6 +78,9 @@ class Parser {
 		std::map<std::string, std::string> names;
 		std::map<std::string, std::string> aliases;
 		std::vector<std::string> directives;
+		// Set on the outermost block of a function body or a for body, whose names share a C++
+		// scope with the enclosing parameters or init declaration.
+		bool sharesEnclosingScope = false;
 	};
 	std::vector<BlockScope> _blocks;
 
@@ -121,7 +124,7 @@ private:
 
 	// The body of an if, else, for or while: a block counts itself, anything else
 	// counts here.
-	StatementPtr parseBody();
+	StatementPtr parseBody(bool sharesEnclosingScope = false);
 
 	const Token& current() const { return _tokens[_position]; }
 	const Token& lookahead(size_t offset = 1) const;
@@ -334,7 +337,7 @@ private:
 	// The declarations after the first of "T a, b, c;", which parseStatement leaves
 	// for the list it is appending to.
 	std::vector<StatementPtr> _declaratorTail;
-	StatementPtr parseCompoundStatement();
+	StatementPtr parseCompoundStatement(bool sharesEnclosingScope = false);
 	StatementPtr parseIfStatement();
 	StatementPtr parseForStatement();
 	StatementPtr parseWhileStatement();
