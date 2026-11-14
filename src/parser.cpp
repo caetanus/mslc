@@ -2028,6 +2028,33 @@ size_t Parser::libraryPrefixParts(const QualifiedName& name) const {
 	return 0;
 }
 
+bool Parser::libraryNominatedFromHere() const {
+	const auto reaches = [&](const std::vector<std::string>& targets) {
+		for (const std::string& target : targets) {
+			std::set<std::string> seen;
+			std::set<std::string> none;
+			bool nominated = false;
+			collectMembers(target, "", seen, none, false, &nominated);
+			if (nominated) {
+				return true;
+			}
+		}
+		return false;
+	};
+	for (size_t depth = 0; depth <= _namespacePath.size(); ++depth) {
+		if (const auto entry = _scopes.find(namespacePrefix(depth)); entry != _scopes.end()
+			&& reaches(entry->second.directives)) {
+			return true;
+		}
+	}
+	for (const BlockScope& block : _blocks) {
+		if (reaches(block.directives)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 size_t Parser::libraryPrefixTokens() const {
 	QualifiedName name;
 	if (!peekQualifiedName(name)) {
@@ -2349,6 +2376,65 @@ std::string Parser::resolveName(const QualifiedName& name, std::vector<std::stri
 		}
 		return last;
 	}
+	// "N::access::read" with a directive or alias of metal in N, "precise::sqrt" under
+	// "using namespace metal;": a library scope reached through a namespace that nominates
+	// metal. The longest prefix that is a file namespace (or the lexical scope) decides.
+	if (!found) {
+		for (size_t count = parts.size() - 1; count-- > 0;) {
+			if (count == 0 && (name.global || parts[0] == kStdlibNamespace)) {
+				break;
+			}
+			if (!stdlibLookup(std::string(kStdlibNamespace) + "::" + parts[count], "").scopeExists) {
+				continue;
+			}
+			bool visible = false;
+			if (count == 0) {
+				QualifiedName first;
+				first.parts.push_back(parts[0]);
+				// Before "::" a name finds only namespaces and types: a local, function or variable of
+				// that spelling does not hide the library's scope.
+				const auto isType = [this](const std::string& candidate) {
+					for (const std::string_view kind : kindsOf(candidate)) {
+						if (kind == "struct" || kind == "enum" || kind == "typedef" || kind == kAnonymousStructTypedef) {
+							return true;
+						}
+					}
+					return false;
+				};
+				bool typeHides = false;
+				if (const std::string* bound = blockName(parts[0])) {
+					typeHides = !bound->empty() && isType(*bound);
+				} else {
+					for (const std::string& candidate : unqualifiedFound(parts[0])) {
+						typeHides = typeHides || isType(candidate);
+					}
+				}
+				visible = namespaceOf(first, 1, NamespaceLookup::Qualifier).empty() && !typeHides
+					&& libraryNominatedFromHere();
+			} else {
+				QualifiedName prefix = name;
+				prefix.parts.resize(count);
+				const std::string from = namespaceOf(prefix, count);
+				if (from.empty() || from == kStdlibNamespace) {
+					continue;
+				}
+				std::set<std::string> seen;
+				std::set<std::string> members;
+				bool nominated = false;
+				collectMembers(from, parts[count], seen, members, true, &nominated);
+				// A qualified walk stops at an own member of that name, so "nominated" is set only
+				// when the scope declares none.
+				visible = nominated;
+			}
+			if (visible) {
+				QualifiedName canonical;
+				canonical.global = true;
+				canonical.parts.push_back(kStdlibNamespace);
+				canonical.parts.insert(canonical.parts.end(), parts.begin() + count, parts.end());
+				return resolveName(canonical);
+			}
+		}
+	}
 	if (!found && parts.size() > 1) {
 		QualifiedName owner = name;
 		owner.parts.pop_back();
@@ -2399,6 +2485,16 @@ std::string Parser::resolveName(const QualifiedName& name, std::vector<std::stri
 			}
 			throw CompileError("no member named \"" + last + "\" in the enum \"" + ownerName + "\" (in \""
 				+ spelled + "\")");
+		}
+	}
+	// A nearer namespace named metal hides the library's: its own members are all there are.
+	if (!name.global && parts.size() > 1 && parts.front() == kStdlibNamespace) {
+		QualifiedName first;
+		first.parts.push_back(parts.front());
+		if (const std::string nearer = namespaceOf(first, 1, NamespaceLookup::Qualifier);
+			!nearer.empty() && nearer != kStdlibNamespace && isNamespacePath(nearer)) {
+			throw CompileError("no member named \"" + (found ? last : parts[1]) + "\" in the namespace \"" + nearer
+				+ "\" (in \"" + spelled + "\")");
 		}
 	}
 	if (parts.front() == kStdlibNamespace && parts.size() > 1

@@ -240,6 +240,8 @@ private:
 	// plain, nearest "metal::" is the literal branches' and counts as none.
 	size_t libraryPrefixParts(const QualifiedName& name) const;
 	size_t libraryPrefixTokens() const;
+	// Whether a using directive in scope, directly or through the namespaces it nominates, reaches metal.
+	bool libraryNominatedFromHere() const;
 	// The library's resource type name that a library prefix qualifies, or 0.
 	size_t libraryResourcePrefixTokens() const;
 	void parseUsing();

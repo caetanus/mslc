@@ -258,3 +258,12 @@ Also unchanged from before #355, found by comparing 224 generated switch program
   Apple rejects, mslc accepts.
 - `return; switch (y) { case 1: x = 1u; [[fallthrough]]; }` before an outer label (the inner
   switch's marker after a jump): Apple accepts, mslc rejects.
+
+## `using precise::sqrt;` beside `using namespace metal;` is accepted (Apple rejects the call as ambiguous)
+
+`using namespace metal; using precise::sqrt;` followed by a call `sqrt(x)` is rejected by Apple
+(`metal::sqrt` and `metal::precise::sqrt` are both visible), but mslc accepts it: the using
+declaration records the bare name `sqrt` as the library's, and mslc does not model the library's
+overload sets across `metal`, `metal::precise` and `metal::fast`. Only invalid source is accepted
+(both spellings lower to the same GLSL `Sqrt`), so no valid program changes value. Found in review
+of the #354 fix.
