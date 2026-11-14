@@ -731,6 +731,7 @@ bool Parser::tryParseHelperFunction() {
 	try {
 		// inline, static and constexpr in any order, ahead of the return type.
 		while (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
+			decl.isLocal = decl.isLocal || !atKeyword("constexpr");
 			advance();
 		}
 
@@ -1185,11 +1186,13 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 			constructors->hasDefault = true;
 			return;
 		}
+		fn.isLocal = true;
 		_unit.helpers.push_back(std::move(fn));
 		return;
 	}
 
 	fn.body = parseCompoundStatement();
+	fn.isLocal = true;
 	if (!isConstructor) {
 		_unit.helpers.push_back(std::move(fn));
 		return;

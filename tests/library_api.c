@@ -119,6 +119,19 @@ int main(int argc, char** argv) {
 		CHECK(header != NULL && fputs(included[i], header) >= 0 && fclose(header) == 0);
 		rejected("#include \"library-api-included.h\"\n", &options, "library-api-included.h:1:");
 	}
+	/* A helper in an included header is content too: accepted, where the other
+	 * declarations above are still refused with the header's own position. */
+	{
+		FILE* header = fopen("library-api-included.h", "w");
+		CHECK(header != NULL && fputs("float helper() { return 1; }", header) >= 0 && fclose(header) == 0);
+		const char* include = "#include \"library-api-included.h\"\n";
+		uint8_t* bytes = NULL;
+		size_t size = 0;
+		char* diagnostic = NULL;
+		CHECK(mslc_compile_library(include, strlen(include), &options, &bytes, &size, &diagnostic) == 0);
+		CHECK(bytes != NULL && size > 56 && diagnostic == NULL);
+		mslc_free(bytes);
+	}
 	char* error = NULL;
 	CHECK(mslc_translate("", 0, NULL, NULL, NULL, NULL, &error) == 1 && error != NULL);
 	mslc_free(error);

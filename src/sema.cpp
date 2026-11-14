@@ -1862,6 +1862,8 @@ namespace {
 	// number of arguments, and no function reaches itself. Apple accepts a
 	// recursive call, but SPIR-V for Vulkan forbids one, and a module with it
 	// fails validation, so it is refused here with the cycle named.
+	constexpr std::string_view stdlibPrefix = "metal::";
+
 	void validateHelpers(const TranslationUnit& unit, bool allowImports) {
 		std::map<std::string, const FunctionDecl*> first;
 		std::map<std::string, const FunctionDecl*> defined;
@@ -1910,7 +1912,6 @@ namespace {
 
 			// A prototype in namespace metal redeclares a standard library function; a
 			// definition with one of its parameter lists redefines it.
-			constexpr std::string_view stdlibPrefix = "metal::";
 			if (helper.body && helper.name.compare(0, stdlibPrefix.size(), stdlibPrefix) == 0) {
 				std::vector<std::optional<StdlibOperand>> operands;
 				for (const Parameter& parameter: helper.parameters) {
@@ -2357,6 +2358,7 @@ namespace {
 		Stage helperScope(const HelperFunction& helper) const;
 		void emitLibraryHelpers();
 		void emitImports();
+		bool isExported(const FunctionDecl& helper) const;
 		void linkageAttributes(Id function, const std::string& name, uint32_t type);
 		Id helperParameterType(const Type& type);
 		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
@@ -10127,31 +10129,47 @@ namespace {
 	// helpers this unit calls and does not define are emitted before the first body.
 	void Emitter::emitImports() {
 		_entryPoint = &_libraryScope;
-		std::vector<const Expression*> calls;
-		for (const FunctionDecl* entry: _entryPoints) {
-			collectCalls(*entry->body, calls);
-		}
+		// What the unit emits as a body: its entry points, what it exports, and what
+		// those call. A helper nothing reaches is not emitted, so it imports nothing.
+		std::set<const FunctionDecl*> seen;
+		std::vector<const FunctionDecl*> pending = _entryPoints;
 		for (const FunctionDecl& helper: _unit.helpers) {
-			if (helper.body) {
-				collectCalls(*helper.body, calls);
+			if (isExported(helper)) {
+				pending.push_back(&helper);
 			}
 		}
-		for (const Expression* call: calls) {
-			if (call->left->kind != ExpressionKind::Identifier) {
+		std::vector<HelperFunction*> imports;
+		while (!pending.empty()) {
+			const FunctionDecl* function = pending.back();
+			pending.pop_back();
+			if (!seen.insert(function).second) {
 				continue;
 			}
-			const auto found = _helpers.find(call->left->name);
-			if (found == _helpers.end() || found->second.definition->body) {
-				continue;
+			std::vector<const Expression*> calls;
+			collectCalls(*function->body, calls);
+			for (const Expression* call: calls) {
+				if (call->left->kind != ExpressionKind::Identifier) {
+					continue;
+				}
+				const auto found = _helpers.find(call->left->name);
+				if (found == _helpers.end()) {
+					continue;
+				}
+				if (found->second.definition->body) {
+					pending.push_back(found->second.definition);
+				} else {
+					imports.push_back(&found->second);
+				}
 			}
-			HelperFunction& entry = found->second;
-			if (std::any_of(entry.definition->parameters.begin(), entry.definition->parameters.end(),
+		}
+		for (HelperFunction* entry: imports) {
+			if (std::any_of(entry->definition->parameters.begin(), entry->definition->parameters.end(),
 				[](const Parameter& parameter) { return parameter.type.isPointer; })) {
-				throw CompileError("\"" + entry.definition->name + "\" is declared but defined elsewhere, and "
+				throw CompileError("\"" + entry->definition->name + "\" is declared but defined elsewhere, and "
 					"takes a pointer parameter; a thread pointer is lowered per caller, so it cannot be a "
 					"link-time symbol");
 			}
-			helperFunctionId(entry);
+			helperFunctionId(*entry);
 		}
 		for (size_t i = 0; i < _helperQueue.size(); ++i) {
 			emitHelper(*_helperQueue[i]);
@@ -10159,29 +10177,32 @@ namespace {
 		_helperQueue.clear();
 	}
 
-	// A Linkage object exports every helper it defines, whether or not anything in the
-	// unit calls it: another unit's call is what makes it live.
+	bool Emitter::isExported(const FunctionDecl& helper) const {
+		return helper.body && !helper.isLocal && _options.exportOnly && _options.exportOnly->count(helper.name);
+	}
+
+	// A Linkage object exports each helper it defines that lowers without a stage, whether
+	// or not anything in the unit calls it: another unit's call is what makes it live.
 	void Emitter::emitLibraryHelpers() {
 		_entryPoint = &_libraryScope;
-		std::set<std::string> exported;
 		for (const FunctionDecl& helper: _unit.helpers) {
-			if (!helper.body) {
+			if (!isExported(helper)) {
 				continue;
 			}
-			HelperFunction& entry = _helpers.at(helper.name);
-			if (std::any_of(helper.parameters.begin(), helper.parameters.end(),
-				[](const Parameter& parameter) { return parameter.type.isPointer; })) {
-				throw CompileError("helper \"" + helper.name + "\" takes a pointer parameter; a thread pointer "
-					"is lowered per caller, so it cannot be exported from a library");
+			try {
+				if (std::any_of(helper.parameters.begin(), helper.parameters.end(),
+					[](const Parameter& parameter) { return parameter.type.isPointer; })) {
+					throw CompileError("it takes a pointer parameter, which is lowered per caller");
+				}
+				linkageAttributes(helperFunctionId(_helpers.at(helper.name)), helper.name, kLinkageExport);
+				for (size_t i = 0; i < _helperQueue.size(); ++i) {
+					emitHelper(*_helperQueue[i]);
+				}
+				_helperQueue.clear();
+			} catch (const CompileError& error) {
+				throw CompileError("helper \"" + helper.name + "\" cannot be exported from a library, which does "
+					"not know the stage of its caller: " + error.what());
 			}
-			const Id function = helperFunctionId(entry);
-			if (exported.insert(helper.name).second) {
-				linkageAttributes(function, helper.name, kLinkageExport);
-			}
-			for (size_t i = 0; i < _helperQueue.size(); ++i) {
-				emitHelper(*_helperQueue[i]);
-			}
-			_helperQueue.clear();
 		}
 	}
 
@@ -10236,13 +10257,19 @@ namespace {
 				_helpers[helper.name].definition = &helper;
 			}
 		}
-		// A name the unit only declares stands for the declaration: a call to it is
-		// the one place validateHelpers lets through without a body.
+		// A name the unit only declares stands for the declaration. Not a standard library
+		// redeclaration (a call to it is the builtin), and not a member, whose call
+		// resolves through its struct.
 		if (_options.linkageObject) {
 			for (const FunctionDecl& helper: _unit.helpers) {
-				HelperFunction& entry = _helpers[helper.name];
-				if (!entry.definition && helper.name.compare(0, 7, "metal::") != 0) {
-					entry.definition = &helper;
+				const size_t tail = helper.name.rfind("::");
+				if (helper.body || helper.name.compare(0, stdlibPrefix.size(), stdlibPrefix) == 0
+					|| (tail != std::string::npos && _unit.findStruct(helper.name.substr(0, tail)))) {
+					continue;
+				}
+				const auto entry = _helpers.try_emplace(helper.name);
+				if (!entry.first->second.definition) {
+					entry.first->second.definition = &helper;
 				}
 			}
 		}
@@ -10339,8 +10366,35 @@ namespace {
 std::string emitModule(spirv::Builder& builder, const TranslationUnit& unit,
 	const std::vector<const FunctionDecl*>& entryPoints, const ModuleOptions& options) {
 	validateHelpers(unit, options.linkageObject);
+	ModuleOptions chosen = options;
+	if (options.linkageObject) {
+		// Each helper is tried alone in a scratch module. One that needs a stage cannot be
+		// exported; with an entry point it stays local to that stage's copies, and without
+		// one nothing could ever call it, so it is an error.
+		std::set<std::string> exportable;
+		const std::vector<const FunctionDecl*> none;
+		for (const FunctionDecl& helper: unit.helpers) {
+			if (!helper.body || helper.isLocal) {
+				continue;
+			}
+			ModuleOptions probe = options;
+			probe.exportOnly = std::set<std::string> { helper.name };
+			spirv::Builder scratch;
+			TypeTable scratchTypes(scratch, unit);
+			Emitter attempt(scratch, unit, none, probe, scratchTypes);
+			try {
+				attempt.run();
+				exportable.insert(helper.name);
+			} catch (const CompileError&) {
+				if (entryPoints.empty()) {
+					throw;
+				}
+			}
+		}
+		chosen.exportOnly = std::move(exportable);
+	}
 	TypeTable types(builder, unit);
-	Emitter emitter(builder, unit, entryPoints, options, types);
+	Emitter emitter(builder, unit, entryPoints, chosen, types);
 	return emitter.run();
 }
 

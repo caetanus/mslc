@@ -464,6 +464,10 @@ struct FunctionDecl {
 	// first declaration.
 	size_t order = 0;
 
+	// Declared static or inline, or a member defined in its struct: internal to the
+	// translation unit, so a Linkage object keeps it local instead of exporting it.
+	bool isLocal = false;
+
 	// A function that is not an entry point.
 	bool isHelper() const { return stage == Stage::None; }
 };
