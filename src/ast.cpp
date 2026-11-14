@@ -58,6 +58,9 @@ std::string typeName(const Type& type) {
 			name = "packed_" + name;
 		}
 	}
+	if (type.isAtomic) {
+		name = "atomic_" + name;
+	}
 	if (type.arrayLength) {
 		name += "[" + std::to_string(*type.arrayLength) + "]";
 	}
