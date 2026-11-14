@@ -2306,6 +2306,7 @@ namespace {
 		Id declareGlobalConstant(const VariableDeclaration& declaration);
 		Id emitConstant(const FoldedConstant& folded);
 		std::vector<uint32_t> constantWords(const FoldedConstant& folded);
+		FoldedConstant foldComparison(BinaryOperator op, FoldedConstant left, FoldedConstant right);
 		FoldedConstant foldInitializer(const Type& type, const Expression& initializer, bool braced = false);
 		void foldStructInitializer(FoldedConstant& folded, const StructDecl& decl,
 			const Expression& initializer);
@@ -6257,6 +6258,48 @@ namespace {
 		return operand;
 	}
 
+	// A comparison of two scalar constants. A bool is an int 0 or 1 here, as at
+	// run time, and the operands meet in the usual arithmetic conversions.
+	FoldedConstant Emitter::foldComparison(BinaryOperator op, FoldedConstant left, FoldedConstant right) {
+		for (FoldedConstant* operand: { &left, &right }) {
+			if (operand->scalar == ScalarKind::Bool) {
+				operand->scalar = ScalarKind::Int;
+				operand->integer = operand->boolean ? 1 : 0;
+			}
+		}
+
+		const auto compare = [&](auto l, auto r) {
+			switch (op) {
+				case BinaryOperator::Less: return l < r;
+				case BinaryOperator::LessEqual: return l <= r;
+				case BinaryOperator::Greater: return l > r;
+				case BinaryOperator::GreaterEqual: return l >= r;
+				case BinaryOperator::Equal: return l == r;
+				default: return l != r;
+			}
+		};
+
+		FoldedConstant folded;
+		folded.scalar = ScalarKind::Bool;
+		if (isFloatKind(left.scalar) || isFloatKind(right.scalar)) {
+			const ScalarKind kind = left.scalar == ScalarKind::Float || right.scalar == ScalarKind::Float
+				? ScalarKind::Float : ScalarKind::Half;
+			const auto valueOf = [&](const FoldedConstant& operand) {
+				return isFloatKind(operand.scalar) ? operand.number
+					: integerAsKind(kind, operand.scalar, operand.integer);
+			};
+			folded.boolean = compare(valueOf(left), valueOf(right));
+			return folded;
+		}
+
+		const ScalarKind common = commonIntegerKind(promotedKind(left.scalar), promotedKind(right.scalar));
+		const uint64_t l = normalizeInteger(common, left.integer);
+		const uint64_t r = normalizeInteger(common, right.integer);
+		folded.boolean = isSignedInteger(common)
+			? compare(static_cast<int64_t>(l), static_cast<int64_t>(r)) : compare(l, r);
+		return folded;
+	}
+
 	FoldedConstant Emitter::foldBinary(const Expression& expression) {
 		// && and || do not evaluate the right operand once the left decides the
 		// result, so an operation in it that no constant expression holds is not
@@ -6285,12 +6328,16 @@ namespace {
 			throw CompileError("a composite constant cannot be an operand of a binary operator");
 		}
 
+		const BinaryOperator op = expression.binaryOperator;
+
+		if (isComparisonOperator(op)) {
+			return foldComparison(op, left, right);
+		}
+
 		if (left.scalar == ScalarKind::Bool || right.scalar == ScalarKind::Bool) {
 			throw CompileError("an arithmetic or bitwise operator on a bool is not folded; "
 				"convert the bool to an int first");
 		}
-
-		const BinaryOperator op = expression.binaryOperator;
 
 		if (isFloatKind(left.scalar) || isFloatKind(right.scalar)) {
 			// A float beats a half, and either beats an integer, as in C.
