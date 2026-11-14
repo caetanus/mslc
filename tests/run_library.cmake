@@ -380,6 +380,31 @@ if(NOT at EQUAL -1)
 	message(FATAL_ERROR "a static inline helper must not be exported:\n${internal_dis}")
 endif()
 
+# An import reached only through a member function body, which the unit emits but which no
+# entry point names: its declaration still comes before every body. Alone and linked.
+file(WRITE "${OUT_DIR}/member_caller.metal"
+"#include <metal_stdlib>\nusing namespace metal;\nfloat shade(float v);\nstruct S { float v; float g() const { return shade(v); } };\nkernel void k(device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) { S s; s.v = 1.0; out[i] = s.g(); }\n")
+link_with_definer(member "${shade_definer}" "${OUT_DIR}/member_caller.metal")
+file(WRITE "${OUT_DIR}/member_helper_only.metal"
+"#include <metal_stdlib>\nusing namespace metal;\nfloat shade(float v);\nstruct S { float v; float g() const { return shade(v); } };\nfloat use(S s) { return s.g(); }\n")
+run_mslc(output 0 --compile-library -o "${OUT_DIR}/member_helper_only.spv" "${OUT_DIR}/member_helper_only.metal")
+validate_file("${OUT_DIR}/member_helper_only.spv" spv1.5 TRUE "a member reaching an import, in a unit of helpers")
+# A member defined in its struct is internal: a header's struct would otherwise be exported by
+# every includer.
+disassemble("${OUT_DIR}/member_helper_only.spv" member_dis)
+string(FIND "${member_dis}" "\"S::g\"" at)
+if(NOT at EQUAL -1)
+	message(FATAL_ERROR "a member defined in its struct must not be exported:\n${member_dis}")
+endif()
+expect_contains("${member_dis}" "LinkageAttributes \"use\" Export" "member unit")
+
+# constexpr is implicitly inline, so it is internal like static and inline.
+file(WRITE "${OUT_DIR}/shared_constexpr.h" "#ifndef SHARED_CONSTEXPR_H\n#define SHARED_CONSTEXPR_H\nconstexpr float half_of(float x) { return x * 0.5; }\nfloat shade(float v);\n#endif\n")
+file(WRITE "${OUT_DIR}/constexpr_caller.metal"
+"#include <metal_stdlib>\nusing namespace metal;\n#include \"shared_constexpr.h\"\nkernel void k(device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) { out[i] = half_of(shade(1.0)); }\n")
+link_with_definer(constexprs "#include <metal_stdlib>\nusing namespace metal;\n#include \"shared_constexpr.h\"\nfloat shade(float v) { return half_of(v); }\n"
+	"${OUT_DIR}/constexpr_caller.metal")
+
 # A stage-dependent helper is only refused where it has to be exported or imported:
 # beside an entry point it stays a local copy, as in default mode.
 file(WRITE "${OUT_DIR}/stage_local.metal"
@@ -402,6 +427,7 @@ endfunction()
 expect_library_refused(fwidth_export "float edge(float v) { return fwidth(v); }\n" "cannot be exported")
 expect_library_refused(implicit_lod_export
 	"float4 look(texture2d<float> t, sampler s, float2 uv) { return t.sample(s, uv); }\n" "explicit level")
+expect_library_refused(unrelated_error_unwrapped "float bad(float v) { return undeclared_name; }\n" "undeclared_name")
 expect_library_refused(pointer_export "float first(thread float* p) { return p[0]; }\n" "pointer parameter")
 expect_library_refused(pointer_import
 	"float first(thread float* p);\nkernel void k(device float* o [[buffer(0)]]) { float a[2] = {1.0, 2.0}; o[0] = first(a); }\n"

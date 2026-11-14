@@ -481,6 +481,13 @@ namespace {
 	// would promise no memory writes, which an entry point that stores to a
 	// buffer breaks, and neither flattening nor unrolling changes what the
 	// shader computes. Named from the generated table rather than written as 0.
+	// A construct that needs the stage of the entry point that reaches it. A library knows
+	// no stage, so such a helper cannot be exported from one.
+	class StageError: public CompileError {
+	public:
+		using CompileError::CompileError;
+	};
+
 	constexpr uint32_t kFunctionControlNone = spirv::FunctionControl::None;
 	// SPIR-V's Linkage Type operand of a LinkageAttributes decoration.
 	constexpr uint32_t kLinkageImport = 1;
@@ -2359,6 +2366,10 @@ namespace {
 		void emitLibraryHelpers();
 		void emitImports();
 		bool isExported(const FunctionDecl& helper) const;
+		bool isMemberName(const std::string& name) const {
+			const size_t tail = name.rfind("::");
+			return tail != std::string::npos && _unit.findStruct(name.substr(0, tail));
+		}
 		void linkageAttributes(Id function, const std::string& name, uint32_t type);
 		Id helperParameterType(const Type& type);
 		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
@@ -4852,7 +4863,7 @@ namespace {
 			throw CompileError(name + " takes one argument: the mem_flags to order");
 		}
 		if (_entryPoint->stage != Stage::Kernel) {
-			throw CompileError(name + " is only supported in a kernel function; Vulkan allows a "
+			throw StageError(name + " is only supported in a kernel function; Vulkan allows a "
 				"control barrier only in compute shaders");
 		}
 
@@ -5527,7 +5538,7 @@ namespace {
 		}
 
 		if (builtin.shape == MathShape::Fwidth && _entryPoint->stage != Stage::Fragment) {
-			throw CompileError("fwidth is only available in fragment functions");
+			throw StageError("fwidth is only available in fragment functions");
 		}
 
 		std::vector<Id> values;
@@ -7714,7 +7725,7 @@ namespace {
 		const Id float4 = _types.vector(ScalarKind::Float, 4);
 		Id sampled = InvalidId;
 		if (lod == InvalidId && _entryPoint == &_libraryScope && !sampler.unnormalizedSampler) {
-			throw CompileError("a sample with no explicit level in a library helper: whether it is implicit "
+			throw StageError("a sample with no explicit level in a library helper: whether it is implicit "
 				"depends on the stage of the entry point that calls it, which a library does not know; "
 				"pass level(...)");
 		}
@@ -9974,7 +9985,7 @@ namespace {
 				// stage here is the caller's: OpKill in it drops that caller's fragment,
 				// and a helper called from a vertex or kernel function is refused below.
 				if (_entryPoint->stage != Stage::Fragment) {
-					throw CompileError(std::string("discard_fragment() is not allowed within a ")
+					throw StageError(std::string("discard_fragment() is not allowed within a ")
 						+ (_entryPoint->stage == Stage::Vertex ? "vertex" : "kernel")
 						+ " function: it drops the fragment, and this function has none");
 				}
@@ -10134,7 +10145,9 @@ namespace {
 		std::set<const FunctionDecl*> seen;
 		std::vector<const FunctionDecl*> pending = _entryPoints;
 		for (const FunctionDecl& helper: _unit.helpers) {
-			if (isExported(helper)) {
+			// A member is reached through a receiver this scan cannot resolve, so every
+			// member body counts as emitted: an import it needs must come before any body.
+			if (isExported(helper) || (helper.body && isMemberName(helper.name))) {
 				pending.push_back(&helper);
 			}
 		}
@@ -10178,7 +10191,7 @@ namespace {
 	}
 
 	bool Emitter::isExported(const FunctionDecl& helper) const {
-		return helper.body && !helper.isLocal && _options.exportOnly && _options.exportOnly->count(helper.name);
+		return helper.body && _options.exportOnly && _options.exportOnly->count(helper.name);
 	}
 
 	// A Linkage object exports each helper it defines that lowers without a stage, whether
@@ -10189,17 +10202,18 @@ namespace {
 			if (!isExported(helper)) {
 				continue;
 			}
+			if (std::any_of(helper.parameters.begin(), helper.parameters.end(),
+				[](const Parameter& parameter) { return parameter.type.isPointer; })) {
+				throw CompileError("helper \"" + helper.name + "\" takes a pointer parameter, which is lowered "
+					"per caller, so it cannot be exported from a library");
+			}
 			try {
-				if (std::any_of(helper.parameters.begin(), helper.parameters.end(),
-					[](const Parameter& parameter) { return parameter.type.isPointer; })) {
-					throw CompileError("it takes a pointer parameter, which is lowered per caller");
-				}
 				linkageAttributes(helperFunctionId(_helpers.at(helper.name)), helper.name, kLinkageExport);
 				for (size_t i = 0; i < _helperQueue.size(); ++i) {
 					emitHelper(*_helperQueue[i]);
 				}
 				_helperQueue.clear();
-			} catch (const CompileError& error) {
+			} catch (const StageError& error) {
 				throw CompileError("helper \"" + helper.name + "\" cannot be exported from a library, which does "
 					"not know the stage of its caller: " + error.what());
 			}
@@ -10262,9 +10276,8 @@ namespace {
 		// resolves through its struct.
 		if (_options.linkageObject) {
 			for (const FunctionDecl& helper: _unit.helpers) {
-				const size_t tail = helper.name.rfind("::");
 				if (helper.body || helper.name.compare(0, stdlibPrefix.size(), stdlibPrefix) == 0
-					|| (tail != std::string::npos && _unit.findStruct(helper.name.substr(0, tail)))) {
+					|| isMemberName(helper.name)) {
 					continue;
 				}
 				const auto entry = _helpers.try_emplace(helper.name);

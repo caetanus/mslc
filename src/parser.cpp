@@ -731,7 +731,7 @@ bool Parser::tryParseHelperFunction() {
 	try {
 		// inline, static and constexpr in any order, ahead of the return type.
 		while (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
-			decl.isLocal = decl.isLocal || !atKeyword("constexpr");
+			decl.isLocal = true;
 			advance();
 		}
 
