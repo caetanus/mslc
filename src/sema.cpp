@@ -8453,9 +8453,12 @@ namespace {
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 
 			if (field.attributes.depthMode) {
-				if (field.attributes.colorIndex || field.attributes.position || field.attributes.attributeIndex
+				if (field.attributes.colorIndex || field.attributes.position || field.attributes.pointSize
 					|| field.attributes.sampleMask) {
 					throw CompileError(what + " has an incompatible depth attribute combination");
+				}
+				if (field.attributes.attributeIndex) {
+					throw CompileError(what + " combines depth with an attribute index, which mslc does not lower");
 				}
 				if (field.attributes.userName || field.attributes.interpolation != Interpolation::None) {
 					throw CompileError(what + " combines depth with user or interpolation, which mslc does not lower");
@@ -8476,8 +8479,11 @@ namespace {
 				continue;
 			}
 			if (field.attributes.sampleMask) {
-				if (field.attributes.colorIndex || field.attributes.position || field.attributes.attributeIndex) {
+				if (field.attributes.colorIndex || field.attributes.position || field.attributes.pointSize) {
 					throw CompileError(what + " has an incompatible sample_mask attribute combination");
+				}
+				if (field.attributes.attributeIndex) {
+					throw CompileError(what + " combines sample_mask with an attribute index, which mslc does not lower");
 				}
 				if (field.attributes.userName || field.attributes.interpolation != Interpolation::None) {
 					throw CompileError(what + " combines sample_mask with user or interpolation, which mslc does not lower");
