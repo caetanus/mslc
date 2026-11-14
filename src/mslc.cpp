@@ -6,6 +6,7 @@
 #include "sema.h"
 #include "spirv.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -40,7 +41,7 @@ namespace {
 		return buffer;
 	}
 
-	enum class ArtifactKind { VulkanExecutable, EmptyLibrary };
+	enum class ArtifactKind { VulkanExecutable, LinkageObject };
 
 	void compile(const char* source, size_t sourceLength, const MslcOptions& effective,
 		ArtifactKind kind, std::vector<uint8_t>& module, std::string& reflection) {
@@ -71,10 +72,13 @@ namespace {
 		}();
 
 		mslc::spirv::Builder builder;
-		if (kind == ArtifactKind::EmptyLibrary) {
+		const bool declaresFunctions = !unit.functions.empty() || !unit.helpers.empty();
+		if (kind == ArtifactKind::LinkageObject) {
 			if (effective.stage != MSLC_STAGE_UNKNOWN) {
 				throw mslc::CompileError("library compilation requires stage UNKNOWN");
 			}
+		}
+		if (kind == ArtifactKind::LinkageObject && !declaresFunctions) {
 			const auto& tokens = preprocessed.tokens;
 			for (size_t i = 0; i < tokens.size();) {
 				if (tokens[i].kind == mslc::TokenKind::EndOfFile
@@ -104,13 +108,23 @@ namespace {
 			return;
 		}
 
-		const auto entryPoints = mslc::selectEntryPoints(unit, stageFromApi(effective.stage));
+		const bool object = kind == ArtifactKind::LinkageObject;
+		// A Linkage object may be all helpers; a Vulkan executable may not.
+		const bool hasEntryPoint = std::any_of(unit.functions.begin(), unit.functions.end(),
+			[](const mslc::FunctionDecl& function) { return !function.isHelper(); });
+		const auto entryPoints = object && !hasEntryPoint ? std::vector<const mslc::FunctionDecl*>()
+			: mslc::selectEntryPoints(unit, stageFromApi(effective.stage));
 		mslc::ModuleOptions moduleOptions;
 		moduleOptions.localSizeX = effective.localSizeX ? effective.localSizeX : 1;
 		moduleOptions.localSizeY = effective.localSizeY ? effective.localSizeY : 1;
 		moduleOptions.localSizeZ = effective.localSizeZ ? effective.localSizeZ : 1;
 		moduleOptions.separateImageSet = effective.imageSetPolicy == MSLC_SET_IMAGES;
+		moduleOptions.linkageObject = object;
 		reflection = mslc::emitModule(builder, unit, entryPoints, moduleOptions);
+		if (object) {
+			builder.finalizeLibrary(module);
+			return;
+		}
 		if (!builder.finalize(module)) {
 			throw mslc::CompileError("emitted no entry point, so the module is not loadable");
 		}
@@ -164,7 +178,7 @@ int mslc_compile_library(const char* source, size_t sourceLength, const MslcOpti
 		if (options) effective = *options;
 		std::vector<uint8_t> module;
 		std::string reflection;
-		compile(source, sourceLength, effective, ArtifactKind::EmptyLibrary, module, reflection);
+		compile(source, sourceLength, effective, ArtifactKind::LinkageObject, module, reflection);
 		auto* buffer = static_cast<uint8_t*>(libraryAllocate(module.size(), 1));
 		if (!buffer) return libraryError("internal error: allocation failure", 2, outError);
 		std::memcpy(buffer, module.data(), module.size());

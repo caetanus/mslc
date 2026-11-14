@@ -277,6 +277,9 @@ struct ModuleOptions {
 	uint32_t localSizeY = 1;
 	uint32_t localSizeZ = 1;
 	bool separateImageSet = false;
+	// A Linkage object rather than a Vulkan executable: it may have no entry point,
+	// exports the helpers it defines, and may call a helper it only declares.
+	bool linkageObject = false;
 };
 
 // The reflection's embedded_samplers entries carry the whole of indium's

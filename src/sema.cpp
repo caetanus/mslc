@@ -482,6 +482,8 @@ namespace {
 	// buffer breaks, and neither flattening nor unrolling changes what the
 	// shader computes. Named from the generated table rather than written as 0.
 	constexpr uint32_t kFunctionControlNone = spirv::FunctionControl::None;
+	// SPIR-V's Linkage Type operand of a LinkageAttributes decoration.
+	constexpr uint32_t kLinkageExport = 0;
 	constexpr uint32_t kSelectionControlNone = spirv::SelectionControl::None;
 	constexpr uint32_t kLoopControlNone = spirv::LoopControl::None;
 	// The Lod bit of the image operands mask, which an explicit-lod sample and
@@ -2012,6 +2014,9 @@ namespace {
 		// entry point in another stage gets its own set and its own execution
 		// modes without any of them being passed down.
 		const FunctionDecl* _entryPoint = nullptr;
+		// Stands in for the entry point while a library's helpers are emitted: no
+		// stage, so a helper that needs one (fwidth, a barrier) is refused.
+		FunctionDecl _libraryScope;
 		const ModuleOptions& _options;
 		TypeTable& _types;
 
@@ -2344,6 +2349,10 @@ namespace {
 		Id emitCall(const Expression& expression);
 		HelperFunction* findHelper(const Expression& call, const Expression*& receiver);
 		Id emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver);
+		Id helperFunctionId(HelperFunction& helper);
+		Stage helperScope(const HelperFunction& helper) const;
+		void emitLibraryHelpers();
+		void linkageAttributes(Id function, const std::string& name, uint32_t type);
 		Id helperParameterType(const Type& type);
 		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
 			size_t first) const;
@@ -5091,13 +5100,10 @@ namespace {
 		return array;
 	}
 
-	// Arguments are evaluated left to right and converted to the parameter types.
-	// Resource arguments retain their caller's identity, including writes.
-	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& generic, const Expression* receiver) {
-		const FunctionDecl& definition = *generic.definition;
-		std::vector<Id> arrays(definition.parameters.size(), InvalidId);
-		HelperFunction& helper = pointerSpecialisation(call, generic, receiver ? 1 : 0, arrays);
-
+	// The id the function is called by in the scope being emitted, with its type
+	// declared and its body queued the first time.
+	Id Emitter::helperFunctionId(HelperFunction& helper) {
+		const FunctionDecl& definition = *helper.definition;
 		if (helper.type == InvalidId) {
 			helper.returnType = returnsVoid(definition) ? _voidType : declaredTypeOf(definition.returnType);
 			std::vector<Id> signature { helper.returnType };
@@ -5121,13 +5127,30 @@ namespace {
 			helper.type = slot.first->second;
 		}
 
-		const auto slot = helper.ids.emplace(_entryPoint->stage, InvalidId);
+		const auto slot = helper.ids.emplace(helperScope(helper), InvalidId);
 		if (slot.second) {
 			slot.first->second = _builder.nextId();
 			_helperQueue.push_back(&helper);
 		}
 
-		std::vector<uint32_t> operands { slot.first->second };
+		return slot.first->second;
+	}
+
+	// A helper is emitted once per stage that reaches it. A library's own helpers are
+	// emitted under no stage.
+	Stage Emitter::helperScope(const HelperFunction& helper) const {
+		(void)helper;
+		return _entryPoint->stage;
+	}
+
+	// Arguments are evaluated left to right and converted to the parameter types.
+	// Resource arguments retain their caller's identity, including writes.
+	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& generic, const Expression* receiver) {
+		const FunctionDecl& definition = *generic.definition;
+		std::vector<Id> arrays(definition.parameters.size(), InvalidId);
+		HelperFunction& helper = pointerSpecialisation(call, generic, receiver ? 1 : 0, arrays);
+
+		std::vector<uint32_t> operands { helperFunctionId(helper) };
 		std::vector<std::pair<Id, Id>> copyOuts;
 		std::vector<std::optional<StdlibOperand>> argumentOperands(call.arguments.size());
 		const auto stdlibArgumentOperand = [&](Id type) -> std::optional<StdlibOperand> {
@@ -5394,7 +5417,8 @@ namespace {
 		_controlDepth = 0;
 
 		_builder.setSection(spirv::Section::Functions);
-		_builder.emitDeclTypedAt(spirv::OpFunction, helper.returnType, helper.ids.at(_entryPoint->stage),
+		const Id function = helper.ids.at(helperScope(helper));
+		_builder.emitDeclTypedAt(spirv::OpFunction, helper.returnType, function,
 			{ kFunctionControlNone, helper.type });
 
 		std::vector<Id> values;
@@ -7672,6 +7696,11 @@ namespace {
 
 		const Id float4 = _types.vector(ScalarKind::Float, 4);
 		Id sampled = InvalidId;
+		if (lod == InvalidId && _entryPoint == &_libraryScope && !sampler.unnormalizedSampler) {
+			throw CompileError("a sample with no explicit level in a library helper: whether it is implicit "
+				"depends on the stage of the entry point that calls it, which a library does not know; "
+				"pass level(...)");
+		}
 		if (lod == InvalidId && _entryPoint->stage == Stage::Fragment && !sampler.unnormalizedSampler) {
 			sampled = _builder.emitTyped(spirv::OpImageSampleImplicitLod, float4, { combined, coordinate });
 		} else {
@@ -10072,12 +10101,48 @@ namespace {
 		_helperQueue.clear();
 	}
 
+	void Emitter::linkageAttributes(Id function, const std::string& name, uint32_t type) {
+		std::vector<uint32_t> operands { function, static_cast<uint32_t>(spirv::Decoration::LinkageAttributes) };
+		spirv::Builder::appendString(operands, name);
+		operands.push_back(type);
+		_builder.emit(spirv::OpDecorate, operands);
+	}
+
+	// A Linkage object exports every helper it defines, whether or not anything in the
+	// unit calls it: another unit's call is what makes it live.
+	void Emitter::emitLibraryHelpers() {
+		_entryPoint = &_libraryScope;
+		std::set<std::string> exported;
+		for (const FunctionDecl& helper: _unit.helpers) {
+			if (!helper.body) {
+				continue;
+			}
+			HelperFunction& entry = _helpers.at(helper.name);
+			if (std::any_of(helper.parameters.begin(), helper.parameters.end(),
+				[](const Parameter& parameter) { return parameter.type.isPointer; })) {
+				throw CompileError("helper \"" + helper.name + "\" takes a pointer parameter; a thread pointer "
+					"is lowered per caller, so it cannot be exported from a library");
+			}
+			const Id function = helperFunctionId(entry);
+			if (exported.insert(helper.name).second) {
+				linkageAttributes(function, helper.name, kLinkageExport);
+			}
+			for (size_t i = 0; i < _helperQueue.size(); ++i) {
+				emitHelper(*_helperQueue[i]);
+			}
+			_helperQueue.clear();
+		}
+	}
+
 	// Emits the whole module: the capabilities, the memory model and the
 	// file-scope globals once, then every entry point. Returns the reflection
 	// document.
 	std::string Emitter::run() {
 		_builder.setSection(spirv::Section::Capabilities);
 		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Shader) });
+		if (_options.linkageObject) {
+			_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Linkage) });
+		}
 
 	// The capability goes with the addressing model rather than with the block:
 	// the model is declared whether or not the shader has a buffer, so a kernel
@@ -10120,7 +10185,6 @@ namespace {
 				_helpers[helper.name].definition = &helper;
 			}
 		}
-
 		// One reflection entry per entry point, in the order they were selected.
 		std::string document = "{\n";
 		document += "\t\"reflection_version\": 2,\n";
@@ -10192,6 +10256,10 @@ namespace {
 		}
 
 		document += "\t]\n}\n";
+
+		if (_options.linkageObject) {
+			emitLibraryHelpers();
+		}
 
 		// After every entry point, so a diagnostic about one function's own
 		// interface comes before one about how two of them pair up.
