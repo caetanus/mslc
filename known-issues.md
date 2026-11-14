@@ -60,3 +60,24 @@ and update or remove this entry.
 for indium and is validated by `spirv-val`, but a driver may not implement it.
 Where a read-back is required for such a module, confirm the driver supports
 the addressing model before treating a failure as an mslc defect.
+
+## atomic_compare_exchange_weak_explicit accepts a narrower set than Apple (#249)
+
+mslc lowers the weak form only for the shapes below and refuses the rest with a
+diagnostic, so these are documented under-acceptances (valid Metal that mslc
+rejects), not miscompiles. `atomic_compare_exchange_strong_explicit` does not
+exist in Apple's toolchain and is rejected on purpose.
+
+Expected side (`&expected`): only the address of a plain local scalar of the
+atomic's own type (`uint` for `atomic_uint`, `int` for `atomic_int`) is taken.
+Not supported: `&e[1]` (array element), `&e.y` (a struct member; a vector
+element is an error in Apple too), a `thread` pointer local passed as the
+expected argument, a builtin parameter, `&*&e`, and a `memory_order(0)` style
+order spelled as anything but `memory_order_relaxed`.
+
+Atomic side: only a device `atomic_uint`/`atomic_int` buffer pointer or element
+(`&c[i]`, or the pointer itself), or `&local` of a scalar threadgroup atomic.
+Not supported: atomic pointers received as helper parameters, atomics held in
+struct members, a `device atomic_uint&` reference, pointer arithmetic on the
+atomic pointer, threadgroup atomic arrays, `atomic<uint>`, and an alias
+declared with `using A = atomic_uint` (a `typedef` alias is supported).
