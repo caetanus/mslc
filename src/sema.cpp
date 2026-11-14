@@ -1999,7 +1999,32 @@ namespace {
 	// fails validation, so it is refused here with the cycle named.
 	constexpr std::string_view stdlibPrefix = "metal::";
 
+	// The names the unit gives two or more signatures. A member function keeps one
+	// signature per name, which validateHelpers still enforces.
+	std::set<std::string> overloadedNames(const TranslationUnit& unit) {
+		std::map<std::string, const FunctionDecl*> seen;
+		std::set<std::string> overloaded;
+		for (const FunctionDecl& helper: unit.helpers) {
+			const size_t tail = helper.name.rfind("::");
+			if (tail != std::string::npos && unit.findStruct(helper.name.substr(0, tail))) {
+				continue;
+			}
+			const auto previous = seen.emplace(helper.name, &helper);
+			if (!previous.second && !sameParameterTypes(*previous.first->second, helper)) {
+				overloaded.insert(helper.name);
+			}
+		}
+		return overloaded;
+	}
+
+	// What a function is called inside the compiler: its name, and for an overloaded
+	// name also its parameters, so each signature is a function of its own.
+	std::string helperKey(const FunctionDecl& helper, const std::set<std::string>& overloaded) {
+		return overloaded.count(helper.name) ? helper.name + "(" + parameterSignature(helper) + ")" : helper.name;
+	}
+
 	void validateHelpers(const TranslationUnit& unit, bool allowImports) {
+		const std::set<std::string> overloaded = overloadedNames(unit);
 		std::map<std::string, const FunctionDecl*> first;
 		std::map<std::string, const FunctionDecl*> defined;
 
@@ -2024,7 +2049,10 @@ namespace {
 				throw CompileError("\"" + helper.name + "\" names both an entry point and a helper function");
 			}
 
-			const auto previous = first.emplace(helper.name, &helper);
+			// A call to an overloaded name is resolved by its arguments' types, which only
+			// the emitter has: the by-name checks below skip it (no key is the bare name).
+			const std::string key = helperKey(helper, overloaded);
+			const auto previous = first.emplace(key, &helper);
 			if (!previous.second) {
 				if (!mslc::sameParameterTypes(*previous.first->second, helper)) {
 					throw CompileError("overloading \"" + helper.name + "\" is not lowered yet; Apple "
@@ -2041,7 +2069,7 @@ namespace {
 				}
 			}
 
-			if (helper.body && !defined.emplace(helper.name, &helper).second) {
+			if (helper.body && !defined.emplace(key, &helper).second) {
 				throw CompileError("redefinition of \"" + helper.name + "\"");
 			}
 
@@ -2103,7 +2131,7 @@ namespace {
 		for (const FunctionDecl& function: unit.functions) {
 			check(function);
 		}
-		for (const auto& [name, definition]: defined) {
+		for (const auto& [key, definition]: defined) {
 			check(*definition);
 		}
 
@@ -2134,8 +2162,8 @@ namespace {
 			path.pop_back();
 			state[name] = Visit::Done;
 		};
-		for (const auto& [name, definition]: defined) {
-			visit(visit, name);
+		for (const auto& [key, definition]: defined) {
+			visit(visit, definition->name);
 		}
 	}
 
@@ -2269,8 +2297,17 @@ namespace {
 			// array bound to each parameter (zero for any other): the helper is
 			// emitted once per distinct list, so its pointer is to the whole array.
 			std::vector<uint32_t> arrayLengths;
+			// Where the first declaration of this signature sits (FunctionDecl::order):
+			// an overload is a candidate only from there down.
+			size_t firstOrder = 0;
 		};
+		// Keyed by helperKey: the name, or for an overloaded name each signature.
 		std::map<std::string, HelperFunction> _helpers;
+		std::set<std::string> _overloadedNames;
+		std::map<std::string, std::vector<HelperFunction*>> _overloads;
+		// Which function calls which, so a cycle through overloads, which the by-name check
+		// of validateHelpers cannot see, is refused when the call that closes it is emitted.
+		std::map<const FunctionDecl*, std::set<const FunctionDecl*>> _callEdges;
 		std::map<std::pair<const FunctionDecl*, std::vector<uint32_t>>, HelperFunction> _pointerSpecialisations;
 		// Helpers called and not yet emitted. A body cannot be emitted while the
 		// function that calls it is half written, so they wait for its end.
@@ -2355,7 +2392,7 @@ namespace {
 		}
 		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
 		void reserveFileScopeSamplers();
-		void rejectMemberFileScopeSamplers(const FunctionDecl& member) const;
+		void rejectMemberFileScopeSamplers(const FunctionDecl& member);
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void addReflectionEntry(const std::string& entry);
 		std::string descriptorJson(uint32_t binding) const;
@@ -2491,8 +2528,18 @@ namespace {
 		// tells a member read on one apart from a member read on a local.
 		const ConstantBinding* constantFor(const Expression* expression);
 		Id emitCall(const Expression& expression);
-		HelperFunction* findHelper(const Expression& call, const Expression*& receiver);
-		Id emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver);
+		HelperFunction* findHelper(const Expression& call, const Expression*& receiver, std::vector<Id>& prepared);
+		Id emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver,
+			const std::vector<Id>& prepared);
+		std::vector<HelperFunction*> helpersNamed(const std::string& name);
+		HelperFunction* resolveOverload(const Expression& call, const std::vector<HelperFunction*>& set,
+			std::vector<Id>& prepared);
+		const HelperFunction* returningHelper(const Expression& call, std::string (*aspect)(const Type&));
+		size_t callerOrder() const { return (_helper ? _helper : _entryPoint)->order; }
+		void noteCall(const FunctionDecl& callee);
+		std::string linkageName(const FunctionDecl& helper) const {
+			return _overloadedNames.count(helper.name) ? helperKey(helper, _overloadedNames) : helper.name;
+		}
 		Id helperFunctionId(HelperFunction& helper);
 		Stage helperScope(const HelperFunction& helper) const;
 		void emitLibraryHelpers();
@@ -3483,8 +3530,9 @@ namespace {
 				// the type of, and this has to leave no code behind.
 				const HelperFunction* helper = nullptr;
 				if (expression.left->kind == ExpressionKind::Identifier) {
-					const auto found = _helpers.find(expression.left->name);
-					helper = found == _helpers.end() ? nullptr : &found->second;
+					helper = returningHelper(expression, [](const Type& type) {
+						return type.isPointer || type.arrayLength ? std::string("*") : type.namedType;
+					});
 				} else if (expression.left->kind == ExpressionKind::Member) {
 					const StructDecl* owner = structOf(*expression.left->left);
 					const auto found = owner ? _helpers.find(owner->name + "::" + expression.left->memberName)
@@ -5215,7 +5263,8 @@ namespace {
 
 	Id Emitter::emitCall(const Expression& expression) {
 		const Expression* receiver = nullptr;
-		HelperFunction* helper = findHelper(expression, receiver);
+		std::vector<Id> prepared;
+		HelperFunction* helper = findHelper(expression, receiver, prepared);
 		if (!helper && expression.left->kind == ExpressionKind::Member) {
 			return emitTextureCall(expression);
 		}
@@ -5230,7 +5279,7 @@ namespace {
 					"no value");
 			}
 
-			return emitHelperCall(expression, *helper, receiver);
+			return emitHelperCall(expression, *helper, receiver, prepared);
 		}
 
 		const std::string name = builtinCalleeName(expression.left->name);
@@ -5326,7 +5375,8 @@ namespace {
 	// The helper a call names. A call through "." is a member function when the
 	// receiver is a struct value, and then receiver is the expression to be passed
 	// first.
-	Emitter::HelperFunction* Emitter::findHelper(const Expression& call, const Expression*& receiver) {
+	Emitter::HelperFunction* Emitter::findHelper(const Expression& call, const Expression*& receiver,
+		std::vector<Id>& prepared) {
 		receiver = nullptr;
 		if (call.left->kind == ExpressionKind::Member) {
 			const Expression& member = *call.left;
@@ -5390,8 +5440,156 @@ namespace {
 				"instantiation, which is not lowered yet; the template itself is parsed and accepted");
 		}
 
+		const auto overloads = _overloads.find(call.left->name);
+		if (overloads != _overloads.end()) {
+			return resolveOverload(call, overloads->second, prepared);
+		}
+
 		const auto found = _helpers.find(call.left->name);
 		return found == _helpers.end() ? nullptr : &found->second;
+	}
+
+	// Every function a name can denote: its one function, or each signature of an overloaded name.
+	std::vector<Emitter::HelperFunction*> Emitter::helpersNamed(const std::string& name) {
+		if (const auto overloads = _overloads.find(name); overloads != _overloads.end()) {
+			return overloads->second;
+		}
+		const auto found = _helpers.find(name);
+		return found == _helpers.end() ? std::vector<HelperFunction*>() : std::vector<HelperFunction*> { &found->second };
+	}
+
+	// The function a call's result is read from before the call is emitted, for one aspect of its
+	// type (the struct it returns, the enum it returns). An overloaded name has one only when every
+	// overload of the call's arity agrees on that aspect, since the arguments are not evaluated yet.
+	const Emitter::HelperFunction* Emitter::returningHelper(const Expression& call,
+		std::string (*aspect)(const Type&)) {
+		const HelperFunction* chosen = nullptr;
+		for (const HelperFunction* candidate: helpersNamed(call.left->name)) {
+			const FunctionDecl& definition = *candidate->definition;
+			if (_overloads.count(call.left->name)
+				&& (candidate->firstOrder > callerOrder() || definition.parameters.size() != call.arguments.size())) {
+				continue;
+			}
+			if (chosen) {
+				if (aspect(chosen->definition->returnType) != aspect(definition.returnType)) {
+					throw CompileError("the overloads of \"" + call.left->name + "\" differ in what they return "
+						"in a way this use of the call depends on, and which one the call chooses is not known "
+						"before its arguments are evaluated; assign the call to a variable first");
+				}
+				continue;
+			}
+			chosen = candidate;
+		}
+		return chosen;
+	}
+
+	// The overload a call names, chosen by its arguments. Arity alone often decides; otherwise the
+	// arguments are evaluated here, once, left to right, and handed on in prepared so the call
+	// does not evaluate them again.
+	Emitter::HelperFunction* Emitter::resolveOverload(const Expression& call, const std::vector<HelperFunction*>& set,
+		std::vector<Id>& prepared) {
+		const std::string& name = call.left->name;
+		const auto describe = [&](const std::vector<HelperFunction*>& entries) {
+			std::string list;
+			for (const HelperFunction* entry: entries) {
+				list += (list.empty() ? "" : ", ") + name + "(" + parameterSignature(*entry->definition) + ")";
+			}
+			return list;
+		};
+		const auto chosen = [&](HelperFunction* entry) {
+			if (!entry->definition->body && !_options.linkageObject) {
+				throw CompileError("\"" + name + "(" + parameterSignature(*entry->definition)
+					+ ")\" is declared but never defined");
+			}
+			return entry;
+		};
+		std::vector<HelperFunction*> visible;
+		std::vector<HelperFunction*> candidates;
+		for (HelperFunction* entry: set) {
+			if (entry->firstOrder > callerOrder()) {
+				continue;
+			}
+			visible.push_back(entry);
+			if (entry->definition->parameters.size() == call.arguments.size()) {
+				candidates.push_back(entry);
+			}
+		}
+		if (visible.empty()) {
+			throw CompileError("\"" + name + "\" is called before it is declared; declare it above its first use");
+		}
+		if (candidates.empty()) {
+			throw CompileError("no matching function for call to \"" + name + "\": it is called with "
+				+ std::to_string(call.arguments.size()) + " arguments; candidates: " + describe(visible));
+		}
+		if (candidates.size() == 1) {
+			return chosen(candidates.front());
+		}
+
+		for (const HelperFunction* entry: candidates) {
+			for (const Parameter& parameter: entry->definition->parameters) {
+				if (parameter.type.isPointer || parameter.type.arrayLength || parameter.isMutableReference()
+					|| parameter.type.resource != ResourceKind::None || !parameter.type.enumName.empty()) {
+					throw CompileError("the call to \"" + name + "\" chooses among overloads with the same "
+						"number of arguments, and one takes a pointer, a mutable reference, an enum or a "
+						"texture or sampler; that is not lowered yet (candidates: " + describe(candidates) + ")");
+				}
+			}
+		}
+		for (const ExpressionPtr& argument: call.arguments) {
+			if (const auto tag = enumOf(*argument); tag && !tag->empty()) {
+				throw CompileError("the call to \"" + name + "\" passes an enum to a choice among overloads, "
+					"which is not lowered yet");
+			}
+		}
+
+		for (const ExpressionPtr& argument: call.arguments) {
+			prepared.push_back(emitExpression(*argument));
+		}
+		std::vector<HelperFunction*> exact;
+		for (HelperFunction* entry: candidates) {
+			bool matches = true;
+			for (size_t i = 0; i < prepared.size(); ++i) {
+				matches = matches
+					&& declaredTypeOf(entry->definition->parameters[i].type) == _builder.typeOf(prepared[i]);
+			}
+			if (matches) {
+				exact.push_back(entry);
+			}
+		}
+		if (exact.size() > 1) {
+			throw CompileError("call to \"" + name + "\" is ambiguous; candidates: " + describe(exact));
+		}
+		if (exact.empty()) {
+			throw CompileError("no overload of \"" + name + "\" takes exactly these argument types, and choosing "
+				"by implicit conversion is not lowered yet; candidates: " + describe(candidates));
+		}
+		return chosen(exact.front());
+	}
+
+	// A call is an edge of the call graph. validateHelpers sees the edges whose callee a name
+	// identifies; the others are checked here, against the edges emitted so far.
+	void Emitter::noteCall(const FunctionDecl& callee) {
+		if (!_helper) {
+			return;
+		}
+		std::vector<const FunctionDecl*> pending { &callee };
+		std::set<const FunctionDecl*> seen;
+		while (!pending.empty()) {
+			const FunctionDecl* at = pending.back();
+			pending.pop_back();
+			if (at == _helper) {
+				throw CompileError("recursive call: \"" + _helper->name + "(" + parameterSignature(*_helper)
+					+ ")\" reaches itself through \"" + callee.name + "(" + parameterSignature(callee)
+					+ ")\"; SPIR-V for Vulkan forbids recursion (Apple's compiler accepts it)");
+			}
+			if (seen.insert(at).second) {
+				const auto edges = _callEdges.find(at);
+				if (edges != _callEdges.end()) {
+					pending.insert(pending.end(), edges->second.begin(), edges->second.end());
+				}
+			}
+		}
+		_callEdges[_helper].insert(&callee);
 	}
 
 	bool Emitter::returnsVoid(const FunctionDecl& function) const {
@@ -5503,8 +5701,10 @@ namespace {
 
 	// Arguments are evaluated left to right and converted to the parameter types.
 	// Resource arguments retain their caller's identity, including writes.
-	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& generic, const Expression* receiver) {
+	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& generic, const Expression* receiver,
+		const std::vector<Id>& prepared) {
 		const FunctionDecl& definition = *generic.definition;
+		noteCall(definition);
 		std::vector<Id> arrays(definition.parameters.size(), InvalidId);
 		HelperFunction& helper = pointerSpecialisation(call, generic, receiver ? 1 : 0, arrays);
 
@@ -5552,7 +5752,7 @@ namespace {
 				requireEnumValue(parameter.type.enumName, *call.arguments[i],
 					"argument " + std::to_string(i + 1) + " of the call to \"" + definition.name + "\"");
 			}
-			const Id value = emitExpression(*call.arguments[i]);
+			const Id value = prepared.empty() ? emitExpression(*call.arguments[i]) : prepared[i];
 			if (parameter.type.enumName.empty()) {
 				argumentOperands[i] = stdlibArgumentOperand(_builder.typeOf(value));
 			}
@@ -5787,7 +5987,7 @@ namespace {
 		// A declaration is a function with no blocks, resolved when the module is linked.
 		if (!definition.body) {
 			_builder.emit(spirv::OpFunctionEnd, { });
-			linkageAttributes(function, definition.name, kLinkageImport);
+			linkageAttributes(function, linkageName(definition), kLinkageImport);
 			_helper = nullptr;
 			return;
 		}
@@ -7802,7 +8002,7 @@ namespace {
 			+ ", \"name\": \"" + declaration.name + "\" }");
 	}
 
-	void Emitter::rejectMemberFileScopeSamplers(const FunctionDecl& member) const {
+	void Emitter::rejectMemberFileScopeSamplers(const FunctionDecl& member) {
 		std::set<const FunctionDecl*> seen { &member };
 		std::vector<const FunctionDecl*> pending { &member };
 		while (!pending.empty()) {
@@ -7826,10 +8026,10 @@ namespace {
 				if (call->left->kind != ExpressionKind::Identifier) {
 					continue;
 				}
-				const auto helper = _helpers.find(call->left->name);
-				if (helper != _helpers.end() && helper->second.definition->body
-					&& seen.insert(helper->second.definition).second) {
-					pending.push_back(helper->second.definition);
+				for (const HelperFunction* helper: helpersNamed(call->left->name)) {
+					if (helper->definition->body && seen.insert(helper->definition).second) {
+						pending.push_back(helper->definition);
+					}
 				}
 			}
 		}
@@ -7875,20 +8075,21 @@ namespace {
 				if (call->left->kind != ExpressionKind::Identifier) {
 					continue;
 				}
-				const auto helper = _helpers.find(call->left->name);
-				if (helper == _helpers.end() || !helper->second.definition->body
-					|| !seen.insert(helper->second.definition).second) {
-					continue;
-				}
+				for (const HelperFunction* helper: helpersNamed(call->left->name)) {
+					if (!helper->definition->body || !seen.insert(helper->definition).second) {
+						continue;
+					}
 
-				pending.push_back(helper->second.definition);
-				if (scan(*helper->second.definition)) {
-					const auto owner = _samplerHelperOwner.emplace(helper->first, _entryPoint);
-					if (owner.first->second != _entryPoint) {
-						throw CompileError("helper function \"" + helper->first + "\" names a file-scope "
-							"sampler, and entry points \"" + owner.first->second->name + "\" and \""
-							+ _entryPoint->name + "\" both reach it; helper file-scope samplers are "
-							"owned by one entry point, so pass the sampler to it as an argument");
+					pending.push_back(helper->definition);
+					if (scan(*helper->definition)) {
+						const std::string key = helperKey(*helper->definition, _overloadedNames);
+						const auto owner = _samplerHelperOwner.emplace(key, _entryPoint);
+						if (owner.first->second != _entryPoint) {
+							throw CompileError("helper function \"" + key + "\" names a file-scope "
+								"sampler, and entry points \"" + owner.first->second->name + "\" and \""
+								+ _entryPoint->name + "\" both reach it; helper file-scope samplers are "
+								"owned by one entry point, so pass the sampler to it as an argument");
+						}
 					}
 				}
 			}
@@ -9377,11 +9578,13 @@ namespace {
 				if (expression.left->kind != ExpressionKind::Identifier) {
 					return std::nullopt;
 				}
-				const auto helper = _helpers.find(expression.left->name);
-				if (helper == _helpers.end()) {
+				const HelperFunction* helper = returningHelper(expression, [](const Type& type) {
+					return type.isPointer || type.arrayLength ? std::string("*") : type.enumName;
+				});
+				if (!helper) {
 					return std::nullopt;
 				}
-				const Type& returned = helper->second.definition->returnType;
+				const Type& returned = helper->definition->returnType;
 				return returned.isPointer || returned.arrayLength ? std::nullopt
 					: std::optional<std::string>(returned.enumName);
 			}
@@ -10064,8 +10267,9 @@ namespace {
 		// A call whose value is dropped, which is the only way to call a void helper.
 		if (expression.kind == ExpressionKind::Call) {
 			const Expression* receiver = nullptr;
-			if (HelperFunction* helper = findHelper(expression, receiver)) {
-				emitHelperCall(expression, *helper, receiver);
+			std::vector<Id> prepared;
+			if (HelperFunction* helper = findHelper(expression, receiver, prepared)) {
+				emitHelperCall(expression, *helper, receiver, prepared);
 				return;
 			}
 			const std::string name = expression.left->kind == ExpressionKind::Identifier
@@ -10695,14 +10899,16 @@ namespace {
 				if (call->left->kind != ExpressionKind::Identifier) {
 					continue;
 				}
-				const auto found = _helpers.find(call->left->name);
-				if (found == _helpers.end()) {
-					continue;
-				}
-				if (found->second.definition->body) {
-					pending.push_back(found->second.definition);
-				} else {
-					imports.push_back(&found->second);
+				for (HelperFunction* found: helpersNamed(call->left->name)) {
+					if (found->definition->body) {
+						pending.push_back(found->definition);
+					} else if (_overloads.count(call->left->name)) {
+						throw CompileError("\"" + call->left->name + "(" + parameterSignature(*found->definition)
+							+ ")\" is declared but defined elsewhere, and the name is overloaded; importing one "
+							"overload of a name is not lowered yet");
+					} else {
+						imports.push_back(found);
+					}
 				}
 			}
 		}
@@ -10739,7 +10945,8 @@ namespace {
 					"per caller, so it cannot be exported from a library");
 			}
 			try {
-				linkageAttributes(helperFunctionId(_helpers.at(helper.name)), helper.name, kLinkageExport);
+				linkageAttributes(helperFunctionId(_helpers.at(helperKey(helper, _overloadedNames))),
+					linkageName(helper), kLinkageExport);
 				for (size_t i = 0; i < _helperQueue.size(); ++i) {
 					emitHelper(*_helperQueue[i]);
 				}
@@ -10797,9 +11004,24 @@ namespace {
 		const Id functionType = _builder.emitDecl(spirv::OpTypeFunction, { _voidType });
 		_functionTypes[{ _voidType }] = functionType;
 
+		_overloadedNames = overloadedNames(_unit);
 		for (const FunctionDecl& helper: _unit.helpers) {
-			if (helper.body) {
-				_helpers[helper.name].definition = &helper;
+			if (!_overloadedNames.count(helper.name)) {
+				if (helper.body) {
+					_helpers[helper.name].definition = &helper;
+				}
+				continue;
+			}
+			// An overloaded name has every signature registered, declared or defined, so a
+			// call can be refused for the right one.
+			const auto entry = _helpers.try_emplace(helperKey(helper, _overloadedNames));
+			HelperFunction& function = entry.first->second;
+			if (entry.second) {
+				function.definition = &helper;
+				function.firstOrder = helper.order;
+				_overloads[helper.name].push_back(&function);
+			} else if (helper.body && !function.definition->body) {
+				function.definition = &helper;
 			}
 		}
 		// A name the unit only declares stands for the declaration. Not a standard library
@@ -10808,7 +11030,7 @@ namespace {
 		if (_options.linkageObject) {
 			for (const FunctionDecl& helper: _unit.helpers) {
 				if (helper.body || helper.name.compare(0, stdlibPrefix.size(), stdlibPrefix) == 0
-					|| isMemberName(helper.name)) {
+					|| isMemberName(helper.name) || _overloadedNames.count(helper.name)) {
 					continue;
 				}
 				const auto entry = _helpers.try_emplace(helper.name);

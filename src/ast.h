@@ -480,6 +480,11 @@ struct FunctionDecl {
 // not an overload.
 bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b);
 
+// The parameter list spelled canonically, as "float3,thread const float&": declarations
+// that sameParameterTypes calls the same spell it the same, whatever their spelling.
+std::string parameterSignature(const Parameter& parameter);
+std::string parameterSignature(const FunctionDecl& function);
+
 struct TranslationUnit {
 	std::vector<StructDecl> structs;
 	std::vector<FunctionDecl> functions;

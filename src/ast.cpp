@@ -176,13 +176,42 @@ bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b) {
 			return false;
 		}
 		if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
-			|| x.isPacked != y.isPacked || x.namedType != y.namedType
+			|| x.isPacked != y.isPacked || x.namedType != y.namedType || x.enumName != y.enumName
+			|| x.isAtomic != y.isAtomic
 			|| x.resource != y.resource || x.textureAccess != y.textureAccess) {
 			return false;
 		}
 	}
 
 	return true;
+}
+
+std::string parameterSignature(const Parameter& parameter) {
+	Type type = parameter.type;
+	const bool pointer = type.isPointer || type.arrayLength.has_value();
+	if (pointer) {
+		type.arrayLength.reset();
+		type.isPointer = true;
+	}
+	if (!pointer && !parameter.isReference) {
+		type.isConst = false;
+	}
+	if (!type.enumName.empty()) {
+		type.namedType = type.enumName;
+	}
+	std::string name = typeName(type);
+	if ((pointer || parameter.isReference) && type.addressSpace != AddressSpace::None) {
+		name = std::string(addressSpaceName(type.addressSpace)) + " " + name;
+	}
+	return parameter.isReference ? name + "&" : name;
+}
+
+std::string parameterSignature(const FunctionDecl& function) {
+	std::string signature;
+	for (const Parameter& parameter: function.parameters) {
+		signature += (signature.empty() ? "" : ",") + parameterSignature(parameter);
+	}
+	return signature;
 }
 
 }
