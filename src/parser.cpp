@@ -3637,14 +3637,17 @@ StatementPtr Parser::parseStatement() {
 	// The one attribute a statement carries is the fall-through marker, which
 	// lowers to nothing: a case's block already branches to the next, and the
 	// attribute only tells the reader the fall-through is meant.
+	// Apple also takes [[clang::fallthrough]]; only [[::clang::fallthrough]] is an error there. It
+	// accepts further spellings ([[gnu::fallthrough]], [[__fallthrough__]]) that are not recognised here.
+	const size_t nameAt = at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket
+		&& lookahead(2).kind == TokenKind::Identifier && lookahead(2).text == "clang"
+		&& lookahead(3).kind == TokenKind::ColonColon ? 4 : 2;
 	if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket
-		&& lookahead(2).kind == TokenKind::Identifier && lookahead(2).text == "fallthrough"
-		&& lookahead(3).kind == TokenKind::RBracket && lookahead(4).kind == TokenKind::RBracket) {
-		advance();
-		advance();
-		advance();
-		advance();
-		advance();
+		&& lookahead(nameAt).kind == TokenKind::Identifier && lookahead(nameAt).text == "fallthrough"
+		&& lookahead(nameAt + 1).kind == TokenKind::RBracket && lookahead(nameAt + 2).kind == TokenKind::RBracket) {
+		for (size_t i = 0; i < nameAt + 3; ++i) {
+			advance();
+		}
 		expect(TokenKind::Semicolon, "after a [[fallthrough]] attribute");
 		if (_switchDepth == 0) {
 			throw CompileError("fallthrough annotation is outside switch statement");
