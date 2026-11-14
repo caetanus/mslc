@@ -1852,7 +1852,6 @@ std::string Parser::aliasQualifier(const QualifiedName& name, NamespaceLookup mo
 // namespace outward (or from the file, after a leading "::"), or "" when there is none.
 std::string Parser::namespaceOf(const QualifiedName& name, size_t count, NamespaceLookup mode) const {
 	const std::vector<std::string>& parts = name.parts;
-	const size_t outermost = name.global ? 0 : _namespacePath.size();
 	// Later parts use qualified own hiding; alias first parts use lexical unions.
 	const auto rest = [&](std::string scope) {
 		for (size_t part = 1; part < count; ++part) {
@@ -1870,32 +1869,16 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 	} else if (const std::string candidate = aliasQualifier(name, mode); !candidate.empty()) {
 		return _namespaces.count(candidate) ? rest(candidate) : std::string();
 	}
-	// Non-alias lookup retains its existing first-match behavior pending #295/#321.
-	for (size_t depth = outermost + 1; depth-- > 0;) {
-		// A namespace that a using directive nominated is searched as well; a block's
-		// directive at the level where its names appear, as resolveName places them.
-		std::vector<std::string> bases = {namespacePrefix(depth)};
-		if (!name.global) {
-			const std::string function = namespacePrefix(_namespacePath.size());
-			for (const BlockScope& block : _blocks) {
-				for (const std::string& target : block.directives) {
-					if (nearestCommon(function, target) == bases.front()) {
-						bases.push_back(target);
-					}
-				}
-			}
+	// The innermost level that names the first part decides, and two namespaces at one
+	// level are ambiguous, as for every other unqualified lookup.
+	for (const NamespaceTier& tier : namespaceTiers(name, mode)) {
+		if (tier.found.size() > 1) {
+			throw CompileError("reference to \"" + parts[0] + "\" is ambiguous: it names " + *tier.found.begin()
+				+ " and " + *std::next(tier.found.begin()));
 		}
-		std::set<std::string> seen;
-		for (size_t i = 0; i < bases.size(); ++i) {
-			if (const std::string candidate = childNamespace(bases[i], parts[0], false, mode); !candidate.empty()) {
-				return rest(candidate);
-			}
-			if (!seen.insert(bases[i]).second) {
-				continue;
-			}
-			if (const auto entry = _scopes.find(bases[i]); entry != _scopes.end()) {
-				bases.insert(bases.end(), entry->second.directives.begin(), entry->second.directives.end());
-			}
+		// A struct, enum or typedef is not a namespace: the lookup goes on outward.
+		if (!tier.found.empty() && _namespaces.count(*tier.found.begin())) {
+			return rest(*tier.found.begin());
 		}
 	}
 	return "";
