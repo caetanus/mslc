@@ -1876,11 +1876,12 @@ void Parser::collectMembers(const std::string& scope, const std::string& name, s
 	collectOwn(scope, name, own);
 	found.insert(own.begin(), own.end());
 	const auto entry = _scopes.find(scope);
-	if (besideStdlib && (scope == kStdlibNamespace
-		|| (entry != _scopes.end() && entry->second.stdlibDeclarations.count(name)))) {
+	// "using metal::name;" makes the library's name this namespace's own member too.
+	const bool declaresStdlib = entry != _scopes.end() && entry->second.stdlibDeclarations.count(name);
+	if (besideStdlib && (scope == kStdlibNamespace || declaresStdlib)) {
 		*besideStdlib = true;
 	}
-	if (qualified && !own.empty()) {
+	if (qualified && (!own.empty() || declaresStdlib)) {
 		return;
 	}
 	if (entry == _scopes.end()) {
