@@ -59,6 +59,9 @@ class Parser {
 	// namespaces a using directive named and the names a using declaration brought in.
 	struct NamespaceScope {
 		std::vector<std::string> directives;
+		// The inline namespaces declared directly in this one: their members are this
+		// scope's own for every lookup, not only through a directive.
+		std::vector<std::string> inlines;
 		// A name to what using declarations brought in under it: several functions
 		// overload, so a call is resolved (or found ambiguous) where it is made.
 		std::map<std::string, std::set<std::string>> declarations;
@@ -227,8 +230,9 @@ private:
 	// The one namespace "part" names inside "scope" ("" if none); several is ambiguous.
 	std::string childNamespace(const std::string& scope, const std::string& part, bool qualified, NamespaceLookup mode) const;
 
-	void parseNamespace();
+	void parseNamespace(bool isInline = false);
 	void parseNamespaceAlias();
+	std::vector<std::string> inlineClosure(const std::string& scope) const;
 	void parseUsing();
 
 	bool peekQualifiedName(QualifiedName& out) const;

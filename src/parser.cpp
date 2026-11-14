@@ -433,7 +433,10 @@ void Parser::parseDeclaration() {
 	}
 
 	if (atKeyword("inline") && lookahead().kind == TokenKind::Identifier && lookahead().text == "namespace") {
-		throw CompileError("an inline namespace is not supported");
+		advance();
+		advance();
+		parseNamespace(true);
+		return;
 	}
 
 	if (matchIdentifier("struct")) {
@@ -523,7 +526,7 @@ static bool tagBesideNonTag(std::string_view a, std::string_view b) {
 // "namespace" is consumed. A name declared in the body is stored under its
 // qualified name; an anonymous namespace is the namespace "(anonymous namespace)",
 // which its enclosing namespace uses, so its names are visible there unqualified.
-void Parser::parseNamespace() {
+void Parser::parseNamespace(bool isInline) {
 	const NestingScope nesting(*this);
 
 	const size_t outer = _namespacePath.size();
@@ -533,6 +536,13 @@ void Parser::parseNamespace() {
 		const std::string path = namespacePrefix(outer + 1);
 		if (std::find(parent.directives.begin(), parent.directives.end(), path) == parent.directives.end()) {
 			parent.directives.push_back(path);
+		}
+		if (isInline && std::find(parent.inlines.begin(), parent.inlines.end(), path) == parent.inlines.end()) {
+			if (_namespaces.count(path)) {
+				throw CompileError("the anonymous namespace was declared without inline, and a later definition "
+					"cannot make it inline");
+			}
+			parent.inlines.push_back(path);
 		}
 		_namespaces.insert(path);
 	} else {
@@ -552,6 +562,22 @@ void Parser::parseNamespace() {
 			if (_namespacePath.size() > outer && lookahead().kind == TokenKind::Assign) {
 				throw CompileError("a namespace alias is declared with one unqualified name, not \""
 					+ namespacePrefix(_namespacePath.size()) + "::" + std::string(current().text) + "\"");
+			}
+			const std::string path = qualify(std::string(current().text));
+			if (isInline) {
+				if (lookahead().kind == TokenKind::ColonColon) {
+					throw CompileError("a nested namespace definition cannot be inline");
+				}
+				// The first definition decides: a later one may omit inline, none may add it.
+				NamespaceScope& parent = _scopes[namespacePrefix(_namespacePath.size())];
+				const auto marked = std::find(parent.inlines.begin(), parent.inlines.end(), path);
+				if (marked == parent.inlines.end()) {
+					if (_namespaces.count(path)) {
+						throw CompileError("\"" + path + "\" was declared as a namespace without inline, and a later "
+							"definition cannot make it inline");
+					}
+					parent.inlines.push_back(path);
+				}
 			}
 			_namespacePath.emplace_back(advance().text);
 			_namespaces.insert(namespacePrefix(_namespacePath.size()));
@@ -1892,6 +1918,22 @@ void Parser::collectOwn(const std::string& scope, const std::string& name, std::
 			found.insert(candidate);
 		}
 	}
+	// An inline namespace's members are this scope's own.
+	if (const auto entry = _scopes.find(scope); entry != _scopes.end()) {
+		for (const std::string& inner : entry->second.inlines) {
+			collectOwn(inner, name, found);
+		}
+	}
+}
+
+std::vector<std::string> Parser::inlineClosure(const std::string& scope) const {
+	std::vector<std::string> set = {scope};
+	for (size_t i = 0; i < set.size(); ++i) {
+		if (const auto entry = _scopes.find(set[i]); entry != _scopes.end()) {
+			set.insert(set.end(), entry->second.inlines.begin(), entry->second.inlines.end());
+		}
+	}
+	return set;
 }
 
 void Parser::collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
@@ -1917,8 +1959,13 @@ void Parser::collectMembers(const std::string& scope, const std::string& name, s
 	if (entry == _scopes.end()) {
 		return;
 	}
-	for (const std::string& directive : entry->second.directives) {
-		collectMembers(directive, name, seen, found, qualified, besideStdlib);
+	// An inline namespace's directives are its enclosing namespace's too.
+	for (const std::string& writer : inlineClosure(scope)) {
+		if (const auto written = _scopes.find(writer); written != _scopes.end()) {
+			for (const std::string& directive : written->second.directives) {
+				collectMembers(directive, name, seen, found, qualified, besideStdlib);
+			}
+		}
 	}
 }
 
@@ -1964,7 +2011,7 @@ std::set<std::string> Parser::namespacesNamed(const std::string& scope, const st
 	if (!seen.insert(scope).second) {
 		return {};
 	}
-	const std::vector<std::string> set = {scope};   // the own tier; an inline namespace of it is added later
+	const std::vector<std::string> set = inlineClosure(scope);   // the own tier: the scope and its inline namespaces
 	std::set<std::string> own;
 	for (const std::string& at : set) {
 		seen.insert(at);
@@ -2090,10 +2137,11 @@ std::vector<Parser::NamespaceTier> Parser::namespaceTiers(const QualifiedName& n
 				}
 			};
 			for (size_t user = 0; user <= _namespacePath.size(); ++user) {
-				const std::string from = namespacePrefix(user);
-				if (const auto entry = _scopes.find(from); entry != _scopes.end()) {
-					for (const std::string& target : entry->second.directives) {
-						nominated(from, target);
+				for (const std::string& from : inlineClosure(namespacePrefix(user))) {
+					if (const auto entry = _scopes.find(from); entry != _scopes.end()) {
+						for (const std::string& target : entry->second.directives) {
+							nominated(from, target);
+						}
 					}
 				}
 			}
@@ -2326,15 +2374,16 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* be
 		const bool declaredHere = own != _scopes.end() && own->second.stdlibDeclarations.count(last);
 		bool stdlibHere = level == kStdlibNamespace || declaredHere;
 		for (size_t user = 0; user <= _namespacePath.size(); ++user) {
-			const std::string from = joinParts(_namespacePath, 0, user);
-			const auto entry = _scopes.find(from);
-			if (entry == _scopes.end()) {
-				continue;
-			}
-			for (const std::string& target : entry->second.directives) {
-				if (nearestCommon(from, target) == level) {
-					std::set<std::string> seen;
-					collectMembers(target, last, seen, found, false, &stdlibHere);
+			for (const std::string& from : inlineClosure(joinParts(_namespacePath, 0, user))) {
+				const auto entry = _scopes.find(from);
+				if (entry == _scopes.end()) {
+					continue;
+				}
+				for (const std::string& target : entry->second.directives) {
+					if (nearestCommon(from, target) == level) {
+						std::set<std::string> seen;
+						collectMembers(target, last, seen, found, false, &stdlibHere);
+					}
 				}
 			}
 		}

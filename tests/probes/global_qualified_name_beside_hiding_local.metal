@@ -1,6 +1,6 @@
 // EXPECT: valid
 // DISASM: OpFAdd %float %float_1
-// DISASM-NO-MATCH: OpFAdd %float %\d+ %\d+
+// DISASM-NO-MATCH: OpFAdd %float %[0-9]+ %[0-9]+
 // "::k" names the file-scope constant (1) while the local k (2) is in scope, so the sum
 // is the constant plus a load of the local, not two loads of the local.
 // Apple accepts this; it was rejected until the AST marked the file-scope name.
