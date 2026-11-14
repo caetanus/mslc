@@ -306,6 +306,41 @@ if(NOT status EQUAL 0)
 endif()
 validate_file("${linked_helpers}" vulkan1.3 TRUE "helpers linked with a shader")
 
+# 11. A helper declared in a header, defined in a second source and called from a
+#     third (#331): the call lowers to an imported declaration, and linking the
+#     three units gives a valid Vulkan executable.
+set(definer_spv "${OUT_DIR}/link_definer.spv")
+set(link_caller_spv "${OUT_DIR}/link_caller.spv")
+run_mslc(output 0 --compile-library -o "${definer_spv}" "${TEST_DIR}/library/link_definer.metal")
+run_mslc(output 0 --compile-library -o "${link_caller_spv}" "${TEST_DIR}/library/link_caller.metal")
+disassemble("${link_caller_spv}" caller_dis)
+expect_contains("${caller_dis}" "LinkageAttributes \"scaled_twice\" Import" "caller")
+expect_contains("${caller_dis}" "OpEntryPoint GLCompute" "caller")
+set(linked_three "${OUT_DIR}/linked_three.spv")
+file(REMOVE "${linked_three}")
+execute_process(COMMAND "${SPIRV_LINK}" "${definer_spv}" "${link_caller_spv}" -o "${linked_three}"
+	RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE output)
+if(NOT status EQUAL 0)
+	message(FATAL_ERROR "spirv-link could not link the definition with its caller:\n${output}")
+endif()
+validate_file("${linked_three}" vulkan1.3 TRUE "declared helper linked with its definition")
+# Without the definition the import is unresolved, which is the link-time failure.
+execute_process(COMMAND "${SPIRV_LINK}" "${link_caller_spv}" -o "${OUT_DIR}/unresolved.spv"
+	RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE output)
+if(status EQUAL 0)
+	message(FATAL_ERROR "spirv-link resolved an import that nothing defines:\n${output}")
+endif()
+
+# Only a declared helper is deferred. Default mode still refuses the declaration
+# with no body, and an undeclared name is an error in either mode.
+run_mslc(output 1 -o "${OUT_DIR}/never.spv" "${TEST_DIR}/library/link_caller.metal")
+expect_contains("${output}" "declared but never defined" "default mode on a declared helper")
+set(typo "${OUT_DIR}/typo.metal")
+file(WRITE "${typo}"
+"#include <metal_stdlib>\nusing namespace metal;\nkernel void k(device float *out [[buffer(0)]]) {\n  out[0] = scaled_twicee(1.0);\n}\n")
+run_mslc(output 1 --compile-library -o "${OUT_DIR}/never.spv" "${typo}")
+expect_contains("${output}" "scaled_twicee" "undeclared name in a library")
+
 # 9. Each mode passes the target environment it claims.
 #
 #    Comparing validator outcomes cannot do this. For a module mslc produces,

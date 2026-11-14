@@ -483,6 +483,7 @@ namespace {
 	// shader computes. Named from the generated table rather than written as 0.
 	constexpr uint32_t kFunctionControlNone = spirv::FunctionControl::None;
 	// SPIR-V's Linkage Type operand of a LinkageAttributes decoration.
+	constexpr uint32_t kLinkageImport = 1;
 	constexpr uint32_t kLinkageExport = 0;
 	constexpr uint32_t kSelectionControlNone = spirv::SelectionControl::None;
 	constexpr uint32_t kLoopControlNone = spirv::LoopControl::None;
@@ -1861,7 +1862,7 @@ namespace {
 	// number of arguments, and no function reaches itself. Apple accepts a
 	// recursive call, but SPIR-V for Vulkan forbids one, and a module with it
 	// fails validation, so it is refused here with the cycle named.
-	void validateHelpers(const TranslationUnit& unit) {
+	void validateHelpers(const TranslationUnit& unit, bool allowImports) {
 		std::map<std::string, const FunctionDecl*> first;
 		std::map<std::string, const FunctionDecl*> defined;
 
@@ -1950,7 +1951,10 @@ namespace {
 					throw CompileError("call to \"" + name + "\" passes " + std::to_string(call->arguments.size())
 						+ " arguments, and it takes " + std::to_string(declared->second->parameters.size()));
 				}
-				if (!defined.count(name)) {
+				// A Linkage object may call a function it only declares: the definition
+				// comes from another translation unit at link time. A Vulkan executable
+				// cannot, since nothing would resolve it.
+				if (!defined.count(name) && !allowImports) {
 					throw CompileError("\"" + name + "\" is declared but never defined");
 				}
 
@@ -2352,6 +2356,7 @@ namespace {
 		Id helperFunctionId(HelperFunction& helper);
 		Stage helperScope(const HelperFunction& helper) const;
 		void emitLibraryHelpers();
+		void emitImports();
 		void linkageAttributes(Id function, const std::string& name, uint32_t type);
 		Id helperParameterType(const Type& type);
 		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
@@ -5101,7 +5106,8 @@ namespace {
 	}
 
 	// The id the function is called by in the scope being emitted, with its type
-	// declared and its body queued the first time.
+	// declared and its body queued the first time. A function this unit only
+	// declares is one id for the whole module, so it is declared once.
 	Id Emitter::helperFunctionId(HelperFunction& helper) {
 		const FunctionDecl& definition = *helper.definition;
 		if (helper.type == InvalidId) {
@@ -5136,11 +5142,10 @@ namespace {
 		return slot.first->second;
 	}
 
-	// A helper is emitted once per stage that reaches it. A library's own helpers are
-	// emitted under no stage.
+	// A helper with a body is emitted once per stage that reaches it. One the unit only
+	// declares, and one a library exports, belong to no stage.
 	Stage Emitter::helperScope(const HelperFunction& helper) const {
-		(void)helper;
-		return _entryPoint->stage;
+		return helper.definition->body ? _entryPoint->stage : Stage::None;
 	}
 
 	// Arguments are evaluated left to right and converted to the parameter types.
@@ -5424,6 +5429,14 @@ namespace {
 		std::vector<Id> values;
 		for (const Id type: helper.parameterTypes) {
 			values.push_back(_builder.emitTyped(spirv::OpFunctionParameter, type, { }));
+		}
+
+		// A declaration is a function with no blocks, resolved when the module is linked.
+		if (!definition.body) {
+			_builder.emit(spirv::OpFunctionEnd, { });
+			linkageAttributes(function, definition.name, kLinkageImport);
+			_helper = nullptr;
+			return;
 		}
 
 		beginBlock(_builder.nextId());
@@ -7333,7 +7346,8 @@ namespace {
 					continue;
 				}
 				const auto helper = _helpers.find(call->left->name);
-				if (helper != _helpers.end() && seen.insert(helper->second.definition).second) {
+				if (helper != _helpers.end() && helper->second.definition->body
+					&& seen.insert(helper->second.definition).second) {
 					pending.push_back(helper->second.definition);
 				}
 			}
@@ -7381,7 +7395,8 @@ namespace {
 					continue;
 				}
 				const auto helper = _helpers.find(call->left->name);
-				if (helper == _helpers.end() || !seen.insert(helper->second.definition).second) {
+				if (helper == _helpers.end() || !helper->second.definition->body
+					|| !seen.insert(helper->second.definition).second) {
 					continue;
 				}
 
@@ -10108,6 +10123,42 @@ namespace {
 		_builder.emit(spirv::OpDecorate, operands);
 	}
 
+	// Declarations come before every definition in a module's function section, so the
+	// helpers this unit calls and does not define are emitted before the first body.
+	void Emitter::emitImports() {
+		_entryPoint = &_libraryScope;
+		std::vector<const Expression*> calls;
+		for (const FunctionDecl* entry: _entryPoints) {
+			collectCalls(*entry->body, calls);
+		}
+		for (const FunctionDecl& helper: _unit.helpers) {
+			if (helper.body) {
+				collectCalls(*helper.body, calls);
+			}
+		}
+		for (const Expression* call: calls) {
+			if (call->left->kind != ExpressionKind::Identifier) {
+				continue;
+			}
+			const auto found = _helpers.find(call->left->name);
+			if (found == _helpers.end() || found->second.definition->body) {
+				continue;
+			}
+			HelperFunction& entry = found->second;
+			if (std::any_of(entry.definition->parameters.begin(), entry.definition->parameters.end(),
+				[](const Parameter& parameter) { return parameter.type.isPointer; })) {
+				throw CompileError("\"" + entry.definition->name + "\" is declared but defined elsewhere, and "
+					"takes a pointer parameter; a thread pointer is lowered per caller, so it cannot be a "
+					"link-time symbol");
+			}
+			helperFunctionId(entry);
+		}
+		for (size_t i = 0; i < _helperQueue.size(); ++i) {
+			emitHelper(*_helperQueue[i]);
+		}
+		_helperQueue.clear();
+	}
+
 	// A Linkage object exports every helper it defines, whether or not anything in the
 	// unit calls it: another unit's call is what makes it live.
 	void Emitter::emitLibraryHelpers() {
@@ -10185,6 +10236,21 @@ namespace {
 				_helpers[helper.name].definition = &helper;
 			}
 		}
+		// A name the unit only declares stands for the declaration: a call to it is
+		// the one place validateHelpers lets through without a body.
+		if (_options.linkageObject) {
+			for (const FunctionDecl& helper: _unit.helpers) {
+				HelperFunction& entry = _helpers[helper.name];
+				if (!entry.definition && helper.name.compare(0, 7, "metal::") != 0) {
+					entry.definition = &helper;
+				}
+			}
+		}
+
+		if (_options.linkageObject) {
+			emitImports();
+		}
+
 		// One reflection entry per entry point, in the order they were selected.
 		std::string document = "{\n";
 		document += "\t\"reflection_version\": 2,\n";
@@ -10272,7 +10338,7 @@ namespace {
 
 std::string emitModule(spirv::Builder& builder, const TranslationUnit& unit,
 	const std::vector<const FunctionDecl*>& entryPoints, const ModuleOptions& options) {
-	validateHelpers(unit);
+	validateHelpers(unit, options.linkageObject);
 	TypeTable types(builder, unit);
 	Emitter emitter(builder, unit, entryPoints, options, types);
 	return emitter.run();
