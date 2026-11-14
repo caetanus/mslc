@@ -5263,6 +5263,14 @@ namespace {
 			return nullptr;
 		}
 
+		// Checked before the helpers: a template that shares its name with a helper is
+		// an overload, and the helper (one signature per name) must not take a call
+		// the template would have won.
+		if (_unit.functionTemplates.count(call.left->name)) {
+			throw CompileError("a call to the function template \"" + call.left->name + "\" needs an "
+				"instantiation, which is not lowered yet; the template itself is parsed and accepted");
+		}
+
 		const auto found = _helpers.find(call.left->name);
 		return found == _helpers.end() ? nullptr : &found->second;
 	}

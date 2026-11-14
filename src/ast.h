@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -482,6 +483,10 @@ struct TranslationUnit {
 
 	// The file's helper functions, prototypes and definitions, in source order.
 	std::vector<FunctionDecl> helpers;
+
+	// Qualified names of the function templates the file declares. They are parsed
+	// and not lowered, so the emitter needs the names to refuse a call to one.
+	std::set<std::string> functionTemplates;
 
 	// File-scope declarations, in the order the source declares them. A
 	// "constant" refers to the ones before it, so the order is the meaning.

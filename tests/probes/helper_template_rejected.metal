@@ -1,4 +1,6 @@
-// EXPECT: error a template is not lowered
+// EXPECT: error needs an instantiation, which is not lowered yet
+// Refs #341: a template is parsed and accepted; a call to one that would need an
+// instantiation is refused by name (it used to fail at the declaration).
 #include <metal_stdlib>
 using namespace metal;
 template <typename T> T f(T x) { return x; }
