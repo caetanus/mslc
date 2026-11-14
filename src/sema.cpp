@@ -2502,6 +2502,7 @@ namespace {
 		Id emitSignExact(Id value, Id type, uint32_t bits);
 		Id atomicAddress(const Expression& argument, const std::string& function, bool& isSigned);
 		Id emitAtomicCall(const Expression& expression);
+		Id emitAtomicCompareExchange(const Expression& expression);
 		Id emitSelectCall(const Expression& expression);
 		void emitBarrierCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
@@ -4993,8 +4994,12 @@ namespace {
 		const std::string name = builtinCalleeName(expression.left->name);
 		const bool isStore = name == "atomic_store_explicit";
 		const bool isLoad = name == "atomic_load_explicit";
-		if (name.rfind("atomic_compare_exchange", 0) == 0) {
-			throw CompileError(name + " is not lowered yet; the fetch, exchange, load and store functions are");
+		if (name == "atomic_compare_exchange_strong_explicit") {
+			throw CompileError(name + " is not a Metal function; Metal declares only "
+				"atomic_compare_exchange_weak_explicit");
+		}
+		if (name == "atomic_compare_exchange_weak_explicit") {
+			return emitAtomicCompareExchange(expression);
 		}
 
 		const size_t expected = isLoad ? 2 : 3;
@@ -5033,6 +5038,64 @@ namespace {
 		else if (name == "atomic_fetch_xor_explicit") opcode = spirv::OpAtomicXor;
 		else if (name == "atomic_exchange_explicit") opcode = spirv::OpAtomicExchange;
 		return _builder.emitTyped(opcode, type, { address, scope, semantics, value });
+	}
+
+	// bool atomic_compare_exchange_weak_explicit(pointer, &expected, desired, relaxed, relaxed).
+	// OpAtomicCompareExchange returns what the atomic held; that equals expected exactly when
+	// the exchange happened, and expected takes it otherwise, so storing it back unconditionally
+	// is the same as Metal's write on failure.
+	Id Emitter::emitAtomicCompareExchange(const Expression& expression) {
+		const std::string name = "atomic_compare_exchange_weak_explicit";
+		if (expression.arguments.size() != 5) {
+			throw CompileError(name + " takes 5 arguments: the pointer, &expected, the desired value, and "
+				"memory_order_relaxed twice");
+		}
+		for (size_t i = 3; i < 5; ++i) {
+			const Expression& order = *expression.arguments[i];
+			if (order.kind != ExpressionKind::Identifier
+				|| (order.name != "memory_order_relaxed" && order.name != "metal::memory_order_relaxed")) {
+				throw CompileError(name + " takes memory_order_relaxed, the only memory order Metal has");
+			}
+		}
+
+		bool isSigned = false;
+		const Id address = atomicAddress(*expression.arguments[0], name, isSigned);
+		const Id type = isSigned ? _intType : _uintType;
+
+		const Expression& expectedArgument = *expression.arguments[1];
+		const Expression* expected = expectedArgument.kind == ExpressionKind::Unary
+			&& expectedArgument.unaryOperator == UnaryOperator::AddressOf
+			&& expectedArgument.left->kind == ExpressionKind::Identifier ? expectedArgument.left.get() : nullptr;
+		if (!expected) {
+			throw CompileError(name + " takes &expected, the address of a local scalar variable, as its "
+				"second argument");
+		}
+		const auto found = _bindings.find(expected->name);
+		if (found == _bindings.end() || !found->second.isPointer || found->second.isBuffer
+			|| found->second.isAddress || found->second.storageClass != spirv::StorageClass::Function
+			|| found->second.bufferPointeeType != InvalidId) {
+			throw CompileError(name + " takes &expected, the address of a local scalar variable, and \""
+				+ expected->name + "\" is not one");
+		}
+		const Type& expectedType = found->second.pointeeMsl;
+		if (found->second.readOnly) {
+			throw CompileError(name + " writes the old value to \"" + expected->name + "\", which is const");
+		}
+		if (expectedType.isAtomic || expectedType.isPointer || !expectedType.isScalar() || expectedType.isMatrix()
+			|| !expectedType.namedType.empty() || !expectedType.enumName.empty() || expectedType.arrayLength
+			|| expectedType.scalar != (isSigned ? ScalarKind::Int : ScalarKind::UInt)) {
+			throw CompileError(name + " takes &expected of the type the atomic holds, " + (isSigned ? "int" : "uint")
+				+ ", and \"" + expected->name + "\" is not one");
+		}
+
+		const Id desired = convertImplicit(emitExpression(*expression.arguments[2]), type);
+		const Id comparator = emitExpression(*expected);
+		const Id scope = constantU32(_types.storageClassOf(_builder.typeOf(address)) == spirv::StorageClass::Workgroup ? 2 : 1);
+		const Id semantics = constantU32(0);  // Relaxed
+		const Id old = _builder.emitTyped(spirv::OpAtomicCompareExchange, type,
+			{ address, scope, semantics, semantics, desired, comparator });
+		_builder.emit(spirv::OpStore, { found->second.id, old });
+		return _builder.emitTyped(spirv::OpIEqual, _boolType, { old, comparator });
 	}
 
 	// The mem_flags a barrier names, as the SPIR-V memory semantics they select, and
