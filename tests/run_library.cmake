@@ -324,6 +324,8 @@ if(NOT status EQUAL 0)
 	message(FATAL_ERROR "spirv-link could not link the definition with its caller:\n${output}")
 endif()
 validate_file("${linked_three}" vulkan1.3 TRUE "declared helper linked with its definition")
+# The caller alone is a valid object: its declaration comes before every body.
+validate_file("${link_caller_spv}" spv1.5 TRUE "the caller object")
 # Without the definition the import is unresolved, which is the link-time failure.
 execute_process(COMMAND "${SPIRV_LINK}" "${link_caller_spv}" -o "${OUT_DIR}/unresolved.spv"
 	RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE output)
@@ -340,6 +342,89 @@ file(WRITE "${typo}"
 "#include <metal_stdlib>\nusing namespace metal;\nkernel void k(device float *out [[buffer(0)]]) {\n  out[0] = scaled_twicee(1.0);\n}\n")
 run_mslc(output 1 --compile-library -o "${OUT_DIR}/never.spv" "${typo}")
 expect_contains("${output}" "scaled_twicee" "undeclared name in a library")
+
+# 12. More link shapes. Each object is valid alone, and linked with the definition it
+#     imports gives a valid Vulkan executable.
+function(link_with_definer name definer_source caller_source)
+	file(WRITE "${OUT_DIR}/${name}_definer.metal" "${definer_source}")
+	run_mslc(output 0 --compile-library -o "${OUT_DIR}/${name}_definer.spv" "${OUT_DIR}/${name}_definer.metal")
+	run_mslc(output 0 --compile-library -o "${OUT_DIR}/${name}_caller.spv" "${caller_source}")
+	validate_file("${OUT_DIR}/${name}_caller.spv" spv1.5 TRUE "${name} caller object")
+	execute_process(COMMAND "${SPIRV_LINK}" "${OUT_DIR}/${name}_definer.spv" "${OUT_DIR}/${name}_caller.spv"
+		-o "${OUT_DIR}/${name}_linked.spv"
+		RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE output)
+	if(NOT status EQUAL 0)
+		message(FATAL_ERROR "${name}: spirv-link failed:\n${output}")
+	endif()
+	validate_file("${OUT_DIR}/${name}_linked.spv" vulkan1.3 TRUE "${name} linked")
+endfunction()
+
+set(shade_definer "#include <metal_stdlib>\nusing namespace metal;\nfloat shade(float value) { return value * 3.0; }\n")
+link_with_definer(stages "${shade_definer}" "${TEST_DIR}/library/link_stages_caller.metal")
+disassemble("${OUT_DIR}/stages_caller.spv" stages_dis)
+string(REGEX MATCHALL "LinkageAttributes \"shade\" Import" imports "${stages_dis}")
+list(LENGTH imports import_count)
+if(NOT import_count EQUAL 1)
+	message(FATAL_ERROR "two stages sharing one import must declare it once, found ${import_count}:\n${stages_dis}")
+endif()
+link_with_definer(via "${shade_definer}" "${TEST_DIR}/library/link_via_helper.metal")
+
+# A static or inline helper in a shared header is internal to each includer, so two
+# units that include it do not both export it.
+file(COPY "${TEST_DIR}/library/shared_static.h" DESTINATION "${OUT_DIR}")
+link_with_definer(internal "#include <metal_stdlib>\nusing namespace metal;\n#include \"shared_static.h\"\nfloat ext(float value) { return sq(value) + 1.0; }\n"
+	"${TEST_DIR}/library/static_caller.metal")
+disassemble("${OUT_DIR}/internal_definer.spv" internal_dis)
+string(FIND "${internal_dis}" "\"sq\"" at)
+if(NOT at EQUAL -1)
+	message(FATAL_ERROR "a static inline helper must not be exported:\n${internal_dis}")
+endif()
+
+# A stage-dependent helper is only refused where it has to be exported or imported:
+# beside an entry point it stays a local copy, as in default mode.
+file(WRITE "${OUT_DIR}/stage_local.metal"
+"#include <metal_stdlib>\nusing namespace metal;\nfloat edge(float v) { return fwidth(v); }\nfragment float4 f(float4 p [[position]]) { return float4(edge(p.x)); }\n")
+run_mslc(output 0 --compile-library -o "${OUT_DIR}/stage_local.spv" "${OUT_DIR}/stage_local.metal")
+validate_file("${OUT_DIR}/stage_local.spv" spv1.5 TRUE "a stage-dependent helper beside its entry point")
+disassemble("${OUT_DIR}/stage_local.spv" stage_dis)
+string(FIND "${stage_dis}" "\"edge\"" at)
+if(NOT at EQUAL -1)
+	message(FATAL_ERROR "a stage-dependent helper must stay local:\n${stage_dis}")
+endif()
+
+function(expect_library_refused label source needle)
+	file(WRITE "${OUT_DIR}/refused_${label}.metal" "#include <metal_stdlib>\nusing namespace metal;\n${source}")
+	file(REMOVE "${OUT_DIR}/refused_${label}.spv")
+	run_mslc(output 1 --compile-library -o "${OUT_DIR}/refused_${label}.spv" "${OUT_DIR}/refused_${label}.metal")
+	expect_contains("${output}" "${needle}" "${label}")
+endfunction()
+
+expect_library_refused(fwidth_export "float edge(float v) { return fwidth(v); }\n" "cannot be exported")
+expect_library_refused(implicit_lod_export
+	"float4 look(texture2d<float> t, sampler s, float2 uv) { return t.sample(s, uv); }\n" "explicit level")
+expect_library_refused(pointer_export "float first(thread float* p) { return p[0]; }\n" "pointer parameter")
+expect_library_refused(pointer_import
+	"float first(thread float* p);\nkernel void k(device float* o [[buffer(0)]]) { float a[2] = {1.0, 2.0}; o[0] = first(a); }\n"
+	"pointer parameter")
+
+# A prototype in namespace metal, and a member declared but not defined, are not link-time
+# symbols: each is a diagnostic, never a crash (run_mslc fails on a signal).
+expect_library_refused(metal_prototype_qualified
+	"namespace metal { float myfunc(float v); }\nfloat g(float v) { return metal::myfunc(v); }\n" "myfunc")
+expect_library_refused(metal_prototype_unqualified
+	"namespace metal { float myfunc(float v); }\nfloat g(float v) { return myfunc(v); }\n" "myfunc")
+expect_library_refused(member_declared_only
+	"struct S { float v; float get() const; };\nfloat use(S s) { return s.get(); }\n" "get")
+
+# The sources the C API test accepts as objects are valid Universal SPIR-V too.
+foreach(case IN ITEMS
+	"float helper() { return 1; }"
+	"float helper();"
+	"fragment float4 entry() { return float4(1); }")
+	file(WRITE "${OUT_DIR}/api_object.metal" "#include <metal_stdlib>\nusing namespace metal;\n${case}\n")
+	run_mslc(output 0 --compile-library -o "${OUT_DIR}/api_object.spv" "${OUT_DIR}/api_object.metal")
+	validate_file("${OUT_DIR}/api_object.spv" spv1.5 TRUE "object for ${case}")
+endforeach()
 
 # 9. Each mode passes the target environment it claims.
 #

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -280,6 +281,9 @@ struct ModuleOptions {
 	// A Linkage object rather than a Vulkan executable: it may have no entry point,
 	// exports the helpers it defines, and may call a helper it only declares.
 	bool linkageObject = false;
+	// With linkageObject: the defined helpers to export. Set by emitModule once it knows
+	// which ones lower without a stage.
+	std::optional<std::set<std::string>> exportOnly;
 };
 
 // The reflection's embedded_samplers entries carry the whole of indium's
