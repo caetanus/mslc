@@ -833,6 +833,7 @@ void Parser::parseTemplateDeclaration() {
 		return CompileError("the declarator of the template \"" + name + "\" is not a shape mslc can name "
 			"the function in (a decltype or typeof return type, or a parenthesised name); it is not lowered");
 	};
+	// Defence in depth: the follower and second-group checks below already refuse these.
 	if (name == "decltype" || name == "__typeof__" || name == "typeof" || name == "sizeof"
 		|| name == "alignof" || name == "noexcept") {
 		throw notNameable();
