@@ -987,6 +987,22 @@ bool Parser::tryParseHelperFunction() {
 	parseHelperParameters(decl, quoted);
 	rejectUsingConflict(decl.name, "function", &decl);
 
+	// [namespace.udecl]: a using declaration names the overloads declared above it; one declared
+	// later is not found through it. That is not modelled, so such an overload is refused.
+	const bool redeclaration = std::any_of(_unit.helpers.begin(), _unit.helpers.end(), [&](const FunctionDecl& other) {
+		return other.name == decl.name && sameParameterTypes(other, decl);
+	});
+	if (!redeclaration) {
+		for (const auto& scope: _scopes) {
+			for (const auto& brought: scope.second.declarations) {
+				if (brought.second.count(decl.name)) {
+					throw CompileError(quoted + " is a new overload declared after a using declaration of its "
+						"name; Apple does not find it through that declaration, which mslc does not model");
+				}
+			}
+		}
+	}
+
 	if (at(TokenKind::LBracket)) {
 		throw CompileError("attributes on " + quoted + " are not lowered yet");
 	}
@@ -2164,8 +2180,17 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 	return "";
 }
 
-std::string Parser::resolveName(const QualifiedName& name) const {
+std::string Parser::resolveName(const QualifiedName& name, std::vector<std::string>* alternatives) const {
 	const auto pick = [&](const std::set<std::string>& found, const std::string& spelled) {
+		// [over.match]: functions that lookup finds in several scopes (using directives and
+		// declarations) are one overload set, which the emitter chooses from by the arguments.
+		if (found.size() > 1 && alternatives && std::all_of(found.begin(), found.end(), [&](const std::string& each) {
+			const std::vector<std::string_view> kinds = kindsOf(each);
+			return kinds.size() == 1 && kinds.front() == "function";
+		})) {
+			alternatives->assign(found.begin(), found.end());
+			return *found.begin();
+		}
 		if (found.size() > 1) {
 			throw CompileError("reference to \"" + spelled + "\" is ambiguous: it names " + *found.begin()
 				+ " and " + *std::next(found.begin()));
@@ -2339,14 +2364,14 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* be
 	return {};
 }
 
-std::string Parser::peekResolved(size_t& tokens) const {
+std::string Parser::peekResolved(size_t& tokens, std::vector<std::string>* alternatives) const {
 	QualifiedName name;
 	if (!peekQualifiedName(name)) {
 		throw CompileError("expected a name, found " + std::string(tokenKindName(kind())) + " \""
 			+ std::string(current().text) + "\"");
 	}
 	tokens = name.tokens;
-	return resolveName(name);
+	return resolveName(name, alternatives);
 }
 
 // "typedef", already consumed, then a type and the one name it is given. What can
@@ -4842,8 +4867,10 @@ ExpressionPtr Parser::parsePrimary() {
 			}
 		}
 		// A local hides a namespace's name only where it is not followed by "::".
+		std::vector<std::string> alternatives;
 		const std::string resolved = kind() == TokenKind::Identifier && isLocal(std::string(current().text))
-			&& lookahead().kind != TokenKind::ColonColon ? std::string(current().text) : peekResolved(spelledTokens);
+			&& lookahead().kind != TokenKind::ColonColon ? std::string(current().text)
+			: peekResolved(spelledTokens, &alternatives);
 		const auto consumeName = [&] {
 			for (size_t i = 0; i < spelledTokens; ++i) {
 				advance();
@@ -4959,6 +4986,10 @@ ExpressionPtr Parser::parsePrimary() {
 		expression->kind = ExpressionKind::Identifier;
 		expression->line = line();
 		expression->name = resolved;
+		expression->overloadNames = alternatives;
+		// An unqualified name in a call also finds the functions of its arguments' namespaces.
+		expression->unqualifiedCall = spelledTokens == 1 && lookahead(spelledTokens).kind == TokenKind::LParen
+			&& !blockName(std::string(current().text));
 		// A qualified call is looked up at the scope it WROTE, not at the scope the member
 		// it found happens to live in: "B::clamp" can resolve to "A::clamp" through a using
 		// declaration or directive in B, but it is still B's lookup that also reaches the

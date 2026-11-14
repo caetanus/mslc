@@ -2105,6 +2105,10 @@ namespace {
 				if (unit.findFunction(name)) {
 					throw CompileError("cannot call the entry point \"" + name + "\"");
 				}
+				// Several names are one overload set, chosen by the arguments at emission.
+				if (!call->left->overloadNames.empty()) {
+					continue;
+				}
 
 				const auto declared = first.find(name);
 				if (declared == first.end()) {
@@ -2536,6 +2540,10 @@ namespace {
 		Id emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver,
 			const std::vector<Id>& prepared);
 		std::vector<HelperFunction*> helpersNamed(const std::string& name);
+		std::vector<std::string> namesOfCall(const Expression& call);
+		// What a call can denote before its arguments are known: every function of every name the
+		// parser found for it (not the ones argument-dependent lookup adds).
+		std::vector<HelperFunction*> helpersCalled(const Expression& call);
 		HelperFunction* resolveOverload(const Expression& call, const std::vector<HelperFunction*>& set,
 			std::vector<Id>& prepared);
 		const HelperFunction* returningHelper(const Expression& call, std::string (*aspect)(const Type&));
@@ -5467,18 +5475,74 @@ namespace {
 		// Checked before the helpers: a template that shares its name with a helper is
 		// an overload, and the helper (one signature per name) must not take a call
 		// the template would have won.
-		if (_unit.functionTemplates.count(call.left->name)) {
-			throw CompileError("a call to the function template \"" + call.left->name + "\" needs an "
-				"instantiation, which is not lowered yet; the template itself is parsed and accepted");
+		const std::vector<std::string> names = namesOfCall(call);
+		for (const std::string& name: names) {
+			if (_unit.functionTemplates.count(name)) {
+				throw CompileError("a call to the function template \"" + name + "\" needs an "
+					"instantiation, which is not lowered yet; the template itself is parsed and accepted");
+			}
 		}
 
-		const auto overloads = _overloads.find(call.left->name);
-		if (overloads != _overloads.end()) {
-			return resolveOverload(call, overloads->second, prepared);
+		std::vector<HelperFunction*> set;
+		for (const std::string& name: names) {
+			const std::vector<HelperFunction*> named = helpersNamed(name);
+			set.insert(set.end(), named.begin(), named.end());
 		}
+		if (set.size() > 1) {
+			return resolveOverload(call, set, prepared);
+		}
+		return set.empty() ? nullptr : set.front();
+	}
 
-		const auto found = _helpers.find(call.left->name);
-		return found == _helpers.end() ? nullptr : &found->second;
+	// The names a call can denote: the one the parser resolved, the others it found at the same
+	// level (using directives and declarations), and for an unqualified call the same-named
+	// function of the namespace of each struct argument (argument-dependent lookup).
+	std::vector<std::string> Emitter::namesOfCall(const Expression& call) {
+		std::vector<std::string> names = call.left->overloadNames;
+		if (names.empty()) {
+			names.push_back(call.left->name);
+		}
+		if (!call.left->unqualifiedCall) {
+			return names;
+		}
+		const size_t tail = call.left->name.rfind("::");
+		const std::string last = tail == std::string::npos ? call.left->name : call.left->name.substr(tail + 2);
+		for (const ExpressionPtr& argument: call.arguments) {
+			const StructDecl* decl = structOf(*argument);
+			std::string type = decl ? decl->name : std::string();
+			if (!decl) {
+				if (argument->kind == ExpressionKind::Conditional) {
+					throw CompileError("an unqualified call has a conditional expression as an argument, whose "
+						"namespace argument-dependent lookup would search; that is not lowered yet");
+				}
+				const auto tag = enumOf(*argument);
+				type = tag && *tag != "<anonymous>" ? *tag : std::string();
+			}
+			const size_t scope = type.rfind("::");
+			if (scope == std::string::npos) {
+				continue;
+			}
+			const std::string associated = type.substr(0, scope) + "::" + last;
+			const std::vector<HelperFunction*> found = helpersNamed(associated);
+			const bool visible = std::any_of(found.begin(), found.end(), [&](const HelperFunction* entry) {
+				return entry->firstOrder <= callerOrder();
+			});
+			if (visible && std::find(names.begin(), names.end(), associated) == names.end()) {
+				names.push_back(associated);
+			}
+		}
+		return names;
+	}
+
+	std::vector<Emitter::HelperFunction*> Emitter::helpersCalled(const Expression& call) {
+		std::vector<HelperFunction*> all = helpersNamed(call.left->name);
+		for (const std::string& name: call.left->overloadNames) {
+			if (name != call.left->name) {
+				const std::vector<HelperFunction*> named = helpersNamed(name);
+				all.insert(all.end(), named.begin(), named.end());
+			}
+		}
+		return all;
 	}
 
 	// Every function a name can denote: its one function, or each signature of an overloaded name.
@@ -5496,9 +5560,10 @@ namespace {
 	const Emitter::HelperFunction* Emitter::returningHelper(const Expression& call,
 		std::string (*aspect)(const Type&)) {
 		const HelperFunction* chosen = nullptr;
-		for (const HelperFunction* candidate: helpersNamed(call.left->name)) {
+		const std::vector<HelperFunction*> named = helpersCalled(call);
+		for (const HelperFunction* candidate: named) {
 			const FunctionDecl& definition = *candidate->definition;
-			if (_overloads.count(call.left->name)
+			if (named.size() > 1
 				&& (candidate->firstOrder > callerOrder() || definition.parameters.size() != call.arguments.size())) {
 				continue;
 			}
@@ -5520,18 +5585,27 @@ namespace {
 	// does not evaluate them again.
 	Emitter::HelperFunction* Emitter::resolveOverload(const Expression& call, const std::vector<HelperFunction*>& set,
 		std::vector<Id>& prepared) {
-		const std::string& name = call.left->name;
+		// As written: Apple names the function as the call spells it.
+		const size_t tail = call.left->name.rfind("::");
+		const std::string name = call.left->unqualifiedCall && tail != std::string::npos
+			? call.left->name.substr(tail + 2) : call.left->name;
 		const auto describe = [&](const std::vector<HelperFunction*>& entries) {
 			std::string list;
 			for (const HelperFunction* entry: entries) {
-				list += (list.empty() ? "" : ", ") + name + "(" + parameterSignature(*entry->definition) + ")";
+				list += (list.empty() ? "" : ", ") + entry->definition->name + "("
+					+ parameterSignature(*entry->definition) + ")";
 			}
 			return list;
 		};
 		const auto chosen = [&](HelperFunction* entry) {
 			if (!entry->definition->body && !_options.linkageObject) {
-				throw CompileError("\"" + name + "(" + parameterSignature(*entry->definition)
+				throw CompileError("\"" + entry->definition->name + "(" + parameterSignature(*entry->definition)
 					+ ")\" is declared but never defined");
+			}
+			// The scan for imports does not know the functions argument-dependent lookup adds.
+			if (!entry->definition->body && entry->ids.empty()) {
+				throw CompileError("\"" + entry->definition->name + "\" is declared but defined elsewhere, and "
+					"this call finds it by argument-dependent lookup, which importing does not follow yet");
 			}
 			return entry;
 		};
@@ -8223,7 +8297,7 @@ namespace {
 				if (call->left->kind != ExpressionKind::Identifier) {
 					continue;
 				}
-				for (const HelperFunction* helper: helpersNamed(call->left->name)) {
+				for (const HelperFunction* helper: helpersCalled(*call)) {
 					if (helper->definition->body && seen.insert(helper->definition).second) {
 						pending.push_back(helper->definition);
 					}
@@ -8272,7 +8346,7 @@ namespace {
 				if (call->left->kind != ExpressionKind::Identifier) {
 					continue;
 				}
-				for (const HelperFunction* helper: helpersNamed(call->left->name)) {
+				for (const HelperFunction* helper: helpersCalled(*call)) {
 					if (!helper->definition->body || !seen.insert(helper->definition).second) {
 						continue;
 					}
@@ -11096,13 +11170,14 @@ namespace {
 				if (call->left->kind != ExpressionKind::Identifier) {
 					continue;
 				}
-				for (HelperFunction* found: helpersNamed(call->left->name)) {
+				const std::vector<HelperFunction*> called = helpersCalled(*call);
+				for (HelperFunction* found: called) {
 					if (found->definition->body) {
 						pending.push_back(found->definition);
-					} else if (_overloads.count(call->left->name)) {
-						throw CompileError("\"" + call->left->name + "(" + parameterSignature(*found->definition)
-							+ ")\" is declared but defined elsewhere, and the name is overloaded; importing one "
-							"overload of a name is not lowered yet");
+					} else if (called.size() > 1) {
+						throw CompileError("\"" + found->definition->name + "(" + parameterSignature(*found->definition)
+							+ ")\" is declared but defined elsewhere, and a call to it is chosen among overloads; "
+							"importing one overload of a name is not lowered yet");
 					} else {
 						imports.push_back(found);
 					}
@@ -11202,10 +11277,18 @@ namespace {
 		_functionTypes[{ _voidType }] = functionType;
 
 		_overloadedNames = overloadedNames(_unit);
+		// Where each name is first declared, so a call that finds it among several names can tell
+		// whether it is visible yet.
+		std::map<std::string, size_t> firstDeclared;
+		for (const FunctionDecl& helper: _unit.helpers) {
+			firstDeclared.emplace(helper.name, helper.order);
+		}
 		for (const FunctionDecl& helper: _unit.helpers) {
 			if (!_overloadedNames.count(helper.name)) {
 				if (helper.body) {
-					_helpers[helper.name].definition = &helper;
+					HelperFunction& function = _helpers[helper.name];
+					function.definition = &helper;
+					function.firstOrder = firstDeclared.at(helper.name);
 				}
 				continue;
 			}
@@ -11233,6 +11316,7 @@ namespace {
 				const auto entry = _helpers.try_emplace(helper.name);
 				if (!entry.first->second.definition) {
 					entry.first->second.definition = &helper;
+					entry.first->second.firstOrder = firstDeclared.at(helper.name);
 				}
 			}
 		}

@@ -166,3 +166,20 @@ have to see the same overloads of a name: a library that defines `f(float)` alon
 does not meet it. Importing one overload of an overloaded name (declared here, defined in
 another unit) is refused for the same reason. Apple's own AIR symbols are Itanium-mangled
 for every function, which mslc does not follow.
+
+## Overload sets, using declarations and argument-dependent lookup: what is not followed (#266)
+
+- A using declaration names the overloads declared above it, and a later one is not found
+  through it (Apple). mslc refuses a new overload declared after a using declaration of its
+  name instead of modelling the cut-off.
+- Argument-dependent lookup adds the same-named functions of the namespace of each struct
+  argument, found from the argument's struct when it is a name, a member, an element or a call
+  result. An enum argument, or a struct the emitter cannot name before evaluating, adds nothing.
+  The passes that run before emission (the import scan, file-scope sampler ownership) read a
+  call's names from the source and do not see what lookup adds: a function declared and defined
+  elsewhere that only argument-dependent lookup reaches is refused, and a file-scope sampler
+  named by a function only it reaches is not counted against its entry point.
+- A helper no entry point reaches is not checked for a call to an overloaded name (arity, no
+  matching function, declared above); resolution happens where the call is emitted.
+- A mutable reference parameter beside other overloads is not offered a vector component (Apple:
+  "non-const reference cannot bind to vector element"); the call picks another overload.

@@ -266,6 +266,15 @@ struct Expression {
 	// call is resolved against both.
 	bool besideStdlib = false;
 
+	// Identifier: the functions an unqualified lookup found in more than one scope (using
+	// directives and declarations), which together are the overload set of a call. Empty when
+	// the lookup found one name, which is then "name".
+	std::vector<std::string> overloadNames;
+
+	// Identifier: written without a qualifier and followed by "(", so argument-dependent lookup
+	// adds the functions of its arguments' namespaces.
+	bool unqualifiedCall = false;
+
 	// InitList
 	std::vector<InitializerElement> elements;
 

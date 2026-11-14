@@ -237,14 +237,16 @@ private:
 	// The file-scope name a spelling refers to from here: its qualified name, or the
 	// spelling itself when it names no declaration (a builtin). A qualified spelling
 	// that names nothing is a CompileError.
-	std::string resolveName(const QualifiedName& name) const;
+	// With "alternatives", a name that finds several functions is their overload set, not an
+	// ambiguity: they are returned there and the first is the result.
+	std::string resolveName(const QualifiedName& name, std::vector<std::string>* alternatives = nullptr) const;
 	// The declarations an unqualified name finds at the innermost namespace level that has
 	// any, without reporting several as ambiguous (a declaration site is not a use). With
 	// "besideStdlib", also whether the standard library's names are visible there or nearer:
 	// the level is namespace metal, or a using directive or declaration brings them to it.
 	std::set<std::string> unqualifiedFound(const std::string& last, bool* besideStdlib = nullptr) const;
 	// The name at the current token, resolved, and how many tokens spell it.
-	std::string peekResolved(size_t& tokens) const;
+	std::string peekResolved(size_t& tokens, std::vector<std::string>* alternatives = nullptr) const;
 	void collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const;
 	// With "besideStdlib", also whether the walk visited namespace metal or a scope with a
 	// "using metal::name;" of this name, directly or through a directive it follows.
