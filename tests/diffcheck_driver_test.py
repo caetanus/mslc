@@ -64,6 +64,12 @@ assert rc == 3, (rc, out)
 rc, out, data = run("range_kernel.metal")
 assert rc == 0 and data["results"][0]["status"] == "matched", (rc, out)
 
+# --profiles restricts the cases' input profiles; an unknown one is refused.
+rc, out, data = run("fma_kernel.metal", "--profiles", "moderate", "--cases", "2")
+assert rc == 0 and [c["profile"] for c in data["results"][0]["cases"]] == ["moderate", "moderate"], (rc, out)
+rc, out, data = run("fma_kernel.metal", "--profiles", "bogus")
+assert rc == 2, (rc, out)
+
 # Buffer indices out of parameter order.
 rc, out, data = run("permuted_index_kernel.metal")
 assert rc == 0 and data["results"][0]["status"] == "matched", (rc, out)
