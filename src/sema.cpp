@@ -6520,18 +6520,27 @@ namespace {
 		}
 	}
 
-	// A member or element of a value that is computed (S{...}, a call): it is a
-	// prvalue, so nothing can be stored to it or bound to a reference. Other roots keep
-	// their own diagnostics.
+	// A struct value that is computed rather than named: S{...}, a call, or a conditional whose
+	// arms all are. A conditional with a named arm may yield a place, so it is not one.
+	static bool isComputedValue(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::Identifier: return false;
+			case ExpressionKind::Member:
+			case ExpressionKind::Index: return isComputedValue(*expression.left);
+			case ExpressionKind::Comma: return isComputedValue(*expression.right);
+			case ExpressionKind::Conditional:
+				return isComputedValue(*expression.arguments[0]) && isComputedValue(*expression.arguments[1]);
+			case ExpressionKind::Call:
+			case ExpressionKind::InitList: return true;
+			default: return false;
+		}
+	}
+
+	// A member or element of a computed value: a prvalue, so nothing can be stored to it
+	// or bound to a reference.
 	static bool isTemporaryPart(const Expression& target) {
-		if (target.kind != ExpressionKind::Member && target.kind != ExpressionKind::Index) {
-			return false;
-		}
-		const Expression* root = &target;
-		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
-			root = root->left.get();
-		}
-		return root->kind == ExpressionKind::Call || root->kind == ExpressionKind::InitList;
+		return (target.kind == ExpressionKind::Member || target.kind == ExpressionKind::Index)
+			&& isComputedValue(target);
 	}
 
 	// The variable a non-const reference parameter names: the caller's own, so a
