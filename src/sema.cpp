@@ -560,6 +560,8 @@ namespace {
 	// The Lod bit of the image operands mask, which an explicit-lod sample and
 	// an image fetch both carry.
 	constexpr uint32_t kImageOperandsLod = 0x2;
+// The Offset image operand, a runtime texel offset (ImageGatherExtended on a gather).
+constexpr uint32_t kImageOperandsOffset = 0x10;
 
 	// Every name an expression or statement refers to. A constexpr sampler nothing
 	// refers to has no state in Apple's AIR, so it gets no binding either.
@@ -2379,6 +2381,7 @@ namespace {
 		std::vector<EmbeddedSampler> _embeddedSamplers;
 		// Set once the module needs ImageQuery, which is declared once.
 		bool _imageQueryDeclared = false;
+		bool _gatherExtendedDeclared = false;
 		bool _sampleRateShadingDeclared = false;
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
@@ -2531,6 +2534,9 @@ namespace {
 		Id emitTextureCall(const Expression& call);
 		Id emitTextureSample(const Expression& call, const Binding& texture);
 		Id emitTextureRead(const Expression& call, const Binding& texture);
+		Id emitTextureGather(const Expression& call, const Binding& texture);
+		const Binding& samplerArgument(const Expression& argument, ResourceKind kind, const std::string& callName);
+		Id samplingCoordinate(const Expression& coordinate, ResourceKind kind, const Expression* layer, const std::string& callName);
 		Id emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component);
 		Id appendArrayLayer(Id coordinate, ScalarKind component, const Expression& layer,
 			const std::string& callName);
@@ -9882,6 +9888,19 @@ namespace {
 		if (method == "sample" && access == TextureAccess::Sample) {
 			return emitTextureSample(call, texture);
 		}
+		if (method == "gather" && access == TextureAccess::Sample) {
+			return emitTextureGather(call, texture);
+		}
+		if (method == "get_num_mip_levels" && access == TextureAccess::Sample) {
+			if (!call.arguments.empty()) {
+				throw CompileError("get_num_mip_levels takes no arguments");
+			}
+			if (!_imageQueryDeclared) {
+				_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::ImageQuery) });
+				_imageQueryDeclared = true;
+			}
+			return _builder.emitTyped(spirv::OpImageQueryLevels, _uintType, { loadFrom(texture.id, texture.pointeeType) });
+		}
 		if (method == "get_height" && kind == ResourceKind::Texture1D) {
 			throw CompileError("a texture1d has no get_height; it is one texel high");
 		}
@@ -9969,6 +9988,122 @@ namespace {
 			{ coordinate, convert(index, _uintType, _types.scalar(component)) });
 	}
 
+	// The sampler a sample or gather names as its first argument. A coord::pixel sampler
+	// is only lowered on a texture2d (Vulkan allows unnormalized coordinates on
+	// non-arrayed 1D and 2D views only).
+	const Binding& Emitter::samplerArgument(const Expression& argument, ResourceKind kind, const std::string& callName) {
+		if (argument.kind != ExpressionKind::Identifier) {
+			throw CompileError("the first argument of " + callName + " has to name a sampler");
+		}
+		const Binding* samplerBinding = findResourceBinding(argument.name);
+		if (!samplerBinding || samplerBinding->pointeeMsl.resource != ResourceKind::Sampler) {
+			throw CompileError("\"" + argument.name + "\" is not a sampler, and " + callName + " takes one "
+				"as its first argument");
+		}
+		if (kind != ResourceKind::Texture2D && samplerBinding->unnormalizedSampler) {
+			throw CompileError(std::string("a ") + resourceKindName(kind) + " cannot be sampled with a "
+				"coord::pixel sampler: mslc lowers unnormalized coordinates on texture2d only (Vulkan "
+				"allows them on non-arrayed 1D and 2D image views). A sampler parameter is not checked, since its state is the host's");
+		}
+		return *samplerBinding;
+	}
+
+	// The float coordinate of a sample or gather, a number being broadcast, with the
+	// array layer appended where the texture has one.
+	Id Emitter::samplingCoordinate(const Expression& argument, ResourceKind kind, const Expression* layer,
+		const std::string& callName) {
+		const uint32_t width = textureCoordinateWidth(kind);
+		const Id coordinateVector = _types.vector(ScalarKind::Float, width);
+		Id coordinate = emitExpression(argument);
+		const Id coordinateType = _builder.typeOf(coordinate);
+		if (coordinateType != coordinateVector) {
+			if (_types.vectorWidth(coordinateType) != 1 || _types.bitWidth(coordinateType) < 8) {
+				throw CompileError("the coordinate of " + callName + " has to be a float"
+					+ (width == 1 ? std::string() : std::to_string(width)) + " or a number");
+			}
+			coordinate = width == 1 ? convert(coordinate, coordinateType, coordinateVector)
+				: broadcast(coordinate, coordinateVector);
+		}
+		if (layer) {
+			coordinate = appendArrayLayer(coordinate, ScalarKind::Float, *layer, callName);
+		}
+		return coordinate;
+	}
+
+	// gather(sampler, coordinate [, array index] [, int2 offset] [, component::x..w]): the
+	// four texels of a 2x2 footprint at one channel, as OpImageGather. The offset is a
+	// texture2d and texture2d_array argument; it takes a runtime value here, which
+	// needs ImageGatherExtended. A coord::pixel sampler is refused.
+	Id Emitter::emitTextureGather(const Expression& call, const Binding& texture) {
+		const auto& arguments = call.arguments;
+		const ResourceKind kind = texture.pointeeMsl.resource;
+		const bool arrayed = kind == ResourceKind::Texture2DArray;
+		if (kind != ResourceKind::Texture2D && kind != ResourceKind::TextureCube && !arrayed) {
+			throw CompileError(std::string("gather is defined on texture2d, texture2d_array and texturecube; ")
+				+ resourceKindName(kind) + " has none");
+		}
+		const size_t fixed = arrayed ? 3 : 2;
+		if (arguments.size() < fixed) {
+			throw CompileError(std::string("gather takes a sampler, a coordinate") + (arrayed ? ", an array index" : "")
+				+ ", and optionally an int2 offset and a component");
+		}
+		const Binding& sampler = samplerArgument(*arguments[0], kind, "gather");
+		if (sampler.unnormalizedSampler) {
+			throw CompileError("gather through a coord::pixel sampler is not lowered: Vulkan allows no gather on an "
+				"unnormalized sampler");
+		}
+		const Id coordinate = samplingCoordinate(*arguments[1], kind, arrayed ? arguments[2].get() : nullptr, "gather");
+
+		Id offset = InvalidId;
+		uint32_t component = 0;
+		bool componentSeen = false;
+		for (size_t i = fixed; i < arguments.size(); ++i) {
+			const Expression& argument = *arguments[i];
+			const std::string tail = argument.kind == ExpressionKind::Identifier
+				? argument.name.substr(argument.name.rfind("::") == std::string::npos ? 0 : argument.name.rfind("::") + 2)
+				: std::string();
+			const bool isComponent = argument.kind == ExpressionKind::Identifier
+				&& argument.name.find("component::") != std::string::npos;
+			if (isComponent) {
+				const auto found = std::string("xyzw").find(tail);
+				// Apple takes the component only after the offset, where there is one.
+				if (componentSeen || i != (kind == ResourceKind::TextureCube ? fixed : fixed + 1)
+					|| tail.size() != 1 || found == std::string::npos) {
+					throw CompileError("gather takes one component::x, y, z or w, after the offset where the texture has one");
+				}
+				component = static_cast<uint32_t>(found);
+				componentSeen = true;
+			} else if (i == fixed && kind != ResourceKind::TextureCube) {
+				const Id value = emitExpression(argument);
+				const Id type = _builder.typeOf(value);
+				if (_types.vectorWidth(type) != 2 || _types.isFloat(type)) {
+					throw CompileError("the offset of gather has to be an int2");
+				}
+				offset = convert(value, type, _types.vector(ScalarKind::Int, 2));
+			} else {
+				throw CompileError(std::string("gather takes ") + (kind == ResourceKind::TextureCube
+					? "a sampler, a coordinate and optionally a component; a texturecube has no offset"
+					: "a sampler, a coordinate, an optional int2 offset and an optional component"));
+			}
+		}
+
+		const Id image = loadFrom(texture.id, texture.pointeeType);
+		const Id loadedSampler = loadFrom(sampler.id, sampler.pointeeType);
+		const Id combined = _builder.emitTyped(spirv::OpSampledImage, _types.sampledImage(kind),
+			{ image, loadedSampler });
+		std::vector<uint32_t> words { combined, coordinate, constantU32(component) };
+		if (offset != InvalidId) {
+			if (!_gatherExtendedDeclared) {
+				_gatherExtendedDeclared = true;
+				_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::ImageGatherExtended) });
+			}
+			words.push_back(kImageOperandsOffset);
+			words.push_back(offset);
+		}
+		return texturePixels(texture, _builder.emitTyped(spirv::OpImageGather,
+			_types.vector(ScalarKind::Float, 4), words));
+	}
+
 	// sample(sampler, float2 coordinate [, level(lod)]), a float3 coordinate on a
 	// texturecube or texture3d, or a float2 coordinate and a uint layer on a
 	// texture2d_array. A fragment function takes
@@ -9987,36 +10122,8 @@ namespace {
 				"this call passes " + std::to_string(arguments.size()));
 		}
 
-		if (arguments[0]->kind != ExpressionKind::Identifier) {
-			throw CompileError("the first argument of sample has to name a sampler");
-		}
-		const Binding* samplerBinding = findResourceBinding(arguments[0]->name);
-		if (!samplerBinding || samplerBinding->pointeeMsl.resource != ResourceKind::Sampler) {
-			throw CompileError("\"" + arguments[0]->name + "\" is not a sampler, and sample takes one "
-				"as its first argument");
-		}
-		const Binding& sampler = *samplerBinding;
-
-		if (kind != ResourceKind::Texture2D && sampler.unnormalizedSampler) {
-			throw CompileError(std::string("a ") + resourceKindName(kind) + " cannot be sampled with a "
-				"coord::pixel sampler: mslc lowers unnormalized coordinates on texture2d only (Vulkan "
-				"allows them on non-arrayed 1D and 2D image views). A sampler parameter is not checked, since its state is the host's");
-		}
-		const uint32_t width = textureCoordinateWidth(kind);
-		const Id coordinateVector = _types.vector(ScalarKind::Float, width);
-		Id coordinate = emitExpression(*arguments[1]);
-		const Id coordinateType = _builder.typeOf(coordinate);
-		if (coordinateType != coordinateVector) {
-			if (_types.vectorWidth(coordinateType) != 1 || _types.bitWidth(coordinateType) < 8) {
-				throw CompileError("the coordinate of sample has to be a float"
-					+ (width == 1 ? std::string() : std::to_string(width)) + " or a number");
-			}
-			coordinate = width == 1 ? convert(coordinate, coordinateType, coordinateVector)
-				: broadcast(coordinate, coordinateVector);
-		}
-		if (arrayed) {
-			coordinate = appendArrayLayer(coordinate, ScalarKind::Float, *arguments[2], "sample");
-		}
+		const Binding& sampler = samplerArgument(*arguments[0], kind, "sample");
+		const Id coordinate = samplingCoordinate(*arguments[1], kind, arrayed ? arguments[2].get() : nullptr, "sample");
 
 		if (kind == ResourceKind::Texture1D && arguments.size() > fixed) {
 			throw CompileError("a texture1d samples with a sampler and a coordinate only; a sample option "
