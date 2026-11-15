@@ -154,11 +154,19 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
 
 ## Reading a mismatch: what is not an mslc bug
 
-Triage of the corpus sweeps (2,754 probe kernels at the default 64 threads: 1,187 compared, 1,071
-matched; the 45 that write only zeros now say `// DIFFCHECK: writes-zero`). Most probes were designed
-as single-thread kernels that all store to element 0, so at 64 threads most of the 71 that differ at 64 threads differ
-because the last writer differs between backends (not all were triaged); those are not in `tests/probe-run.txt` and need a
-RUN line with `grid=1` or a rewrite to index by thread. Another 15 time out or crash a host.
+Triage of the corpus sweeps (2,754 probe kernels at 64 threads, local size 8: 1,187 compared, 1,071
+matched, 71 mismatched, 45 wrote only zeros, 15 errors, the rest skipped). `tests/probe-run.txt` is
+the matched and zero-output files of that sweep (one line per file, so fewer lines than kernels),
+less the probes that read uninitialised memory and four that flaked across repeated runs because
+every thread stores to the same element (a race, not a finding), plus the changes below. Other
+probes with that shape may still flake. Of the 45 zero-output
+probes, 29 say `// DIFFCHECK: writes-zero` (zero by design; 3 of them also run `grid=1 local=1`
+because every thread stores to element 0); 5 were zero only because the random inputs never reached
+the branch, so they bound the input with `DIFFCHECK-RANGE`; 10 race on element 0 and run `grid=1
+local=1`, which is deterministic for an acceptance probe whose result is incidental but would hide
+lane-order errors; 1 reads uninitialised memory and was dropped from the list. Most of the 71
+mismatches are the same race (not all were triaged). They are not in the list; they need a RUN
+line with `grid=1`, or a rewrite that indexes by thread. The 15 errors time out or crash a host.
 
 - Inputs that are UB for the kernel. A float input converted to an array index, a `uchar` lane
   index, a loop bound or a store index drawn from the full 32-bit range reads or writes out of
@@ -200,7 +208,8 @@ a Metal device, and lavapipe needs Mesa installed, so this is a local and opt-in
 `tools/diffcheck/ci-probe-metal.sh`, logs whether the runner has a Metal device and skips the rest
 when it does not. Unproven on a real runner: read that step's log on the first run (a device named
 under `devices:` and `default: present` means the job runs; `devices: 0` means a self-hosted runner is
-the only way). `tests/probe-run.txt` lists the kernel probes that match at the default grid; the job
+the only way). A failing job-level `continue-on-error` job may still show a red check on the commit;
+that is unverified until the first run. `tests/probe-run.txt` lists the kernel probes that match at the default grid; the job
 requires 1,050 compared.
 
 A probe in `tests/probes/` opts in with a `// RUN:` line; with the option on it becomes the
