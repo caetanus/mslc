@@ -624,7 +624,8 @@ void Parser::parseNamespaceAlias() {
 		throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
 	}
 	if (!_blocks.empty()) {
-		if (_blocks.back().names.count(name)) {
+		if (_blocks.back().names.count(name)
+			|| (_blocks.back().sharesEnclosingScope && _blocks.size() >= 2 && _blocks[_blocks.size() - 2].names.count(name))) {
 			throw CompileError("\"" + name + "\" is declared and cannot also be a namespace alias");
 		}
 		if (const auto [entry, inserted] = _blocks.back().aliases.emplace(name, target); !inserted && entry->second != target) {
