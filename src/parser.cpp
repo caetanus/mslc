@@ -3873,6 +3873,7 @@ void Parser::parseResourceType(Type& type) {
 	}
 
 	std::string access = "sample";
+	bool accessSpelled = false;
 	if (match(TokenKind::Comma)) {
 		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
 			// A nearer namespace named metal supplies its own "access", not the library's (a file
@@ -3901,6 +3902,7 @@ void Parser::parseResourceType(Type& type) {
 			throw CompileError("expected an access qualifier name after \"access::\"");
 		}
 		access = std::string(advance().text);
+		accessSpelled = true;
 		if (access != "sample" && access != "read" && access != "write" && access != "read_write") {
 			throw CompileError(name + " access::" + access + " is not lowered yet; mslc lowers "
 				"access::sample, which is the default, access::read, access::write and access::read_write");
@@ -3911,7 +3913,7 @@ void Parser::parseResourceType(Type& type) {
 	type.resource = isMultisampled ? ms->second.kind : depth != depthTextures.end() ? depth->second : color->second;
 	type.isDepth = isDepth;
 	type.isMultisampled = isMultisampled;
-	if (isMultisampled && access != "read") {
+	if (isMultisampled && (access != "sample" || accessSpelled) && access != "read") {
 		throw CompileError(name + " access::" + access + " is not lowered yet; a multisampled texture is read-only");
 	}
 	if (type.isDepth && (element->second != ScalarKind::Float || access != "sample")) {

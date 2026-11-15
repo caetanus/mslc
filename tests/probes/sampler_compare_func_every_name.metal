@@ -11,8 +11,14 @@
 #include <metal_stdlib>
 using namespace metal;
 fragment float4 hit(depth2d<float> d [[texture(0)]]) {
-  constexpr sampler a(compare_func::never), b(compare_func::less), c(compare_func::less_equal), e(compare_func::greater),
-    f(compare_func::greater_equal), g(compare_func::equal), h(compare_func::not_equal), i(compare_func::always);
+  constexpr sampler a(compare_func::never);
+  constexpr sampler b(compare_func::less);
+  constexpr sampler c(compare_func::less_equal);
+  constexpr sampler e(compare_func::greater);
+  constexpr sampler f(compare_func::greater_equal);
+  constexpr sampler g(compare_func::equal);
+  constexpr sampler h(compare_func::not_equal);
+  constexpr sampler i(compare_func::always);
   float x = d.sample_compare(a, float2(0.5), 0.5) + d.sample_compare(b, float2(0.5), 0.5) + d.sample_compare(c, float2(0.5), 0.5)
     + d.sample_compare(e, float2(0.5), 0.5) + d.sample_compare(f, float2(0.5), 0.5) + d.sample_compare(g, float2(0.5), 0.5)
     + d.sample_compare(h, float2(0.5), 0.5) + d.sample_compare(i, float2(0.5), 0.5);
