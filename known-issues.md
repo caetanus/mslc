@@ -192,6 +192,35 @@ treats it as an exact match that binds only a constant-space place; the same cal
 ambiguous, as in Apple. The argument is read once at the call, not bound, so a value read through two
 aliasing constant references is the same value (nothing can write constant memory).
 
+## Two reference parameters on overlapping places of one variable are refused (#210)
+
+`f(s.a, s.b)`, `f(w.s.a, w.t.a)` and `f(a[0], a[2])` (different members, or different literal indices at
+the first step they differ) are lowered: each place is copied in and out on its own. Still refused, though
+Apple accepts them, because a pair of copies cannot reproduce a write seen through the other reference: the
+same place twice (`f(s.a, s.a)`, `f(a[1], a[1])`), a member with its own struct (`f(s.a, s)`), and an index
+that is not a literal (`f(a[0], a[i])`, even `f(a[i].x, a[i].y)`). Apple refuses a reference to a vector
+component, element or matrix column element (`f(v.x)`, `f(v[1])`, `f(m[1][0])`, `float &r = v.y;`); mslc
+refuses them too, and binds `const thread float &r = v.y;` to a copy, as Apple does. A vector element that
+is reached through a call result, a conditional or a cast is not recognised as one.
+
+## Two names for one object in a call that copies elements in and out (found 2026-11-15, #210)
+
+`thread S &r = s; f(r.a, s.a)` and a helper `h(thread S &p, thread S &q) { return f(p.a, q.a); }` called
+as `h(s, s)` pass two copies of storage that is the same object, so a write through one is lost or stale
+(Apple: both references alias). Pre-existing; the check sees names, not objects.
+
+## A constant-buffer struct argument never matches a constant reference in an overloaded call (#232 f)
+
+`h(const constant A &)` against `h(const thread A &)` or `h(B)`, called with `ca[0]` of a `constant A *`, is
+refused as "no matching function" (the buffer layout type is not the parameter's type), where Apple picks
+the first, or `h(B)`. A loud over-rejection.
+
+## Constant references: what is not modelled (#232 f, review follow-up)
+
+A vector component or element of a constant vector chooses among overloads with a `const constant float &`
+candidate: Apple finds the candidate viable and errors if it wins, mslc refuses the call. `const device float
+&r = b[0].x;` and the constant equivalent are refused (the copy is thread memory; Apple refuses the mismatch).
+
 ## Overload sets, using declarations and argument-dependent lookup: what is not followed (#266)
 
 - A using declaration names the overloads declared above it, and a later one is not found

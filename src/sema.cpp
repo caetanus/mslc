@@ -2628,6 +2628,7 @@ namespace {
 		std::vector<std::string> namesOfCall(const Expression& call);
 		const StructDecl* adlStructOf(const Expression& argument);
 		bool inConstantSpace(const Expression& place) const;
+		std::optional<Type> placeType(const Expression& place);
 		bool isVectorPlace(const Expression& place);
 		bool isVectorComponent(const Expression& place);
 		Id constantReferenceArgument(const Expression& argument, const Parameter& parameter,
@@ -6543,7 +6544,7 @@ namespace {
 	// bare variables are the same pointer and alias as C++ does.
 	void Emitter::rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
 		size_t first) const {
-		struct Passed { std::string root; bool temporary; };
+		struct Passed { std::string root; bool temporary; std::vector<AccessStep> steps; };
 		std::vector<Passed> passed;
 		for (size_t i = 0; i < call.arguments.size(); ++i) {
 			if (!definition.parameters[first + i].isMutableReference()) {
@@ -6559,9 +6560,92 @@ namespace {
 				continue;
 			}
 			const auto bound = _bindings.find(root.name);
+			std::string rootName;
+			std::vector<AccessStep> steps;
+			accessChain(argument, rootName, steps);
 			passed.push_back({ root.name, argument.kind != ExpressionKind::Identifier
-				|| (bound != _bindings.end() && bound->second.isAddress) });
+				|| (bound != _bindings.end() && bound->second.isAddress), std::move(steps) });
 		}
+
+		// A copied-in element or member is stale for anything else that reads or writes the same
+		// storage during the call: a pointer parameter handed the whole array, or an argument that
+		// writes (assignment, a call of a helper) while naming that storage.
+		const bool copiedIn = std::any_of(passed.begin(), passed.end(), [](const Passed& p) { return p.temporary; });
+		if (copiedIn) {
+			const auto mayWrite = [&](const auto& self, const Expression& e) -> bool {
+				if (e.kind == ExpressionKind::Assign) {
+					return true;
+				}
+				// A helper writes the caller's storage only through a reference or a pointer parameter.
+				if (e.kind == ExpressionKind::Call && e.left->kind == ExpressionKind::Identifier) {
+					const auto takesAddress = [](const HelperFunction& helper) {
+						return std::any_of(helper.definition->parameters.begin(), helper.definition->parameters.end(),
+							[](const Parameter& p) { return p.isMutableReference() || p.type.isPointer; });
+					};
+					const auto overloads = _overloads.find(e.left->name);
+					const auto single = _helpers.find(e.left->name);
+					if (overloads != _overloads.end()
+						? std::any_of(overloads->second.begin(), overloads->second.end(),
+							[&](const HelperFunction* h) { return takesAddress(*h); })
+						: single != _helpers.end() && takesAddress(single->second)) {
+						return true;
+					}
+				}
+				for (const Expression* child: { e.left.get(), e.right.get() }) {
+					if (child && self(self, *child)) return true;
+				}
+				return std::any_of(e.arguments.begin(), e.arguments.end(),
+					[&](const ExpressionPtr& a) { return self(self, *a); });
+			};
+			std::set<std::string> roots;
+			for (const Passed& p: passed) {
+				if (p.temporary) roots.insert(p.root);
+			}
+			for (size_t i = 0; i < call.arguments.size(); ++i) {
+				const Parameter& parameter = definition.parameters[first + i];
+				if (parameter.isMutableReference()) {
+					continue;
+				}
+				std::set<std::string> names;
+				collectIdentifiers(*call.arguments[i], names);
+				const bool sharesRoot = std::any_of(names.begin(), names.end(),
+					[&](const std::string& n) { return roots.count(n) > 0; });
+				if ((parameter.type.isPointer && sharesRoot) || mayWrite(mayWrite, *call.arguments[i])) {
+					throw CompileError("the call to \"" + definition.name + "\" passes an element or member through "
+						"a reference parameter, and another argument reads or writes the same storage "
+						"(a pointer to it, or an expression with side effects); the reference is a copy "
+						"that is written back after the call, so that is not lowered yet");
+				}
+			}
+		}
+
+		// Two places of one variable that no run can make the same (different members, or different
+		// literal indices at the first step they differ) are separate copies in and out, so the callee
+		// cannot tell them from two variables. One that is a prefix of the other, or a dynamic index,
+		// may overlap and stays refused.
+		const auto disjoint = [](const std::vector<AccessStep>& a, const std::vector<AccessStep>& b) {
+			for (size_t k = 0; k < a.size() && k < b.size(); ++k) {
+				if (a[k].isDereference || a[k].isArrow || b[k].isDereference || b[k].isArrow
+					|| a[k].isIndex != b[k].isIndex) {
+					return false;
+				}
+				if (!a[k].isIndex) {
+					if (a[k].memberName != b[k].memberName) {
+						return true;
+					}
+					continue;
+				}
+				const bool literals = a[k].index->kind == ExpressionKind::IntLiteral
+					&& b[k].index->kind == ExpressionKind::IntLiteral;
+				if (!literals) {
+					return false;
+				}
+				if (a[k].index->intValue != b[k].index->intValue) {
+					return true;
+				}
+			}
+			return false;
+		};
 
 		for (size_t i = 0; i < passed.size(); ++i) {
 			for (size_t j = i + 1; j < passed.size(); ++j) {
@@ -6569,9 +6653,11 @@ namespace {
 				const bool viaAddress = (passed[i].temporary || passed[j].temporary)
 					&& (_bindings.count(passed[i].root) && _bindings.at(passed[i].root).isAddress
 						|| _bindings.count(passed[j].root) && _bindings.at(passed[j].root).isAddress);
-				if ((sameRoot && (passed[i].temporary || passed[j].temporary)) || viaAddress) {
+				const bool apart = sameRoot && !viaAddress && disjoint(passed[i].steps, passed[j].steps);
+				if (!apart && ((sameRoot && (passed[i].temporary || passed[j].temporary)) || viaAddress)) {
 					throw CompileError("the call to \"" + definition.name + "\" passes the same variable "
-						"through two reference parameters, one of them as a member or element; that is "
+						"through two reference parameters, one of them as a member or element, and the two "
+						"places may overlap (one holds the other, or an index is not a literal); that is "
 						"not lowered yet");
 				}
 			}
@@ -6589,9 +6675,9 @@ namespace {
 			throw CompileError(what + " has to be a variable, an element or a member: parameter \""
 				+ parameter.name + "\" is a reference to it");
 		}
-		if (argument.kind == ExpressionKind::Member && !structOf(*argument.left)) {
+		if (isVectorComponent(argument)) {
 			throw CompileError(what + " is a component of a vector, which a reference parameter cannot "
-				"name yet");
+				"name (Apple refuses it too)");
 		}
 
 		const Expression& root = storeRoot(argument);
@@ -6647,40 +6733,65 @@ namespace {
 		return _constants.count(root.name) > 0;
 	}
 
-	// A place whose value is a whole vector: a vector variable, an element of a buffer or an array of
-	// vectors, or a vector member.
-	bool Emitter::isVectorPlace(const Expression& place) {
-		const auto vector = [](const Type& type) { return type.vectorWidth > 1 && !type.isMatrix(); };
+	// The type a name, an element or a member has, as the source spelled it; a buffer pointer counts as an
+	// array. Nothing for an expression that is not one of these.
+	std::optional<Type> Emitter::placeType(const Expression& place) {
 		switch (place.kind) {
 			case ExpressionKind::Identifier: {
 				const auto binding = _bindings.find(place.name);
-				return binding != _bindings.end() && !binding->second.isBuffer
-					&& !binding->second.pointeeMsl.arrayLength && vector(binding->second.pointeeMsl);
-			}
-			case ExpressionKind::Index: {
-				if (place.left->kind != ExpressionKind::Identifier) {
-					return false;
+				if (binding != _bindings.end()) {
+					Type type = binding->second.pointeeMsl;
+					if (binding->second.isBuffer) {
+						if (type.arrayLength) {
+							type.innerArrayLengths.insert(type.innerArrayLengths.begin(), *type.arrayLength);
+						}
+						type.arrayLength = 1;
+					}
+					return type;
 				}
-				const auto binding = _bindings.find(place.left->name);
-				return binding != _bindings.end() && vector(binding->second.pointeeMsl)
-					&& (binding->second.isBuffer || (binding->second.pointeeMsl.arrayLength
-						&& binding->second.pointeeMsl.arrayRank() == 1));
+				for (const VariableDeclaration& global: _unit.globals) {
+					if (global.name == place.name) {
+						return global.type;
+					}
+				}
+				return std::nullopt;
 			}
 			case ExpressionKind::Member: {
 				const StructDecl* decl = structOf(*place.left);
 				if (!decl) {
-					return false;
+					return std::nullopt;
 				}
 				std::string name;
 				const size_t field = fieldIndexOf(*decl, place.memberName, name);
-				return field != decl->fields.size() && !decl->fields[field].type.arrayLength
-					&& vector(decl->fields[field].type);
+				return field == decl->fields.size() ? std::nullopt : std::optional<Type>(decl->fields[field].type);
 			}
-			default: return false;
+			case ExpressionKind::Index: {
+				std::optional<Type> type = placeType(*place.left);
+				if (!type) {
+					return std::nullopt;
+				}
+				if (type->arrayLength) {
+					type->dropOuterDimension();
+				} else if (type->isMatrix()) {
+					type->matrixColumns = 0;
+				} else if (type->vectorWidth > 1) {
+					type->vectorWidth = 0;
+				} else {
+					return std::nullopt;
+				}
+				return type;
+			}
+			default: return std::nullopt;
 		}
 	}
 
-	// A component of a vector (v.x, v[1]), which no reference binds (Apple refuses it too).
+	// A place whose value is a whole vector.
+	bool Emitter::isVectorPlace(const Expression& place) {
+		const std::optional<Type> type = placeType(place);
+		return type && !type->arrayLength && type->vectorWidth > 1 && !type->isMatrix();
+	}
+
+	// A component of a vector (v.x, v[1], m[1][0]), which no reference binds (Apple refuses it too).
 	bool Emitter::isVectorComponent(const Expression& place) {
 		if (place.kind == ExpressionKind::Member) {
 			return !structOf(*place.left);
@@ -10183,9 +10294,30 @@ namespace {
 				"an element or a member; binding it to a value is not lowered yet");
 		}
 
-		if (place.kind == ExpressionKind::Member && !structOf(*place.left)) {
-			throw CompileError("the reference \"" + declaration.name + "\" is bound to a component of a "
-				"vector, which is not lowered yet");
+		if (isVectorComponent(place)) {
+			// A reference to a component of a vector has no storage to name. Apple refuses a non-const
+			// one, and binds a const one to a temporary copy of the component.
+			if (!declaration.type.isConst) {
+				throw CompileError("the reference \"" + declaration.name + "\" is bound to a component of a "
+					"vector, which a non-const reference cannot name (Apple refuses it too); copy the "
+					"component or bind a const reference");
+			}
+			if (declaration.type.addressSpace != AddressSpace::None
+				&& declaration.type.addressSpace != AddressSpace::Thread) {
+				throw CompileError("the reference \"" + declaration.name + "\" to a component of a vector is in the "
+					+ addressSpaceName(declaration.type.addressSpace) + " address space, and the copy it would "
+					"bind is in thread memory (Apple refuses the mismatch)");
+			}
+			const Id value = emitExpression(place);
+			const Type referenced = declaration.type.isAuto
+				? deduceAutoType(declaration.type, _builder.typeOf(value), declaration.name) : declaration.type;
+			requireSameReferent(declaration, referenced, _builder.typeOf(value));
+			const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
+				_types.pointer(spirv::StorageClass::Function, _builder.typeOf(value)),
+				{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+			_builder.emit(spirv::OpStore, { variable, value });
+			bindLocal(declaration.name, variable, _builder.typeOf(value), referenced);
+			return;
 		}
 
 		const Expression& root = storeRoot(place);
