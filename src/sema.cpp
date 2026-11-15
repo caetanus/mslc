@@ -1366,7 +1366,7 @@ void TypeTable::requireCapability(spirv::CapabilityValue capability) {
 
 // The Dim, Arrayed flag and capability a texture kind's image type takes; the
 // sampled and the storage image of a kind differ only in the Sampled operand.
-Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sampled, bool depth) {
+Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sampled, bool depth, bool multisampled) {
 	const bool cube = kind == ResourceKind::TextureCube || kind == ResourceKind::TextureCubeArray;
 	const bool oneD = kind == ResourceKind::Texture1D || kind == ResourceKind::Texture1DArray;
 	const bool arrayed = kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture1DArray
@@ -1377,17 +1377,20 @@ Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sample
 	if (kind == ResourceKind::TextureCubeArray) {
 		requireCapability(spirv::Capability::ImageCubeArray);
 	}
+	if (multisampled && arrayed) {
+		requireCapability(spirv::Capability::ImageMSArray);
+	}
 	return _builder.emitDecl(spirv::OpTypeImage, { scalar(sampledType),
 		cube ? spirv::Dim::Cube : kind == ResourceKind::Texture3D ? spirv::Dim::Dim3D
 			: oneD ? spirv::Dim::Dim1D : spirv::Dim::Dim2D,
-		depth ? 1u : sampled == 2 ? 0u : 2u, arrayed ? 1u : 0u, 0u, sampled,
+		depth ? 1u : sampled == 2 ? 0u : 2u, arrayed ? 1u : 0u, multisampled ? 1u : 0u, sampled,
 		static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 }
 
-Id TypeTable::image(ResourceKind kind, ScalarKind sampledType, bool depth) {
-	Id& cached = _images[{ kind, sampledType, depth }];
+Id TypeTable::image(ResourceKind kind, ScalarKind sampledType, bool depth, bool multisampled) {
+	Id& cached = _images[{ kind, sampledType, depth, multisampled }];
 	if (cached == InvalidId) {
-		cached = imageOf(kind, sampledType, 1u, depth);
+		cached = imageOf(kind, sampledType, 1u, depth, multisampled);
 	}
 
 	return cached;
@@ -1406,7 +1409,7 @@ Id TypeTable::storageImage(ResourceKind kind, TextureAccess access, ScalarKind e
 	}
 	Id& cached = _storageImages[{ kind, element }];
 	if (cached == InvalidId) {
-		cached = imageOf(kind, element, 2u, false);
+		cached = imageOf(kind, element, 2u, false, false);
 	}
 	return cached;
 }
@@ -1430,9 +1433,9 @@ Id TypeTable::samplerType() {
 	return _samplerType;
 }
 
-Id TypeTable::sampledImage(ResourceKind kind, ScalarKind sampledType, bool depth) {
-	const Id imageType = image(kind, sampledType, depth);
-	Id& cached = _sampledImages[{ kind, sampledType, depth }];
+Id TypeTable::sampledImage(ResourceKind kind, ScalarKind sampledType, bool depth, bool multisampled) {
+	const Id imageType = image(kind, sampledType, depth, multisampled);
+	Id& cached = _sampledImages[{ kind, sampledType, depth, multisampled }];
 	if (cached == InvalidId) {
 		cached = _builder.emitDecl(spirv::OpTypeSampledImage, { imageType });
 	}
@@ -2545,6 +2548,7 @@ namespace {
 		Id emitTextureSample(const Expression& call, const Binding& texture, bool compare = false);
 		Id compareValue(const Expression& argument, const std::string& callName);
 		Id emitTextureRead(const Expression& call, const Binding& texture);
+		Id emitMultisampledCall(const Expression& call, const Binding& texture);
 		Id emitTextureGather(const Expression& call, const Binding& texture, bool compare = false);
 		const Binding& samplerArgument(const Expression& argument, ResourceKind kind, const std::string& callName);
 		Id samplingCoordinate(const Expression& coordinate, ResourceKind kind, const Expression* layer, const std::string& callName);
@@ -6694,6 +6698,7 @@ namespace {
 			return binding && binding->pointeeMsl.resource == type.resource
 				&& (!type.isTexture() || (binding->pointeeMsl.scalar == type.scalar
 					&& binding->pointeeMsl.isDepth == type.isDepth
+					&& binding->pointeeMsl.isMultisampled == type.isMultisampled
 					&& binding->pointeeMsl.textureAccess == type.textureAccess)) ? exact(-1) : none;
 		}
 		if (type.isPointer || type.arrayLength) {
@@ -6846,7 +6851,7 @@ namespace {
 		if (type.textureAccess != TextureAccess::Sample) {
 			return _types.storageImage(type.resource, type.textureAccess, textureSampledKind(type.scalar));
 		}
-		return type.isTexture() ? _types.image(type.resource, textureSampledKind(type.scalar), type.isDepth) : _types.samplerType();
+		return type.isTexture() ? _types.image(type.resource, textureSampledKind(type.scalar), type.isDepth, type.isMultisampled) : _types.samplerType();
 	}
 
 	// The variable behind a texture or sampler argument: it has to be a name for a
@@ -6865,6 +6870,7 @@ namespace {
 		const bool matches = binding && binding->pointeeMsl.resource == wanted.resource
 			&& (!wanted.isTexture() || (binding->pointeeMsl.scalar == wanted.scalar
 				&& binding->pointeeMsl.isDepth == wanted.isDepth
+				&& binding->pointeeMsl.isMultisampled == wanted.isMultisampled
 				&& binding->pointeeMsl.textureAccess == wanted.textureAccess));
 		if (!matches) {
 			throw CompileError(what + " is \"" + argument.name + "\", which is not a "
@@ -9892,6 +9898,9 @@ namespace {
 		if (method == "write") {
 			throw CompileError("texture write returns void and has no value");
 		}
+		if (texture.pointeeMsl.isMultisampled) {
+			return emitMultisampledCall(call, texture);
+		}
 		const bool sized = method == "get_width" || method == "get_height"
 			|| (method == "get_depth" && kind == ResourceKind::Texture3D)
 			|| (method == "get_array_size" && isArrayKind(kind));
@@ -10187,7 +10196,7 @@ namespace {
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id loadedSampler = loadFrom(sampler.id, sampler.pointeeType);
 		const Id combined = _builder.emitTyped(spirv::OpSampledImage,
-			_types.sampledImage(kind, textureSampledKind(texture.pointeeMsl.scalar), texture.pointeeMsl.isDepth),
+			_types.sampledImage(kind, textureSampledKind(texture.pointeeMsl.scalar), texture.pointeeMsl.isDepth, false),
 			{ image, loadedSampler });
 		std::vector<uint32_t> words { combined, coordinate, compare ? reference : constantU32(component) };
 		if (offset != InvalidId && constantOffset) {
@@ -10363,7 +10372,7 @@ namespace {
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id loadedSampler = loadFrom(sampler.id, sampler.pointeeType);
 		const Id combined = _builder.emitTyped(spirv::OpSampledImage,
-			_types.sampledImage(texture.pointeeMsl.resource, textureSampledKind(texture.pointeeMsl.scalar), texture.pointeeMsl.isDepth),
+			_types.sampledImage(texture.pointeeMsl.resource, textureSampledKind(texture.pointeeMsl.scalar), texture.pointeeMsl.isDepth, false),
 			{ image, loadedSampler });
 
 		const Id float4 = _types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4);
@@ -10477,14 +10486,67 @@ namespace {
 		return textureTexel(texture, fetched);
 	}
 
+	// The methods of a multisampled texture: read(coordinate [, array index], sample) is
+	// OpImageFetch with the Sample operand and no lod, get_num_samples is
+	// OpImageQuerySamples, and the size queries take no argument.
+	Id Emitter::emitMultisampledCall(const Expression& call, const Binding& texture) {
+		const std::string& method = call.left->memberName;
+		const auto& arguments = call.arguments;
+		const ResourceKind kind = texture.pointeeMsl.resource;
+		const bool arrayed = isArrayKind(kind);
+		if (method == "get_width" || method == "get_height") {
+			return emitTextureSize(call, texture, method == "get_width" ? SizeComponent::Width : SizeComponent::Height);
+		}
+		if (method == "get_array_size" && arrayed) {
+			return emitTextureSize(call, texture, SizeComponent::ArraySize);
+		}
+		if (method == "get_num_samples") {
+			if (!arguments.empty()) {
+				throw CompileError("get_num_samples takes no arguments");
+			}
+			if (!_imageQueryDeclared) {
+				_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::ImageQuery) });
+				_imageQueryDeclared = true;
+			}
+			return _builder.emitTyped(spirv::OpImageQuerySamples, _uintType, { loadFrom(texture.id, texture.pointeeType) });
+		}
+		if (method != "read") {
+			throw CompileError("the " + typeName(texture.pointeeMsl) + " method \"" + method + "\" is not lowered yet; mslc lowers "
+				"read, get_num_samples, get_width, get_height and get_array_size on a multisampled texture");
+		}
+		const size_t fixed = arrayed ? 3 : 2;
+		if (arguments.size() != fixed) {
+			throw CompileError(std::string("read on a multisampled texture takes a coordinate")
+				+ (arrayed ? ", an array index" : "") + " and a sample index");
+		}
+		Id coordinate = emitExpression(*arguments[0]);
+		const Id coordinateType = _builder.typeOf(coordinate);
+		const bool unsignedPair = _types.vectorWidth(coordinateType) == 2 && !_types.isFloat(coordinateType)
+			&& !_types.isSignedInt(coordinateType) && (_types.bitWidth(coordinateType) == 32 || _types.bitWidth(coordinateType) == 16);
+		if (!unsignedPair) {
+			throw CompileError("the coordinate of read has to be a uint2 or a ushort2");
+		}
+		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, 2));
+		if (arrayed) {
+			coordinate = appendArrayLayer(coordinate, ScalarKind::UInt, *arguments[1], "read");
+		}
+		const Id sampleIndex = layerIndex(*arguments[fixed - 1], "read");
+		const Id image = loadFrom(texture.id, texture.pointeeType);
+		return textureTexel(texture, _builder.emitTyped(spirv::OpImageFetch,
+			_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4),
+			{ image, coordinate, 0x40 /* Sample */, sampleIndex }));
+	}
+
 	// get_width(), get_height() and get_depth() or get_array_size() (component 0,
 	// 1 and 2 of the size), of level 0 or of the lod given.
 	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component) {
 		const std::string& name = call.left->memberName;
-		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample;
+		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample || texture.pointeeMsl.isMultisampled;
 		if (storage && !call.arguments.empty()) {
-			throw CompileError(std::string("mip arguments are unsupported on access::")
-				+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures; " + name + " takes no arguments");
+			throw CompileError(texture.pointeeMsl.isMultisampled
+				? name + " takes no arguments: a multisampled texture has no mip levels"
+				: std::string("mip arguments are unsupported on access::")
+					+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures; " + name + " takes no arguments");
 		}
 		if (call.arguments.size() > 1) {
 			throw CompileError(name + " takes an optional lod; this call passes "

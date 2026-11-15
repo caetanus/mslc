@@ -63,9 +63,13 @@ std::string typeName(const Type& type) {
 		return "sampler";
 	}
 	if (type.isTexture()) {
-		const std::string kindName = !type.isDepth ? std::string(resourceKindName(type.resource))
+		std::string kindName = !type.isDepth ? std::string(resourceKindName(type.resource))
 			: type.resource == ResourceKind::Texture2D ? "depth2d" : type.resource == ResourceKind::Texture2DArray ? "depth2d_array"
 			: type.resource == ResourceKind::TextureCube ? "depthcube" : "depthcube_array";
+		if (type.isMultisampled) {
+			const size_t array = kindName.find("_array");
+			kindName = array == std::string::npos ? kindName + "_ms" : kindName.substr(0, array) + "_ms_array";
+		}
 		return kindName + "<" + scalarKindName(type.scalar)
 			+ (type.textureAccess == TextureAccess::Sample ? std::string(">")
 				: std::string(", access::") + textureAccessName(type.textureAccess) + ">");

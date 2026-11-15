@@ -130,6 +130,9 @@ struct Type {
 	// A depth2d, depth2d_array, depthcube or depthcube_array: the texture kind above with a
 	// depth image, whose lookups return one float instead of a four-channel texel.
 	bool isDepth = false;
+	// A texture2d_ms, texture2d_ms_array, depth2d_ms or depth2d_ms_array: read by texel and sample
+	// index with no sampler and no mip levels.
+	bool isMultisampled = false;
 
 	bool isScalar() const { return vectorWidth == 0; }
 	bool isVector() const { return vectorWidth > 1; }

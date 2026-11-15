@@ -3680,13 +3680,22 @@ void Parser::parseResourceType(Type& type) {
 		{ "texture1d_array", ResourceKind::Texture1DArray },
 		{ "texturecube_array", ResourceKind::TextureCubeArray },
 	};
+	struct Multisampled { ResourceKind kind; bool depth; };
+	static const std::map<std::string_view, Multisampled> multisampled = {
+		{ "texture2d_ms", { ResourceKind::Texture2D, false } },
+		{ "texture2d_ms_array", { ResourceKind::Texture2DArray, false } },
+		{ "depth2d_ms", { ResourceKind::Texture2D, true } },
+		{ "depth2d_ms_array", { ResourceKind::Texture2DArray, true } },
+	};
 	const auto depth = depthTextures.find(name);
-	const bool isDepth = depth != depthTextures.end();
 	const auto color = textures.find(name);
-	if (!isDepth && color == textures.end()) {
+	const auto ms = multisampled.find(name);
+	const bool isMultisampled = ms != multisampled.end();
+	const bool isDepth = depth != depthTextures.end() || (isMultisampled && ms->second.depth);
+	if (!isMultisampled && depth == depthTextures.end() && color == textures.end()) {
 		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture1d, texture2d, texturecube, "
 			"texture3d, texture2d_array, texture1d_array and texturecube_array, depth2d, depth2d_array, depthcube and "
-			"depthcube_array, and sampler");
+			"depthcube_array, texture2d_ms, texture2d_ms_array, depth2d_ms and depth2d_ms_array, and sampler");
 	}
 
 	expect(TokenKind::Less, ("to open the sampled type of " + name).c_str());
@@ -3754,13 +3763,18 @@ void Parser::parseResourceType(Type& type) {
 	}
 
 	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
-	type.resource = isDepth ? depth->second : color->second;
+	type.resource = isMultisampled ? ms->second.kind : depth != depthTextures.end() ? depth->second : color->second;
 	type.isDepth = isDepth;
+	type.isMultisampled = isMultisampled;
+	if (isMultisampled && access != "sample" && access != "read") {
+		throw CompileError(name + " access::" + access + " is not lowered yet; a multisampled texture is read-only");
+	}
 	if (type.isDepth && (element->second != ScalarKind::Float || access != "sample")) {
 		throw CompileError(name + "<" + component + (access == "sample" ? "" : ", access::" + access)
 			+ "> is not lowered yet; mslc lowers depth textures of float with access::sample (Apple has no depth half)");
 	}
-	type.textureAccess = access == "write" ? TextureAccess::Write
+	// A multisampled texture is a sampled image whichever way read is spelled.
+	type.textureAccess = isMultisampled ? TextureAccess::Sample : access == "write" ? TextureAccess::Write
 		: access == "read" ? TextureAccess::Read
 		: access == "read_write" ? TextureAccess::ReadWrite : TextureAccess::Sample;
 	type.scalar = element->second;
