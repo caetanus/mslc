@@ -56,16 +56,30 @@ class Fill(unittest.TestCase):
         self.assertEqual(len(data), 400 * 16)
 
 
+class Bounds(unittest.TestCase):
+    def test_integer_leaves_stay_in_range_and_floats_are_untouched(self):
+        for profile in inputs.PROFILES:
+            data = make(profile, bounds=(0, 3))
+            self.assertLessEqual({struct.unpack_from("<I", data, i * 16 + 4)[0] for i in range(400)}, {0, 1, 2, 3}, profile)
+        floats = {struct.unpack_from("<I", make("wide", bounds=(0, 3)), i * 16)[0] for i in range(400)}
+        self.assertGreater(len(floats), 100)
+
+
 class Directives(unittest.TestCase):
     def test_parse(self):
-        d = directives.parse("// RUN: grid=64 seed=2\n// DIFFCHECK: writes-zero\n"
+        d = directives.parse("// RUN: grid=64 seed=2\n// DIFFCHECK: writes-zero\n// DIFFCHECK-RANGE: which 0 3\n"
                              "// DIFFCHECK-EXCLUDE: scratch reads uninitialised memory\nkernel void k() {}\n")
         self.assertEqual(d, {"run": {"grid": 64, "seed": 2}, "writes_zero": True,
-                             "exclude": {"scratch": "reads uninitialised memory"}})
+                             "exclude": {"scratch": "reads uninitialised memory"},
+                             "range": {"which": (0, 3)}})
 
     def test_exclusion_without_a_reason_is_an_error(self):
         with self.assertRaises(ValueError):
             directives.parse("// DIFFCHECK-EXCLUDE: scratch\n")
+
+    def test_empty_range_is_an_error(self):
+        with self.assertRaises(ValueError):
+            directives.parse("// DIFFCHECK-RANGE: which 5 2\n")
 
     def test_unknown_run_key_is_an_error(self):
         with self.assertRaises(ValueError):

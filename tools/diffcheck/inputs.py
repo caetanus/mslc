@@ -40,7 +40,7 @@ def _wide_float(rng, scalar):
     return (rng.getrandbits(1) << 15) | (rng.randrange(3, 29) << 10) | rng.getrandbits(10)
 
 
-def leaf_bits(rng, scalar, profile):
+def leaf_bits(rng, scalar, profile, bounds=None):
     size, kind = SCALARS[scalar]
     if kind == "bool":
         return rng.getrandbits(1)
@@ -54,6 +54,8 @@ def leaf_bits(rng, scalar, profile):
             return rng.choice(_EDGE_FLOAT[scalar])
         return _wide_float(rng, scalar)
     mask = (1 << (size * 8)) - 1
+    if bounds and kind == "int":
+        return rng.randint(*bounds) & mask
     if profile == "moderate":
         low = 0 if scalar.startswith("u") else -100
         return rng.randrange(low, 201) & mask
@@ -62,8 +64,9 @@ def leaf_bits(rng, scalar, profile):
     return rng.getrandbits(size * 8)
 
 
-def fill_buffer(layout, elements, rng, profile, sentinel=False, poison_padding=False):
-    """A bytearray of elements * stride bytes for one buffer."""
+def fill_buffer(layout, elements, rng, profile, sentinel=False, poison_padding=False, bounds=None):
+    """A bytearray of elements * stride bytes for one buffer. `bounds` (lo, hi) limits its
+    integer leaves, for a buffer a kernel uses as an index."""
     stride = layout["stride"]
     if sentinel:
         return bytearray([SENTINEL]) * (elements * stride)
@@ -72,5 +75,5 @@ def fill_buffer(layout, elements, rng, profile, sentinel=False, poison_padding=F
         for leaf in layout["leaves"]:
             size = SCALARS[leaf["scalar"]][0]
             at = element * stride + leaf["off"]
-            data[at:at + size] = leaf_bits(rng, leaf["scalar"], profile).to_bytes(size, "little")
+            data[at:at + size] = leaf_bits(rng, leaf["scalar"], profile, bounds).to_bytes(size, "little")
     return data
