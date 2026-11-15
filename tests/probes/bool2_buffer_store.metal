@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1 cases=3
 // DISASM-MATCH: OpSelect %uchar %[0-9]+ %uchar_1[_0-9]* %uchar_0[_0-9]*
 // DISASM-NO-MATCH: OpSelect %uchar %[0-9]+ %uchar_0
 // DISASM-LANES: OpCompositeExtract %bool 2

@@ -41,4 +41,18 @@ if(TARGET diffcheck-vkhost AND TARGET diffcheck-metalhost)
 	add_test(NAME diffcheck/driver COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_driver_test.py
 		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
 	set_tests_properties(diffcheck/driver PROPERTIES SKIP_RETURN_CODE 77)
+
+	# A probe with a "// RUN:" line is also run on both backends. Unlike the disassembly
+	# needles, a wrong decoration, an inverted select or a swapped lane changes the result.
+	file(GLOB diffcheck_probes CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/probes/*.metal)
+	foreach(probe IN LISTS diffcheck_probes)
+		file(STRINGS ${probe} run_line LIMIT_COUNT 1 REGEX "^// RUN:")
+		if(run_line)
+			get_filename_component(name ${probe} NAME_WE)
+			add_test(NAME diffcheck/probe/${name} COMMAND ${PYTHON3} ${DIFFCHECK_SRC}/diffcheck.py ${probe}
+				--mslc $<TARGET_FILE:mslc-cli> --metalhost $<TARGET_FILE:diffcheck-metalhost>
+				--vkhost $<TARGET_FILE:diffcheck-vkhost>)
+			set_tests_properties(diffcheck/probe/${name} PROPERTIES SKIP_RETURN_CODE 77)
+		endif()
+	endforeach()
 endif()
