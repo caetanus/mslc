@@ -64,5 +64,19 @@ class CrossCheck(unittest.TestCase):
         self.assertTrue(any("mslc does not bind it" in f for f in found))
 
 
+class Verdict(unittest.TestCase):
+    OK = {"negative_control": True, "diff_count": 0, "diffs": []}
+
+    def test_a_control_that_did_not_fire_is_never_a_match(self):
+        self.assertEqual(checks.verdict([dict(self.OK, negative_control=False)], True, False)[0], "control-failed")
+
+    def test_mismatch_zero_output_and_match(self):
+        bad = dict(self.OK, diff_count=1, diffs=[{"buffer": "o"}])
+        self.assertEqual(checks.verdict([self.OK, bad], True, False)[0], "mismatched")
+        self.assertEqual(checks.verdict([self.OK], False, False)[0], "zero-output")
+        self.assertEqual(checks.verdict([self.OK], False, True)[0], "matched")
+        self.assertEqual(checks.verdict([self.OK], True, False)[0], "matched")
+
+
 if __name__ == "__main__":
     unittest.main()

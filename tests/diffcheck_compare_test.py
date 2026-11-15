@@ -42,6 +42,10 @@ class LeafEqual(unittest.TestCase):
         self.assertTrue(compare.leaf_equal(bits(0x7f800000), bits(0x7f800000), "float"))
         self.assertFalse(compare.leaf_equal(bits(0x7f800000), bits(0xff800000), "float", ulp=1 << 30))
 
+    def test_infinity_is_not_within_a_bound_of_the_largest_finite_value(self):
+        self.assertFalse(compare.leaf_equal(bits(0x7f800000), bits(0x7f7fffff), "float", ulp=4))
+        self.assertFalse(compare.leaf_equal(bytes([0xff, 0x7b]), bytes([0x00, 0x7c]), "half", ulp=4))
+
     def test_signed_zero_is_exact_only_without_a_bound(self):
         self.assertFalse(compare.leaf_equal(f32(0.0), f32(-0.0), "float"))
         self.assertTrue(compare.leaf_equal(f32(0.0), f32(-0.0), "float", ulp=1))
@@ -91,6 +95,9 @@ class UlpBound(unittest.TestCase):
 
     def test_namespaced_call_counts(self):
         self.assertEqual(compare.ulp_bound_for_source("x = metal::precise::sin(y);"), compare.ULP_BOUNDS["sin"])
+
+    def test_a_comment_or_string_is_not_a_call(self):
+        self.assertEqual(compare.ulp_bound_for_source('// sin( here\nconst char* s = "pow(";\n/* exp( */ x = a + b;'), 0)
 
     def test_exact_only_source_has_no_bound(self):
         self.assertEqual(compare.ulp_bound_for_source("o[i] = a * b + sqrt(c) / d;"), 0)

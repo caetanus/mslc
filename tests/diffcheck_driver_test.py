@@ -64,6 +64,15 @@ assert rc == 3, (rc, out)
 rc, out, data = run("range_kernel.metal")
 assert rc == 0 and data["results"][0]["status"] == "matched", (rc, out)
 
+# Buffer indices out of parameter order.
+rc, out, data = run("permuted_index_kernel.metal")
+assert rc == 0 and data["results"][0]["status"] == "matched", (rc, out)
+
+# An excluded buffer is not the one the negative control perturbs: the control runs on `o`.
+rc, out, data = run("excluded_first_kernel.metal")
+assert rc == 0 and data["results"][0]["excluded"].keys() == {"junk"}, (rc, out)
+assert all(c["negative_control"] for c in data["results"][0]["cases"])
+
 # The same range given on the command line, for a file one does not edit; a malformed one is refused.
 rc, out, data = run("range_flag_kernel.metal", "--range", "idx=0:127")
 assert rc == 0 and data["results"][0]["status"] == "matched", (rc, out)
@@ -89,4 +98,15 @@ with tempfile.TemporaryDirectory() as d:
     open(listing, "a").write("%s\n" % kernel("zero_kernel.metal"))
     r = subprocess.run(base, capture_output=True, text=True)
     assert r.returncode == 1 and "1 zero-output" in r.stdout, r
+with tempfile.TemporaryDirectory() as d:
+    listing = os.path.join(d, "list.txt")
+    open(os.path.join(d, "missing.metal"), "w").write("kernel void k() { nope(); }\n")
+    base = [sys.executable, DRIVER, "--corpus", listing, "--mslc", mslc, "--metalhost", metalhost, "--vkhost", vkhost]
+    # An empty list is an error, and --min-compared turns a regression to skips into a failure.
+    open(listing, "w").write("# nothing\n")
+    assert subprocess.run(base, capture_output=True, text=True).returncode == 2
+    open(listing, "w").write("%s\n%s\n" % (kernel("fma_kernel.metal"), os.path.join(d, "missing.metal")))
+    assert subprocess.run(base, capture_output=True, text=True).returncode == 0
+    r = subprocess.run(base + ["--min-compared", "2"], capture_output=True, text=True)
+    assert r.returncode == 1 and "--min-compared" in r.stderr, r
 print("PASS")

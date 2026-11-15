@@ -2,6 +2,7 @@
 control's perturbation, and the "something was actually written" test."""
 
 import compare
+import json
 
 
 def cross_check(mslc_buffers, apple):
@@ -58,3 +59,17 @@ def written_nonzero(layouts, before, after):
                 if any(new) and new != bytes(before[index][at:at + size]):
                     return True
     return False
+
+
+def verdict(cases, nonzero, writes_zero):
+    """(status, reason) for the cases of one kernel. A control that did not fire outranks a
+    match, because a comparison that cannot fail proves nothing."""
+    if any(not c["negative_control"] for c in cases):
+        return "control-failed", "the perturbed copy compared equal to Apple's output, or nothing could be perturbed"
+    first = next((c for c in cases if c["diff_count"]), None)
+    if first:
+        return "mismatched", "first difference: %s" % json.dumps(first["diffs"][0])
+    if not nonzero and not writes_zero:
+        return "zero-output", ("no output leaf was written to a non-zero value on either backend "
+                               "(declare `// DIFFCHECK: writes-zero` if that is right)")
+    return "matched", None
