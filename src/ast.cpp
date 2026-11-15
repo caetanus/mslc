@@ -127,6 +127,21 @@ const char* samplerMipFilterName(SamplerMipFilter filter) {
 	return "unknown";
 }
 
+const char* samplerCompareName(SamplerCompare compare) {
+	switch (compare) {
+		case SamplerCompare::Never: return "Never";
+		case SamplerCompare::Less: return "Less";
+		case SamplerCompare::LessEqual: return "LessEqual";
+		case SamplerCompare::Greater: return "Greater";
+		case SamplerCompare::GreaterEqual: return "GreaterEqual";
+		case SamplerCompare::Equal: return "Equal";
+		case SamplerCompare::NotEqual: return "NotEqual";
+		case SamplerCompare::Always: return "Always";
+	}
+
+	return "unknown";
+}
+
 const char* addressSpaceName(AddressSpace space) {
 	switch (space) {
 		case AddressSpace::Device: return "device";

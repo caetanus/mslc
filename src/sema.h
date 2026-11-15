@@ -301,10 +301,11 @@ struct ModuleOptions {
 };
 
 // The reflection's embedded_samplers entries carry the whole of indium's
-// EmbeddedSampler. The options that set compare_function, anisotropy,
+// EmbeddedSampler. compare_function is the compare_func option (Never when unset,
+// the names Never, Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual and
+// Always). The options that set anisotropy,
 // border_color and the lod clamp are refused, so those fields hold Apple's
-// defaults for a sampler that does not set them: compare_function Never (8 in
-// Apple's sampler state word), anisotropy 1, border_color TransparentBlack,
+// defaults for a sampler that does not set them: anisotropy 1, border_color TransparentBlack,
 // lod_min 0 and lod_max 65504 (the largest half). A consumer must not zero-fill
 // them: lod_max 0 would restrict the sampler to mip level 0.
 //

@@ -4720,16 +4720,16 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 
 		const std::string family(advance().text);
 		static const std::set<std::string> unlowered = {
-			"compare_func", "max_anisotropy", "lod_clamp", "border_color", "reduction",
+			"max_anisotropy", "lod_clamp", "border_color", "reduction",
 		};
 		static const std::set<std::string> known = {
 			"coord", "address", "s_address", "t_address", "r_address", "filter",
-			"mag_filter", "min_filter", "mip_filter",
+			"mag_filter", "min_filter", "mip_filter", "compare_func",
 		};
 		if (unlowered.count(family)) {
 			throw CompileError("the sampler option \"" + family + "\" is not lowered yet; mslc lowers "
-				"coord, address, s_address, t_address, r_address, filter, mag_filter, min_filter and "
-				"mip_filter");
+				"coord, address, s_address, t_address, r_address, filter, mag_filter, min_filter, "
+				"mip_filter and compare_func");
 		}
 		if (!known.count(family)) {
 			throw CompileError("\"" + family + "\" is not a sampler option");
@@ -4791,6 +4791,18 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 				[&](const char* attribute) {
 					(attribute[1] == 'a' ? state.magFilter : state.minFilter) = chosen;
 				});
+		} else if (family == "compare_func") {
+			static const std::map<std::string_view, SamplerCompare> compares = {
+				{ "never", SamplerCompare::Never }, { "less", SamplerCompare::Less },
+				{ "less_equal", SamplerCompare::LessEqual }, { "greater", SamplerCompare::Greater },
+				{ "greater_equal", SamplerCompare::GreaterEqual }, { "equal", SamplerCompare::Equal },
+				{ "not_equal", SamplerCompare::NotEqual }, { "always", SamplerCompare::Always },
+			};
+			const auto chosen = compares.find(value);
+			if (chosen == compares.end()) {
+				throw CompileError("\"" + spelled + "\" is not a comparison function");
+			}
+			fill({ "compare" }, [&](const char*) { state.compare = chosen->second; });
 		} else {
 			SamplerMipFilter chosen = SamplerMipFilter::None;
 			if (value == "none") chosen = SamplerMipFilter::None;
