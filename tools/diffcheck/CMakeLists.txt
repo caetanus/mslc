@@ -36,3 +36,9 @@ if(APPLE)
 else()
 	message(STATUS "diffcheck: not macOS, the Metal host is not built")
 endif()
+
+if(TARGET diffcheck-vkhost AND TARGET diffcheck-metalhost)
+	add_test(NAME diffcheck/driver COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_driver_test.py
+		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
+	set_tests_properties(diffcheck/driver PROPERTIES SKIP_RETURN_CODE 77)
+endif()
