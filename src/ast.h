@@ -300,6 +300,10 @@ struct Expression {
 	// declared type names a template parameter, so what it is stands or falls with the arguments.
 	bool templateDependent = false;
 
+	// InitList, Call: a braced temporary or constructor call of a struct the source names (not through a
+	// template parameter), whose type is that struct whatever its arguments are.
+	bool namesConcreteStruct = false;
+
 	// InitList
 	std::vector<InitializerElement> elements;
 
