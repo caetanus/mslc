@@ -6,6 +6,8 @@
 //   std <2.4|3.0|3.1|3.2>     local X Y Z       groups X Y Z       reflection <out.json>
 //   contract on|off           (source mode; default off, see below)
 //   buffer <metal index> <bytes> <input file> <output file>          (run mode)
+// Graphics: mode reflect-gfx|draw, see drawMain; reflect-gfx writes {vertex, fragment} binding
+// lists (buffers with layouts, textures, samplers) of the render pipeline.
 // The source is compiled with newLibraryWithSource and MTLMathModeSafe, the way Blender
 // and Darling's callers do, plus `#pragma clang fp contract(off)`: Metal contracts
 // a * b + c into an fma even in safe math mode, mslc emits a separate multiply and
@@ -73,49 +75,281 @@ static void addLeaves(NSMutableArray *out, NSUInteger base, MTLDataType t, MTLSt
     }
 }
 
+// Buffers with their element layout; with `graphics`, textures and samplers are listed as
+// supported ({index, name, type, data}) instead of being "unsupported".
+static NSDictionary *reflectBindings(NSArray<id<MTLBinding>> *list, BOOL graphics) {
+    g_unsupported = [NSMutableArray array];
+    NSMutableArray *buffers = [NSMutableArray array], *textures = [NSMutableArray array], *samplers = [NSMutableArray array];
+    for (id<MTLBinding> b in list) {
+        if (graphics && [b.name hasPrefix:@"vertexBuffer."]) continue;  // the vertex descriptor's own buffers
+        if (graphics && b.type == MTLBindingTypeTexture) {
+            id<MTLTextureBinding> tb = (id<MTLTextureBinding>)b;
+            [textures addObject:@{@"index": @(b.index), @"name": b.name,
+                @"type": tb.textureType == MTLTextureType2D ? @"2d" : @"other",
+                @"data": tb.textureDataType == MTLDataTypeFloat ? @"float" : @"other"}];
+            continue;
+        }
+        if (graphics && b.type == MTLBindingTypeSampler) {
+            [samplers addObject:@{@"index": @(b.index), @"name": b.name}];
+            continue;
+        }
+        if (b.type != MTLBindingTypeBuffer) {
+            [g_unsupported addObject:[NSString stringWithFormat:@"%@ (index %lu, binding type %ld)", b.name,
+                (unsigned long)b.index, (long)b.type]];
+            continue;
+        }
+        id<MTLBufferBinding> bb = (id<MTLBufferBinding>)b;
+        NSMutableArray *leaves = [NSMutableArray array];
+        NSUInteger stride;
+        BOOL pointer = bb.bufferPointerType != nil;
+        if (pointer) {
+            MTLPointerType *p = bb.bufferPointerType;
+            stride = p.elementIsArgumentBuffer ? 0 : p.dataSize;
+            addLeaves(leaves, 0, p.elementType, p.elementStructType, p.elementArrayType, bb.name);
+        } else {
+            stride = bb.bufferDataSize;
+            addLeaves(leaves, 0, bb.bufferDataType, bb.bufferStructType, nil, bb.name);
+        }
+        NSArray *access = @[@"read", @"readwrite", @"write"];
+        [buffers addObject:@{@"index": @(bb.index), @"name": bb.name, @"access": access[bb.access],
+            @"pointer": @(pointer), @"stride": @(stride), @"alignment": @(bb.bufferAlignment), @"leaves": leaves}];
+    }
+    return @{@"buffers": buffers, @"textures": textures, @"samplers": samplers, @"unsupported": g_unsupported};
+}
+
+static id<MTLLibrary> buildLibrary(id<MTLDevice> device, NSDictionary *m, NSError **error) {
+    id<MTLLibrary> lib;
+    if (m[@"metallib"]) {
+        lib = [device newLibraryWithURL:[NSURL fileURLWithPath:m[@"metallib"][0]] error:error];
+    } else {
+        NSString *src = [NSString stringWithContentsOfFile:m[@"source"][0] encoding:NSUTF8StringEncoding error:nil];
+        if (!src) die(@"cannot read the source");
+        MTLCompileOptions *opts = [MTLCompileOptions new];
+        opts.mathMode = MTLMathModeSafe;
+        NSString *std = m[@"std"][0];
+        if (m[@"contract"] && ![m[@"contract"][0] isEqual:@"on"] && ![m[@"contract"][0] isEqual:@"off"]) die(@"contract is on or off");
+        if (std) {
+            if ([std isEqual:@"2.4"]) opts.languageVersion = MTLLanguageVersion2_4;
+            else if ([std isEqual:@"3.0"]) opts.languageVersion = MTLLanguageVersion3_0;
+            else if ([std isEqual:@"3.1"]) opts.languageVersion = MTLLanguageVersion3_1;
+            else if ([std isEqual:@"3.2"]) opts.languageVersion = MTLLanguageVersion3_2;
+            else die(@"unknown std");
+        }
+        if (![m[@"contract"][0] isEqual:@"on"])
+            src = [@"#pragma clang fp contract(off)\n#line 1\n" stringByAppendingString:src];
+        lib = [device newLibraryWithSource:src options:opts error:error];
+    }
+    return lib;
+}
+
+// ---- graphics: one fixed draw into offscreen targets (see tools/diffcheck/graphics.py) ----
+
+struct VFmt { const char *name; MTLVertexFormat format; NSUInteger size; };
+static const VFmt kVertexFormats[] = {
+    {"float", MTLVertexFormatFloat, 4}, {"float2", MTLVertexFormatFloat2, 8}, {"float3", MTLVertexFormatFloat3, 12},
+    {"float4", MTLVertexFormatFloat4, 16}, {"int", MTLVertexFormatInt, 4}, {"int2", MTLVertexFormatInt2, 8},
+    {"int3", MTLVertexFormatInt3, 12}, {"int4", MTLVertexFormatInt4, 16}, {"uint", MTLVertexFormatUInt, 4},
+    {"uint2", MTLVertexFormatUInt2, 8}, {"uint3", MTLVertexFormatUInt3, 12}, {"uint4", MTLVertexFormatUInt4, 16},
+    {"half2", MTLVertexFormatHalf2, 4}, {"half3", MTLVertexFormatHalf3, 6}, {"half4", MTLVertexFormatHalf4, 8},
+};
+
+struct CFmt { const char *name; MTLPixelFormat format; NSUInteger bytes; };
+static const CFmt kColorFormats[] = {
+    {"rgba32float", MTLPixelFormatRGBA32Float, 16}, {"rgba32sint", MTLPixelFormatRGBA32Sint, 16},
+    {"rgba32uint", MTLPixelFormatRGBA32Uint, 16}, {"rgba16float", MTLPixelFormatRGBA16Float, 8},
+};
+
+static const VFmt &vertexFormat(NSString *name) {
+    for (const VFmt &f : kVertexFormats) if ([name isEqual:@(f.name)]) return f;
+    die([@"unknown vertex format " stringByAppendingString:name]);
+    abort();
+}
+
+static const CFmt &colorFormat(NSString *name) {
+    for (const CFmt &f : kColorFormats) if ([name isEqual:@(f.name)]) return f;
+    die([@"unknown colour format " stringByAppendingString:name]);
+    abort();
+}
+
+static NSData *slurp(NSString *path, NSUInteger expect) {
+    NSData *d = [NSData dataWithContentsOfFile:path];
+    if (!d || (expect != NSUIntegerMax && d.length != expect)) die([@"missing or wrong-sized input file " stringByAppendingString:path]);
+    return d;
+}
+
+static id<MTLTexture> target(id<MTLDevice> device, MTLPixelFormat f, NSUInteger w, NSUInteger h) {
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    return [device newTextureWithDescriptor:td];
+}
+
+// Reflects the render pipeline (draw == NO) or draws and writes every attachment to its file.
+// Manifest lines: vertex, fragment, target W H, draw V I, attr LOC FMT [FILE], color I FMT [C0..C3 FILE],
+// depth [CLEAR FILE], gbuffer STAGE INDEX SET MEMBER BYTES FILE, texture INDEX SET BINDING W H FILE,
+// sampler INDEX SET BINDING. Vertex buffer slot for attribute n is 30 - n.
+static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, NSDictionary<NSString *, NSMutableArray *> *lists, BOOL draw) {
+    NSUInteger width = [m[@"target"][0] integerValue], height = [m[@"target"][1] integerValue];
+    if (!width || !height) die(@"manifest has no target size");
+    id<MTLFunction> vfn = [lib newFunctionWithName:m[@"vertex"][0]], ffn = [lib newFunctionWithName:m[@"fragment"][0]];
+    if (!vfn || !ffn) die(@"no such entry point in the Apple library");
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = vfn;
+    pd.fragmentFunction = ffn;
+    if (lists[@"attr"].count) {
+        MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+        for (NSArray *w in lists[@"attr"]) {
+            NSUInteger loc = [w[1] integerValue];
+            const VFmt &f = vertexFormat(w[2]);
+            vd.attributes[loc].format = f.format;
+            vd.attributes[loc].offset = 0;
+            vd.attributes[loc].bufferIndex = 30 - loc;
+            vd.layouts[30 - loc].stride = f.size;
+            vd.layouts[30 - loc].stepFunction = MTLVertexStepFunctionPerVertex;
+        }
+        pd.vertexDescriptor = vd;
+    }
+    for (NSArray *w in lists[@"color"]) pd.colorAttachments[[w[1] integerValue]].pixelFormat = colorFormat(w[2]).format;
+    if (m[@"depth"]) pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    NSError *err = nil;
+    MTLRenderPipelineReflection *refl = nil;
+    id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:pd
+        options:MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo reflection:&refl error:&err];
+    if (!pso) die([@"pipeline failed: " stringByAppendingString:err.localizedDescription ?: @"?"]);
+    if (!draw) {
+        NSDictionary *doc = @{@"device": device.name, @"vertex": reflectBindings(refl.vertexBindings, YES),
+            @"fragment": reflectBindings(refl.fragmentBindings, YES)};
+        NSData *j = [NSJSONSerialization dataWithJSONObject:doc options:NSJSONWritingSortedKeys error:nil];
+        if (!m[@"reflection"] || ![j writeToFile:m[@"reflection"][0] atomically:YES]) die(@"cannot write the reflection");
+        return 0;
+    }
+
+    NSUInteger vertices = [m[@"draw"][0] integerValue], instances = [m[@"draw"][1] integerValue];
+    id<MTLCommandQueue> q = [device newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    NSMutableArray<id<MTLTexture>> *colorTex = [NSMutableArray array];
+    for (NSArray *w in lists[@"color"]) {
+        id<MTLTexture> t = target(device, colorFormat(w[2]).format, width, height);
+        MTLRenderPassColorAttachmentDescriptor *ca = rp.colorAttachments[[w[1] integerValue]];
+        ca.texture = t;
+        ca.loadAction = MTLLoadActionClear;
+        ca.storeAction = MTLStoreActionStore;
+        ca.clearColor = MTLClearColorMake([w[3] doubleValue], [w[4] doubleValue], [w[5] doubleValue], [w[6] doubleValue]);
+        [colorTex addObject:t];
+    }
+    id<MTLTexture> depthTex = nil;
+    if (m[@"depth"]) {
+        depthTex = target(device, MTLPixelFormatDepth32Float, width, height);
+        rp.depthAttachment.texture = depthTex;
+        rp.depthAttachment.loadAction = MTLLoadActionClear;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        rp.depthAttachment.clearDepth = [m[@"depth"][0] doubleValue];
+    }
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:pso];
+    [enc setCullMode:MTLCullModeNone];
+    [enc setViewport:(MTLViewport){0, 0, (double)width, (double)height, 0, 1}];
+    if (depthTex) {
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = YES;
+        [enc setDepthStencilState:[device newDepthStencilStateWithDescriptor:dd]];
+    }
+    NSMutableArray *keep = [NSMutableArray array];
+    for (NSArray *w in lists[@"attr"]) {
+        NSData *d = slurp(w[3], NSUIntegerMax);
+        id<MTLBuffer> b = [device newBufferWithBytes:d.bytes length:d.length ?: 4 options:MTLResourceStorageModeShared];
+        [enc setVertexBuffer:b offset:0 atIndex:30 - [w[1] integerValue]];
+        [keep addObject:b];
+    }
+    for (NSArray *w in lists[@"gbuffer"]) {
+        NSData *d = slurp(w[6], [w[5] integerValue]);
+        id<MTLBuffer> b = [device newBufferWithBytes:d.bytes length:d.length ?: 4 options:MTLResourceStorageModeShared];
+        if ([w[1] isEqual:@"vertex"]) [enc setVertexBuffer:b offset:0 atIndex:[w[2] integerValue]];
+        else [enc setFragmentBuffer:b offset:0 atIndex:[w[2] integerValue]];
+        [keep addObject:b];
+    }
+    for (NSArray *w in lists[@"texture"]) {
+        NSUInteger tw = [w[4] integerValue], th = [w[5] integerValue];
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:tw height:th mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModeShared;
+        id<MTLTexture> t = [device newTextureWithDescriptor:td];
+        NSData *texels = slurp(w[6], tw * th * 16);
+        [t replaceRegion:MTLRegionMake2D(0, 0, tw, th) mipmapLevel:0 withBytes:texels.bytes bytesPerRow:tw * 16];
+        [enc setFragmentTexture:t atIndex:[w[1] integerValue]];
+        [keep addObject:t];
+    }
+    for (NSArray *w in lists[@"sampler"]) {
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+        sd.mipFilter = MTLSamplerMipFilterNotMipmapped;
+        sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
+        [enc setFragmentSamplerState:[device newSamplerStateWithDescriptor:sd] atIndex:[w[1] integerValue]];
+    }
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices instanceCount:instances];
+    [enc endEncoding];
+
+    // Private targets are copied to shared buffers; the buffers are what the host reads.
+    NSMutableArray<id<MTLBuffer>> *outs = [NSMutableArray array];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    MTLSize size = MTLSizeMake(width, height, 1);
+    for (NSUInteger i = 0; i < colorTex.count; i++) {
+        NSUInteger bpp = colorFormat(lists[@"color"][i][2]).bytes;
+        id<MTLBuffer> b = [device newBufferWithLength:width * height * bpp options:MTLResourceStorageModeShared];
+        [blit copyFromTexture:colorTex[i] sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size
+            toBuffer:b destinationOffset:0 destinationBytesPerRow:width * bpp destinationBytesPerImage:width * height * bpp];
+        [outs addObject:b];
+    }
+    id<MTLBuffer> depthOut = nil;
+    if (depthTex) {
+        depthOut = [device newBufferWithLength:width * height * 4 options:MTLResourceStorageModeShared];
+        [blit copyFromTexture:depthTex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size
+            toBuffer:depthOut destinationOffset:0 destinationBytesPerRow:width * 4 destinationBytesPerImage:width * height * 4
+            options:MTLBlitOptionDepthFromDepthStencil];
+    }
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) die([@"command buffer failed: " stringByAppendingString:cb.error.localizedDescription ?: @"?"]);
+    for (NSUInteger i = 0; i < outs.count; i++)
+        if (![[NSData dataWithBytes:outs[i].contents length:outs[i].length] writeToFile:lists[@"color"][i][7] atomically:YES]) die(@"cannot write a colour file");
+    if (depthOut && ![[NSData dataWithBytes:depthOut.contents length:depthOut.length] writeToFile:m[@"depth"][1] atomically:YES]) die(@"cannot write the depth file");
+    printf("device: %s\n", device.name.UTF8String);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc != 2) die(@"usage: metalhost manifest");
         NSMutableDictionary *m = [NSMutableDictionary dictionary];
         NSMutableArray *bufSpecs = [NSMutableArray array];
+        NSMutableDictionary<NSString *, NSMutableArray *> *lists = [NSMutableDictionary dictionary];
+        NSSet *multi = [NSSet setWithArray:@[@"attr", @"color", @"gbuffer", @"texture", @"sampler"]];
         NSString *text = [NSString stringWithContentsOfFile:@(argv[1]) encoding:NSUTF8StringEncoding error:nil];
         if (!text) die(@"cannot read manifest");
         for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
             NSArray *w = [line componentsSeparatedByString:@" "];
             if (line.length == 0) continue;
             if ([w[0] isEqual:@"buffer"] && w.count == 5) [bufSpecs addObject:w];
-            else if (w.count >= 2) m[w[0]] = [w subarrayWithRange:NSMakeRange(1, w.count - 1)];
+            else if ([multi containsObject:w[0]]) {
+                if (!lists[w[0]]) lists[w[0]] = [NSMutableArray array];
+                [lists[w[0]] addObject:w];
+            } else if (w.count >= 2 || [w[0] isEqual:@"depth"]) m[w[0]] = [w subarrayWithRange:NSMakeRange(1, w.count - 1)];
             else die([@"bad manifest line: " stringByAppendingString:line]);
         }
         BOOL run = [m[@"mode"][0] isEqual:@"run"];
+        BOOL gfx = [m[@"mode"][0] isEqual:@"draw"] || [m[@"mode"][0] isEqual:@"reflect-gfx"];
         NSString *entry = m[@"entry"][0];
-        if (!entry) die(@"manifest has no entry");
+        if (!entry && !gfx) die(@"manifest has no entry");
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) die(@"no Metal device");
         NSError *err = nil;
-        id<MTLLibrary> lib;
-        if (m[@"metallib"]) {
-            lib = [device newLibraryWithURL:[NSURL fileURLWithPath:m[@"metallib"][0]] error:&err];
-        } else {
-            NSString *src = [NSString stringWithContentsOfFile:m[@"source"][0] encoding:NSUTF8StringEncoding error:nil];
-            if (!src) die(@"cannot read the source");
-            MTLCompileOptions *opts = [MTLCompileOptions new];
-            opts.mathMode = MTLMathModeSafe;
-            NSString *std = m[@"std"][0];
-            if (m[@"contract"] && ![m[@"contract"][0] isEqual:@"on"] && ![m[@"contract"][0] isEqual:@"off"]) die(@"contract is on or off");
-            if (std) {
-                if ([std isEqual:@"2.4"]) opts.languageVersion = MTLLanguageVersion2_4;
-                else if ([std isEqual:@"3.0"]) opts.languageVersion = MTLLanguageVersion3_0;
-                else if ([std isEqual:@"3.1"]) opts.languageVersion = MTLLanguageVersion3_1;
-                else if ([std isEqual:@"3.2"]) opts.languageVersion = MTLLanguageVersion3_2;
-                else die(@"unknown std");
-            }
-            if (![m[@"contract"][0] isEqual:@"on"])
-                src = [@"#pragma clang fp contract(off)\n#line 1\n" stringByAppendingString:src];
-            lib = [device newLibraryWithSource:src options:opts error:&err];
-        }
+        id<MTLLibrary> lib = buildLibrary(device, m, &err);
         if (!lib) die([@"Apple compile failed: " stringByAppendingString:err.localizedDescription ?: @"?"]);
+        if (gfx) return drawMain(device, lib, m, lists, [m[@"mode"][0] isEqual:@"draw"]);
         id<MTLFunction> fn = [lib newFunctionWithName:entry];
         if (!fn) die(@"no such entry point in the Apple library");
 
@@ -126,31 +360,9 @@ int main(int argc, char **argv) {
             options:MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo reflection:&refl error:&err];
         if (!pso) die([@"pipeline failed: " stringByAppendingString:err.localizedDescription ?: @"?"]);
 
-        g_unsupported = [NSMutableArray array];
-        NSMutableArray *buffers = [NSMutableArray array];
-        for (id<MTLBinding> b in refl.bindings) {
-            if (b.type != MTLBindingTypeBuffer) {
-                [g_unsupported addObject:[NSString stringWithFormat:@"%@ (index %lu, binding type %ld)", b.name,
-                    (unsigned long)b.index, (long)b.type]];
-                continue;
-            }
-            id<MTLBufferBinding> bb = (id<MTLBufferBinding>)b;
-            NSMutableArray *leaves = [NSMutableArray array];
-            NSUInteger stride;
-            BOOL pointer = bb.bufferPointerType != nil;
-            if (pointer) {
-                MTLPointerType *p = bb.bufferPointerType;
-                stride = p.elementIsArgumentBuffer ? 0 : p.dataSize;
-                addLeaves(leaves, 0, p.elementType, p.elementStructType, p.elementArrayType, bb.name);
-            } else {
-                stride = bb.bufferDataSize;
-                addLeaves(leaves, 0, bb.bufferDataType, bb.bufferStructType, nil, bb.name);
-            }
-            NSArray *access = @[@"read", @"readwrite", @"write"];
-            [buffers addObject:@{@"index": @(bb.index), @"name": bb.name, @"access": access[bb.access],
-                @"pointer": @(pointer), @"stride": @(stride), @"alignment": @(bb.bufferAlignment), @"leaves": leaves}];
-        }
-        NSDictionary *doc = @{@"device": device.name, @"buffers": buffers, @"unsupported": g_unsupported,
+        NSDictionary *bindings = reflectBindings(refl.bindings, NO);
+        NSArray *buffers = bindings[@"buffers"];
+        NSDictionary *doc = @{@"device": device.name, @"buffers": buffers, @"unsupported": bindings[@"unsupported"],
             @"max_threads": @(pso.maxTotalThreadsPerThreadgroup), @"execution_width": @(pso.threadExecutionWidth)};
         if (m[@"reflection"]) {
             NSData *j = [NSJSONSerialization dataWithJSONObject:doc options:NSJSONWritingSortedKeys error:nil];
