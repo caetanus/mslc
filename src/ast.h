@@ -510,6 +510,8 @@ struct TranslationUnit {
 	// Qualified names of the function templates the file declares. They are parsed
 	// and not lowered, so the emitter needs the names to refuse a call to one.
 	std::set<std::string> functionTemplates;
+	// The qualified names of the inline namespaces, which argument-dependent lookup follows outward and inward.
+	std::set<std::string> inlineNamespaces;
 
 	// File-scope declarations, in the order the source declares them. A
 	// "constant" refers to the ones before it, so the order is the meaning.

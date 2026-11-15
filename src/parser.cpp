@@ -544,6 +544,9 @@ void Parser::parseNamespace(bool isInline) {
 			}
 			parent.inlines.push_back(path);
 		}
+		if (isInline) {
+			_unit.inlineNamespaces.insert(path);
+		}
 		_namespaces.insert(path);
 	} else {
 		while (true) {
@@ -578,6 +581,7 @@ void Parser::parseNamespace(bool isInline) {
 					}
 					parent.inlines.push_back(path);
 				}
+				_unit.inlineNamespaces.insert(path);
 			}
 			_namespacePath.emplace_back(advance().text);
 			_namespaces.insert(namespacePrefix(_namespacePath.size()));

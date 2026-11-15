@@ -167,14 +167,30 @@ does not meet it. Importing one overload of an overloaded name (declared here, d
 another unit) is refused for the same reason. Apple's own AIR symbols are Itanium-mangled
 for every function, which mslc does not follow.
 
+## A conditional or comma argument that is an lvalue is refused when the call chooses among overloads (#306)
+
+A conditional or comma with a place for an operand (`c ? la : lb`, `c ? la : 2.0f`, `(lw, lv)`) is an
+lvalue-like value in Apple and can bind a non-const reference parameter; the overload ranking takes it for a
+thread prvalue. Such an argument is refused whenever the call has more than one candidate by arity, qualified
+or not (`N::f(c ? la : lb)`, `::f(...)` included). With one candidate it is accepted (by value or through ADL).
+
+## A const member function's receiver aliases a member reference argument (found 2026-11-15, pre-existing)
+
+`struct S { float a; float b; float m(thread float &x) const { x = 7.0f; return a; } };` and `s.m(s.a)` return 7
+in Apple and 1 in mslc: the receiver is passed by value, so it is not the object the reference names.
+
 ## Overload sets, using declarations and argument-dependent lookup: what is not followed (#266)
 
 - A using declaration names the overloads declared above it, and a later one is not found
   through it (Apple). mslc refuses a new overload declared after a using declaration of its
   name instead of modelling the cut-off.
-- Argument-dependent lookup adds the same-named functions of the namespace of each struct
-  argument, found from the argument's struct when it is a name, a member, an element or a call
-  result. An enum argument, or a struct the emitter cannot name before evaluating, adds nothing.
+- Argument-dependent lookup adds the same-named functions of the namespace of each struct or enum
+  argument, found from the argument's type when it is a name, a member, an element, a call result,
+  a comma or a conditional whose arms agree (#306; an assignment or a cast to a struct is not lowered as an argument at all, and `enumOf` has no case for an assignment). Not followed: the namespace of
+  the pointee of a pointer argument (`g(&s)`; passing `&x` to a helper is refused on its own, so
+  nothing valid is lost today), and a friend function defined in a struct (not parsed). The
+  enclosing namespace of an inline one, and the inline members of a namespace, are followed. A
+  struct the emitter cannot name before evaluating adds nothing.
   The passes that run before emission (the import scan, file-scope sampler ownership) read a
   call's names from the source and do not see what lookup adds: a function declared and defined
   elsewhere that only argument-dependent lookup reaches is refused, and a file-scope sampler

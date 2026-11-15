@@ -2626,6 +2626,7 @@ namespace {
 			const std::vector<Id>& prepared);
 		std::vector<HelperFunction*> helpersNamed(const std::string& name);
 		std::vector<std::string> namesOfCall(const Expression& call);
+		const StructDecl* adlStructOf(const Expression& argument);
 		HelperFunction* definedHelper(HelperFunction* entry);
 		// What a call can denote before its arguments are known: every function of every name the
 		// parser found for it (not the ones argument-dependent lookup adds).
@@ -5772,6 +5773,20 @@ namespace {
 	// The names a call can denote: the one the parser resolved, the others it found at the same
 	// level (using directives and declarations), and for an unqualified call the same-named
 	// function of the namespace of each struct argument (argument-dependent lookup).
+	// The struct an argument has the type of, for argument-dependent lookup: structOf, and the
+	// forms that only keep their operand's type (a comma, a conditional).
+	// Kept apart from structOf, which member access calls on any expression.
+	const StructDecl* Emitter::adlStructOf(const Expression& argument) {
+		switch (argument.kind) {
+			case ExpressionKind::Comma: return adlStructOf(*argument.right);
+			case ExpressionKind::Conditional: {
+				const StructDecl* first = adlStructOf(*argument.arguments.at(0));
+				return first == adlStructOf(*argument.arguments.at(1)) ? first : nullptr;
+			}
+			default: return structOf(argument);
+		}
+	}
+
 	std::vector<std::string> Emitter::namesOfCall(const Expression& call) {
 		std::vector<std::string> names = call.left->overloadNames;
 		if (names.empty()) {
@@ -5783,35 +5798,53 @@ namespace {
 		const size_t tail = call.left->name.rfind("::");
 		const std::string last = tail == std::string::npos ? call.left->name : call.left->name.substr(tail + 2);
 		for (const ExpressionPtr& argument: call.arguments) {
-			const StructDecl* decl = structOf(*argument);
+			const StructDecl* decl = adlStructOf(*argument);
 			std::string type = decl ? decl->name : std::string();
 			if (!decl) {
-				if (argument->kind == ExpressionKind::Conditional) {
+				const auto tag = enumOf(*argument);
+				if (argument->kind == ExpressionKind::Conditional && !tag) {
 					throw CompileError("an unqualified call has a conditional expression as an argument, whose "
 						"namespace argument-dependent lookup would search; that is not lowered yet");
 				}
-				const auto tag = enumOf(*argument);
 				type = tag && *tag != "<anonymous>" ? *tag : std::string();
 			}
 			if (type.empty()) {
 				continue;
 			}
 			// A type of the file scope associates the file scope: its f is found from inside a namespace too.
+			// A namespace that is inline associates its enclosing one, and a namespace its inline members.
 			const size_t scope = type.rfind("::");
-			const std::string associated = scope == std::string::npos ? last : type.substr(0, scope) + "::" + last;
-			const std::vector<HelperFunction*> found = helpersNamed(associated);
-			const bool visible = std::any_of(found.begin(), found.end(), [&](const HelperFunction* entry) {
-				return entry->firstOrder <= callerOrder();
-			}) || _unit.functionTemplates.count(associated);
-			if (visible && std::find(names.begin(), names.end(), associated) == names.end()) {
-				// The library's own overloads compete with it, which mslc does not model here.
-				// (A struct argument matches no library overload, so there is nothing to compete with.)
-				if (!decl && (isMSLBuiltinName(last) || findMathBuiltin(last))) {
-					throw CompileError("argument-dependent lookup finds \"" + associated + "\", which competes with the "
-						"standard library's \"" + last + "\"; Apple resolves the two by overload, which mslc "
-						"does not model");
+			std::vector<std::string> spaces { scope == std::string::npos ? std::string() : type.substr(0, scope) };
+			for (size_t k = 0; k < spaces.size(); ++k) {
+				const std::string current = spaces[k];
+				const auto add = [&](const std::string& space) {
+					if (std::find(spaces.begin(), spaces.end(), space) == spaces.end()) spaces.push_back(space);
+				};
+				if (_unit.inlineNamespaces.count(current)) {
+					const size_t outer = current.rfind("::");
+					add(outer == std::string::npos ? std::string() : current.substr(0, outer));
 				}
-				names.push_back(associated);
+				for (const std::string& inner: _unit.inlineNamespaces) {
+					const size_t outer = inner.rfind("::");
+					if ((outer == std::string::npos ? std::string() : inner.substr(0, outer)) == current) add(inner);
+				}
+			}
+			for (const std::string& space: spaces) {
+				const std::string associated = space.empty() ? last : space + "::" + last;
+				const std::vector<HelperFunction*> found = helpersNamed(associated);
+				const bool visible = std::any_of(found.begin(), found.end(), [&](const HelperFunction* entry) {
+					return entry->firstOrder <= callerOrder();
+				}) || _unit.functionTemplates.count(associated);
+				if (visible && std::find(names.begin(), names.end(), associated) == names.end()) {
+					// The library's own overloads compete with it, which mslc does not model here.
+					// (A struct argument matches no library overload, so there is nothing to compete with.)
+					if (!decl && (isMSLBuiltinName(last) || findMathBuiltin(last))) {
+						throw CompileError("argument-dependent lookup finds \"" + associated + "\", which competes with the "
+							"standard library's \"" + last + "\"; Apple resolves the two by overload, which mslc "
+							"does not model");
+					}
+					names.push_back(associated);
+				}
 			}
 		}
 		return names;
@@ -5903,6 +5936,28 @@ namespace {
 			return chosen(candidates.front());
 		}
 
+		// A conditional or a comma with a place for an operand may be an lvalue, in any address space; the
+		// ranking below takes every one for a thread prvalue and could pick the wrong function. One made of
+		// values only is a prvalue.
+		const auto placeLike = [](const auto& self, const Expression& e) -> bool {
+			switch (e.kind) {
+				case ExpressionKind::Identifier: case ExpressionKind::Index: case ExpressionKind::Member: return true;
+				case ExpressionKind::Comma: return self(self, *e.right);
+				// One place arm is enough to refuse: Apple binds `c ? la : 2.0f` to a non-const reference
+				// parameter (measured), so it is not a plain prvalue.
+				case ExpressionKind::Conditional:
+					return self(self, *e.arguments.at(0)) || self(self, *e.arguments.at(1));
+				default: return false;
+			}
+		};
+		for (const ExpressionPtr& argument: call.arguments) {
+			if ((argument->kind == ExpressionKind::Conditional || argument->kind == ExpressionKind::Comma)
+				&& placeLike(placeLike, *argument)) {
+				throw CompileError("a conditional or comma expression as an argument chooses among the overloads of \""
+					+ name + "\", which is not lowered yet (whether it is an lvalue, and in which address space, "
+					"decides the overload); assign it to a variable first");
+			}
+		}
 		std::vector<OverloadArgument> arguments;
 		for (const ExpressionPtr& argument: call.arguments) {
 			arguments.push_back(classifyArgument(*argument));
