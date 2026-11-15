@@ -408,3 +408,27 @@ in a declaration, as in Apple, so the silent wrong-callee cases are gone. Still 
   mslc recognises" where Apple says "called object type float is not a function".
 - No probe pins that a function declared AFTER a use leaves the struct visible at the use (the
   behaviour is correct; the guard against hiding by a later declaration is untested).
+
+## Wording gaps on references to members of temporaries (#251)
+
+None of these is a wrong accept, but some are forms Apple accepts that mslc still refuses. Each row was
+measured with `xcrun metal` and `mslc` on the same source.
+
+- Refused where Apple accepts, because a matrix `operator[]` gives an lvalue even on a prvalue (`Q` holds a
+  `float2x2 m`, `mkm()` returns a `float2x2`, `sw` takes `thread float2&`): `sw(Q{}.m[0])`, `sw(mkq().m[1])`
+  and `sw(mkm()[0])`. mslc says "a member or an index has to start at a name mslc knows" for the first two
+  and "assigning to an element of a value that is not a local, a struct member or a buffer element" for
+  the third. The reference declarations (`thread float2& r = Q{}.m[0];`, `= mkm()[0];`) say "a place mslc
+  cannot name", and through a conditional (`(c ? q1 : Q{}).m[0]`, `(c ? m1 : mkm())[0]`) they name the
+  conditional, in a declaration and as an argument.
+- `thread float& r = (c ? s : S{1,2}).v.x;` and `(c ? S{1,2} : s).v.x`: Apple says it cannot bind a
+  temporary; mslc says the reference is bound to a component of a vector.
+- `constant int& r = S{1,2}.a;` (y10): Apple says the binding "changes address space"; mslc says "a place
+  mslc cannot name". `constant int& r = (c ? s : t).a;` and the `(c ? S{1,2} : t)` form (y31, y11): Apple
+  says the same; mslc names the conditional.
+- `one((c ? cs[0] : cs[1]).a)` for a `constant` buffer `cs` (x15): Apple says "no matching function" (cannot
+  bind a reference in address space 'constant'); mslc names the conditional.
+- `two((c ? s : t).a, S{1,2}.b)` (x27): Apple refuses the second argument ("expects an lvalue for 2nd
+  argument") and accepts the first; mslc refuses the first, as a member of a conditional.
+- `one(ds[0].a)` for a `device` buffer `ds` (x14): Apple says "no matching function" (cannot bind a reference
+  in address space 'device'); mslc says the argument is not a variable of this function.
