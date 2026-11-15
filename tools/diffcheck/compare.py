@@ -70,8 +70,9 @@ def ulp_distance(a, b, scalar):
     return abs(ordered(a) - ordered(b))
 
 
-def leaf_equal(a, b, scalar, ulp=0):
-    """True when the two raw little-endian values of one leaf agree."""
+def leaf_equal(a, b, scalar, ulp=0, eps=0.0):
+    """True when the two raw little-endian values of one leaf agree. `eps` is an absolute
+    bound for two finite floats, for interpolated values: a ULP bound alone is useless near zero."""
     kind = SCALARS[scalar][1]
     if kind != "float":
         return a == b
@@ -81,8 +82,10 @@ def leaf_equal(a, b, scalar, ulp=0):
     if a == b:
         return True
     # An infinity next to the largest finite value is one ULP away, and is an overflow bug.
-    if ulp == 0 or is_inf(a, scalar) or is_inf(b, scalar):
+    if (ulp == 0 and eps == 0) or is_inf(a, scalar) or is_inf(b, scalar):
         return False
+    if eps and abs(struct.unpack(_fields(scalar)[0], a)[0] - struct.unpack(_fields(scalar)[0], b)[0]) <= eps:
+        return True
     return ulp_distance(a, b, scalar) <= ulp
 
 
@@ -115,7 +118,7 @@ class Diff:
                 "apple_hex": self.apple[::-1].hex(), "mslc_hex": self.mslc[::-1].hex()}
 
 
-def compare(layout, apple, mslc, ulp=0, limit=16):
+def compare(layout, apple, mslc, ulp=0, limit=16, eps=0.0):
     """Compare two buffers of one layout; returns up to `limit` Diffs.
 
     layout: {"name", "stride", "leaves": [{"off", "scalar"}]}. Both buffers must have
@@ -131,7 +134,7 @@ def compare(layout, apple, mslc, ulp=0, limit=16):
             size = SCALARS[leaf["scalar"]][0]
             at = base + leaf["off"]
             a, b = bytes(apple[at:at + size]), bytes(mslc[at:at + size])
-            if not leaf_equal(a, b, leaf["scalar"], ulp):
+            if not leaf_equal(a, b, leaf["scalar"], ulp, eps):
                 diffs.append(Diff(layout["name"], element, at, leaf["scalar"], a, b))
                 if len(diffs) >= limit:
                     return diffs
