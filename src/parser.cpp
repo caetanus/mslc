@@ -3546,8 +3546,7 @@ void Parser::recordConstant(const VariableDeclaration& declaration, bool local) 
 // A local or a parameter keeps its type for sizeof once the declarator is complete. An auto, a
 // resource or an array with no length yet is left out, so a sizeof of it is not folded here.
 void Parser::recordObjectType(const std::string& name, const Type& type) {
-	if (name.empty() || type.isAuto || type.resource != ResourceKind::None
-		|| (type.arrayLength && *type.arrayLength == 0) || _blocks.empty()) {
+	if (name.empty() || type.isAuto || type.resource != ResourceKind::None || _blocks.empty()) {
 		return;
 	}
 	_blocks.back().objectTypes[name] = type;
@@ -3596,7 +3595,7 @@ std::optional<Type> Parser::declaredObjectType(const Expression& operand) const 
 	for (const VariableDeclaration& global: _unit.globals) {
 		if (global.name == operand.name) {
 			const Type& type = global.type;
-			if (type.isAuto || type.resource != ResourceKind::None || (type.arrayLength && *type.arrayLength == 0)) {
+			if (type.isAuto || type.resource != ResourceKind::None) {
 				return std::nullopt;
 			}
 			return type;
