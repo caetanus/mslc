@@ -226,3 +226,13 @@ Also recorded under this entry, all measured against Apple and all pre-existing:
 - The buffer-as-value message ("the buffer ... is used as a value") covers every use of a
   kernel buffer pointer as a value: a comparison, a conversion to bool, a copy. Apple accepts
   comparisons and bool tests and rejects `float x = p`; mslc rejects all, with one wording.
+
+## Brace elision: forms Apple accepts that mslc refuses (#161)
+
+Refusals, not miscompiles; each fails with a diagnostic.
+
+- A designator over a struct member with a bare value, `Outer o{.p = 1.0f, .c = 3.0f}`: Apple elides
+  under the designator (p.a = 1, p.b = 0); mslc reports "a struct converts to another form of itself only".
+- A member with a user constructor, `struct OC { Ctor k; float c; }; OC o{1.0f, 2.0f};`: Apple calls
+  `Ctor(float)`; mslc rejects brace initialisation involving declared constructors.
+- A member struct with an array member reached by elision is rejected as not lowered (arrays: #131).

@@ -2621,6 +2621,8 @@ namespace {
 		Id emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
 			const std::string& spelled);
 		Id emitInitListValue(const Type& target, const Expression& list);
+		Id emitStructElements(const Type& target, const StructDecl& decl, const std::vector<InitializerElement>& elements,
+			size_t& cursor, std::vector<std::optional<Id>>& values, bool elided);
 		Id emitListScalarValue(const Type& target, const Expression& expression, bool dropExcess = false);
 		void checkAndDiscard(const Expression& expression);
 		Id convertListScalar(Id value, const Type& target, const Expression& expression);
@@ -4227,6 +4229,70 @@ namespace {
 		return first;
 	}
 
+	// A flat cursor over the element list: a struct member that is reached by an element
+	// which is neither braced nor already of the member's struct type is initialised from
+	// the following elements, as Apple does (brace elision).
+	Id Emitter::emitStructElements(const Type& target, const StructDecl& decl,
+			const std::vector<InitializerElement>& elements, size_t& cursor,
+			std::vector<std::optional<Id>>& values, bool elided) {
+		const std::string spelled = typeName(target);
+		Expression empty;
+		empty.kind = ExpressionKind::InitList;
+		std::vector<uint32_t> fields;
+		while (cursor < elements.size()) {
+			const InitializerElement& element = elements[cursor];
+			if (!element.fieldName.empty()) {
+				if (elided) { break; }
+				size_t named = fields.size();
+				while (named < decl.fields.size() && decl.fields[named].name != element.fieldName) {
+					++named;
+				}
+				if (named == decl.fields.size()) {
+					throw CompileError("field " + element.fieldName + " is unknown or out of order in " + spelled + " initializer");
+				}
+				while (fields.size() < named) {
+					fields.push_back(emitInitListValue(decl.fields[fields.size()].type, empty));
+				}
+			}
+			if (fields.size() == decl.fields.size()) {
+				if (elided) { break; }
+				throw CompileError("excess elements in " + spelled + " initializer");
+			}
+			const Type& field = decl.fields[fields.size()].type;
+			if (element.value->kind == ExpressionKind::InitList) {
+				fields.push_back(emitInitListValue(field, *element.value));
+				++cursor;
+				continue;
+			}
+			if (!values[cursor]) { values[cursor] = emitExpression(*element.value); }
+			const Id value = *values[cursor];
+			const StructDecl* fieldDecl = field.namedType.empty() || field.arrayLength.has_value()
+				? nullptr : _unit.findStruct(field.namedType);
+			const std::string* sourceName = _types.structNameOf(_builder.typeOf(value), nullptr);
+			if (fieldDecl && element.fieldName.empty() && !fieldDecl->hasConstructors
+				&& !(sourceName && *sourceName == field.namedType)) {
+				if (fieldDecl->fields.empty()) {
+					throw CompileError("initializer for " + typeName(field) + ", which has no members, requires explicit braces");
+				}
+				if (std::any_of(fieldDecl->fields.begin(), fieldDecl->fields.end(),
+						[](const StructField& member) { return member.type.arrayLength.has_value(); })) {
+					throw CompileError("brace elision into " + typeName(field) + ", which has an array member, "
+						"is not lowered yet; add the braces");
+				}
+				fields.push_back(emitStructElements(field, *fieldDecl, elements, cursor, values, true));
+				continue;
+			}
+			++cursor;
+			fields.push_back(field.namedType.empty() && field.isScalar()
+				? convertListScalar(value, field, *element.value)
+				: convertImplicit(value, declaredTypeOf(field)));
+		}
+		while (fields.size() < decl.fields.size()) {
+			fields.push_back(emitInitListValue(decl.fields[fields.size()].type, empty));
+		}
+		return _builder.emitTyped(spirv::OpCompositeConstruct, declaredTypeOf(target), fields);
+	}
+
 	Id Emitter::emitInitListValue(const Type& target, const Expression& list) {
 		if (target.addressSpace != AddressSpace::None) {
 			throw CompileError("a local in the " + std::string(addressSpaceName(target.addressSpace))
@@ -4244,52 +4310,21 @@ namespace {
 			if (hasArrayMember && list.elements.empty()) {
 				return _types.zero(toType);
 			}
-			std::optional<Id> singleValue;
+			std::vector<std::optional<Id>> values(list.elements.size());
 			if (list.elements.size() == 1 && list.elements.front().fieldName.empty()
 				&& list.elements.front().value->kind != ExpressionKind::InitList) {
-				singleValue = emitExpression(*list.elements.front().value);
-				const std::string* sourceName = _types.structNameOf(_builder.typeOf(*singleValue), nullptr);
+				values[0] = emitExpression(*list.elements.front().value);
+				const std::string* sourceName = _types.structNameOf(_builder.typeOf(*values[0]), nullptr);
 				if (sourceName && *sourceName == target.namedType) {
-					return convertImplicit(*singleValue, toType);
+					return convertImplicit(*values[0], toType);
 				}
 			}
 			if (hasArrayMember) {
 				throw CompileError("brace initialization of " + spelled + ", which has an array member, "
 					"is not lowered yet; assign the members one by one");
 			}
-			Expression empty;
-			empty.kind = ExpressionKind::InitList;
-			std::vector<uint32_t> fields;
-			for (const InitializerElement& element: list.elements) {
-				if (!element.fieldName.empty()) {
-					size_t named = fields.size();
-					while (named < decl.fields.size() && decl.fields[named].name != element.fieldName) {
-						++named;
-					}
-					if (named == decl.fields.size()) {
-						throw CompileError("field " + element.fieldName + " is unknown or out of order in " + spelled + " initializer");
-					}
-					while (fields.size() < named) {
-						fields.push_back(emitInitListValue(decl.fields[fields.size()].type, empty));
-					}
-				}
-				if (fields.size() == decl.fields.size()) {
-					throw CompileError("excess elements in " + spelled + " initializer");
-				}
-				const Type& field = decl.fields[fields.size()].type;
-				if (element.value->kind == ExpressionKind::InitList) {
-					fields.push_back(emitInitListValue(field, *element.value));
-				} else {
-					const Id value = singleValue ? *singleValue : emitExpression(*element.value);
-					fields.push_back(field.namedType.empty() && field.isScalar()
-						? convertListScalar(value, field, *element.value)
-						: convertImplicit(value, declaredTypeOf(field)));
-				}
-			}
-			while (fields.size() < decl.fields.size()) {
-				fields.push_back(emitInitListValue(decl.fields[fields.size()].type, empty));
-			}
-			return _builder.emitTyped(spirv::OpCompositeConstruct, toType, fields);
+			size_t cursor = 0;
+			return emitStructElements(target, decl, list.elements, cursor, values, false);
 		}
 		if (list.elements.empty()) { return _types.zero(toType); }
 		for (const InitializerElement& element: list.elements) {
