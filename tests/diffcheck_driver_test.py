@@ -64,6 +64,12 @@ assert rc == 3, (rc, out)
 rc, out, data = run("range_kernel.metal")
 assert rc == 0 and data["results"][0]["status"] == "matched", (rc, out)
 
+# The same range given on the command line, for a file one does not edit; a malformed one is refused.
+rc, out, data = run("range_flag_kernel.metal", "--range", "idx=0:127")
+assert rc == 0 and data["results"][0]["status"] == "matched", (rc, out)
+rc, out, data = run("range_flag_kernel.metal", "--range", "idx")
+assert rc == 2 and data is None, (rc, out)
+
 # Corpus mode: a table with a summary; skips do not fail the run, a mismatch does.
 with tempfile.TemporaryDirectory() as d:
     listing = os.path.join(d, "list.txt")
