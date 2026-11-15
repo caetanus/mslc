@@ -2444,6 +2444,10 @@ namespace {
 		Id emitConstant(const FoldedConstant& folded);
 		std::vector<uint32_t> constantWords(const FoldedConstant& folded);
 		FoldedConstant foldScalarConstruct(const Expression& expression);
+		FoldedConstant foldConditional(const Expression& expression);
+		bool constantLeaves(const Expression& expression, const std::string& excluded);
+		bool namesConstexprAggregate(const Expression& expression);
+		bool provenByFolding(const Expression& expression, const std::string& excluded);
 		FoldedConstant foldComparison(BinaryOperator op, FoldedConstant left, FoldedConstant right);
 		FoldedConstant foldInitializer(const Type& type, const Expression& initializer, bool braced = false);
 		void foldStructInitializer(FoldedConstant& folded, const StructDecl& decl,
@@ -4221,12 +4225,31 @@ namespace {
 					while (initializer->kind == ExpressionKind::InitList && initializer->elements.size() == 1) {
 						initializer = initializer->elements.front().value.get();
 					}
-					const Expression* literal = initializer;
-					while (literal->kind == ExpressionKind::Unary) { literal = literal->left.get(); }
-					return (literal->kind == ExpressionKind::IntLiteral || literal->kind == ExpressionKind::FloatLiteral
-						|| literal->kind == ExpressionKind::BoolLiteral) && canFoldExpression(*initializer);
+					return initializer->kind != ExpressionKind::InitList && canFoldExpression(*initializer, global.name);
 				}
 				return false;
+			}
+			case ExpressionKind::Binary:
+			case ExpressionKind::Conditional: return provenByFolding(expression, excluded);
+			case ExpressionKind::Construct: {
+				const Type* type = expression.constructType ? &*expression.constructType : nullptr;
+				if (type && type->isVector() && !type->isMatrix() && !type->isPointer && !type->arrayLength
+					&& type->namedType.empty() && type->enumName.empty()) {
+					// An explicit conversion of each component; a float to an integer has a
+					// range of its own to check, so that case is left unproven.
+					for (const ExpressionPtr& argument: expression.arguments) {
+						if (argument->kind == ExpressionKind::Construct && argument->constructType
+							&& argument->constructType->isVector()) {
+							if (!canFoldExpression(*argument, excluded)) { return false; }
+							continue;
+						}
+						if (!canFoldExpression(*argument, excluded)) { return false; }
+						const FoldedConstant value = foldExpression(*argument);
+						if (value.isComposite || (isFloatKind(value.scalar) && !isFloatKind(type->scalar))) { return false; }
+					}
+					return !expression.arguments.empty();
+				}
+				return provenByFolding(expression, excluded);
 			}
 			case ExpressionKind::Unary: {
 				const UnaryOperator op = expression.unaryOperator;
@@ -4245,6 +4268,48 @@ namespace {
 			}
 			default: return false;
 		}
+	}
+
+	// What a constant expression is made of: constants at the leaves, and only the
+	// operators that fold.
+	bool Emitter::constantLeaves(const Expression& expression, const std::string& excluded) {
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+			case ExpressionKind::BoolLiteral:
+			case ExpressionKind::FloatLiteral:
+			case ExpressionKind::Identifier: return canFoldExpression(expression, excluded);
+			case ExpressionKind::Unary: return constantLeaves(*expression.left, excluded);
+			case ExpressionKind::Binary:
+				return constantLeaves(*expression.left, excluded) && constantLeaves(*expression.right, excluded);
+			case ExpressionKind::Conditional:
+				return constantLeaves(*expression.left, excluded) && expression.arguments.size() == 2
+					&& constantLeaves(*expression.arguments[0], excluded)
+					&& constantLeaves(*expression.arguments[1], excluded);
+			case ExpressionKind::Construct:
+				for (const ExpressionPtr& argument: expression.arguments) {
+					if (!constantLeaves(*argument, excluded)) { return false; }
+				}
+				return !expression.arguments.empty();
+			default: return false;
+		}
+	}
+
+	// Folds an expression of constants and says whether it is one: an operation no constant
+	// expression holds (a signed overflow, a shift out of range, a division by zero) or a
+	// form the folder does not know is not proven.
+	bool Emitter::provenByFolding(const Expression& expression, const std::string& excluded) {
+		if (!constantLeaves(expression, excluded)) { return false; }
+		const bool saved = _foldDomainError;
+		_foldDomainError = false;
+		bool proven = true;
+		try {
+			foldExpression(expression);
+		} catch (const CompileError&) {
+			proven = false;
+		}
+		proven = proven && !_foldDomainError;
+		_foldDomainError = saved;
+		return proven;
 	}
 
 	Id Emitter::convertListScalar(Id value, const Type& target, const Expression& expression) {
@@ -6901,6 +6966,7 @@ namespace {
 
 			case ExpressionKind::Binary: return foldBinary(expression);
 			case ExpressionKind::Unary: return foldUnary(expression);
+			case ExpressionKind::Conditional: return foldConditional(expression);
 			case ExpressionKind::Construct:
 				// (Mode)1, Mode(1) and static_cast<Mode>(1): the value converts to the
 				// enum's integer type, whatever enum or integer it was.
@@ -6941,6 +7007,52 @@ namespace {
 			"from the declarations before it, and this is not one");
 	}
 
+	// c ? a : b of constants. Only the chosen arm is evaluated, but the result has the
+	// type both arms meet in, so the other arm has to fold too for the type to be known.
+	FoldedConstant Emitter::foldConditional(const Expression& expression) {
+		const FoldedConstant condition = foldExpression(*expression.left);
+		if (condition.isComposite) {
+			throw CompileError("a composite constant cannot be a condition");
+		}
+		const bool taken = condition.scalar == ScalarKind::Bool ? condition.boolean
+			: isFloatKind(condition.scalar) ? condition.number != 0.0 : condition.integer != 0;
+		const bool savedError = _foldDomainError;
+		FoldedConstant arms[2];
+		for (size_t i = 0; i < 2; ++i) {
+			const bool chosen = (i == 0) == taken;
+			_foldDomainError = false;
+			try {
+				arms[i] = foldExpression(*expression.arguments[i]);
+			} catch (const CompileError&) {
+				if (chosen) { throw; }
+				throw CompileError("the type of a conditional constant needs both of its arms to be constants");
+			}
+			if (arms[i].isComposite) { throw CompileError("a composite constant cannot be a conditional arm"); }
+			if (!chosen) { _foldDomainError = false; }
+			if (chosen && _foldDomainError) {
+				throw CompileError("the chosen arm of a conditional constant is not a constant expression");
+			}
+		}
+		_foldDomainError = savedError;
+		FoldedConstant result = arms[taken ? 0 : 1];
+		const ScalarKind first = arms[0].scalar;
+		const ScalarKind second = arms[1].scalar;
+		ScalarKind common = first;
+		if (first != second) {
+			if (isFloatKind(first) || isFloatKind(second)) {
+				common = first == ScalarKind::Float || second == ScalarKind::Float ? ScalarKind::Float : ScalarKind::Half;
+			} else {
+				const auto promote = [](ScalarKind kind) { return kind == ScalarKind::Bool ? ScalarKind::Int : promotedKind(kind); };
+				common = commonIntegerKind(promote(first), promote(second));
+			}
+		}
+		if (result.scalar == ScalarKind::Bool && common != ScalarKind::Bool) {
+			result.integer = result.boolean ? 1 : 0;
+			result.scalar = ScalarKind::Int;
+		}
+		return result.scalar == common ? result : convertConstant(result, common);
+	}
+
 	// int(x), float(x) and bool(x) of a scalar constant. A float does not become an
 	// integer here: a value outside the integer's range is undefined, and mslc
 	// folds none of those.
@@ -6971,7 +7083,20 @@ namespace {
 		}
 
 		if (isFloatKind(folded.scalar) && !isFloatKind(to)) {
-			throw CompileError("a float is not converted to an integer in a constant");
+			// The truncated value has to fit the target, or the conversion is undefined
+			// and so no constant expression.
+			const double truncated = std::trunc(folded.number);
+			const int width = mappingFor(to).width;
+			const double limit = std::ldexp(1.0, isSignedInteger(to) ? width - 1 : width);
+			const double lowest = isSignedInteger(to) ? -limit : 0.0;
+			if (!(truncated >= lowest && truncated < limit)) {
+				_foldDomainError = true;
+				throw CompileError("a float whose value does not fit " + std::string(cxxTypeName(to))
+					+ " cannot be converted to it in a constant");
+			}
+			folded.integer = truncated < 0 ? static_cast<uint64_t>(static_cast<int64_t>(truncated))
+				: static_cast<uint64_t>(truncated);
+			folded.scalar = ScalarKind::Long;
 		}
 
 		return convertConstant(folded, to);
@@ -7159,6 +7284,19 @@ namespace {
 			}
 
 			const uint64_t count = right.integer;
+			// Before C++20 a negative value cannot be shifted left, and the result has to
+			// fit the unsigned type of the same width.
+			if (op == BinaryOperator::ShiftLeft && isSignedInteger(folded.scalar)) {
+				const uint64_t value = normalizeInteger(folded.scalar, left.integer);
+				const bool leftNegative = static_cast<int64_t>(value) < 0;
+				const bool overflows = width < 64
+					? ((static_cast<unsigned __int128>(value) << count) >> width) != 0
+					: (value << count) >> count != value;
+				if (leftNegative || overflows) {
+					_foldDomainError = true;
+					throw CompileError("a left shift of a constant overflows");
+				}
+			}
 			if (op == BinaryOperator::ShiftLeft) {
 				folded.integer = normalizeInteger(folded.scalar, left.integer << count);
 			} else if (isSignedInteger(folded.scalar)) {
@@ -9932,6 +10070,25 @@ namespace {
 		return false;
 	}
 
+	// A constexpr struct or vector copied into another: its own initializer was
+	// validated where it was declared.
+	bool Emitter::namesConstexprAggregate(const Expression& expression) {
+		if (expression.kind != ExpressionKind::Identifier) { return false; }
+		const auto local = _bindings.find(expression.name);
+		if (local != _bindings.end()) {
+			const Type& type = local->second.pointeeMsl;
+			return type.isConstexpr && !type.isPointer && !type.arrayLength && !type.isMatrix()
+				&& (type.isVector() || !type.namedType.empty());
+		}
+		for (const VariableDeclaration& global: _unit.globals) {
+			if (global.name == expression.name) {
+				return global.type.isConstexpr && !global.type.isPointer && !global.type.arrayLength
+					&& !global.type.isMatrix() && (global.type.isVector() || !global.type.namedType.empty());
+			}
+		}
+		return false;
+	}
+
 	// A constexpr brace initializer has to be made of constants. This is checked
 	// for a declaration that is never reached too, which is invalid all the same.
 	void Emitter::validateConstexprInitializer(const VariableDeclaration& declaration) {
@@ -9981,7 +10138,7 @@ namespace {
 		const auto validate = [&](const auto& self, const Expression& expression) -> void {
 			if (expression.kind == ExpressionKind::InitList) {
 				for (const InitializerElement& element: expression.elements) { self(self, *element.value); }
-			} else if (!canFoldExpression(expression, declaration.name)) {
+			} else if (!canFoldExpression(expression, declaration.name) && !namesConstexprAggregate(expression)) {
 				throw CompileError("a constexpr brace initializer requires a supported constant expression; this form is not lowered yet");
 			}
 		};
