@@ -2505,6 +2505,10 @@ std::set<std::string> Parser::namespacesNamed(const std::string& scope, const st
 	for (const std::string& at : set) {
 		seen.insert(at);
 		const std::string key = at.empty() ? part : at + "::" + part;
+		// The library's namespace is a member of the file scope, so a directive's metal competes with it.
+		if (at.empty() && part == kStdlibNamespace) {
+			own.insert(kStdlibNamespace);
+		}
 		if (std::string found = canonicalNamespace(key); !found.empty()) {
 			own.insert(found);
 			if (aliases && _namespaceAliases.count(key)) {
