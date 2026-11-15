@@ -146,6 +146,16 @@ const char* samplerCompareName(SamplerCompare compare) {
 	return "unknown";
 }
 
+const char* samplerBorderName(SamplerBorder border) {
+	switch (border) {
+		case SamplerBorder::TransparentBlack: return "TransparentBlack";
+		case SamplerBorder::OpaqueBlack: return "OpaqueBlack";
+		case SamplerBorder::OpaqueWhite: return "OpaqueWhite";
+	}
+
+	return "unknown";
+}
+
 const char* addressSpaceName(AddressSpace space) {
 	switch (space) {
 		case AddressSpace::Device: return "device";
