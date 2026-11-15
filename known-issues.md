@@ -1,5 +1,21 @@
 # Known issues
 
+## Vexing parse: unused function-looking declarations are rejected, `v(1.0)` calls are not modelled (#356)
+
+`float3 v(float(a));` declares a function in C++ and in Apple's compiler, so a later `v.x` or
+`v = ...` is an error there. mslc used to build a variable and accept the use. It now refuses the
+declaration itself when every comma group inside the parentheses is `type(name)` or `type()` with a
+name (`T v(U(x))`, `T v(U(x), V(y))`, `S s(S(a))`, with `thread` or `const`): "the most vexing
+parse". Trade-off, a decision recorded for the owner to override:
+
+- Apple accepts such a declaration when `v` is never used as a value, or is called as a function
+  (`float3 v(float(a)); ... v(1.0)`). mslc refuses all of them, because it lowers no block-scope
+  function declarations. A shader that relies on that is declaring an unused function by mistake.
+- Empty parentheses (`float3 v();`) are not matched by this check; they still reach the "has no
+  arguments" refusal, which Apple does not make for an unused declaration.
+- `for (float3 v(float(a)); ...)` is refused by the for initialiser, as any parenthesised
+  initialiser there already was.
+
 ## lavapipe cannot execute any mslc module on this machine (RESOLVED, stale)
 
 **Status:** resolved/stale as of 2026-10-13; kept for history, not current guidance.

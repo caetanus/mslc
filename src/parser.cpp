@@ -3738,6 +3738,52 @@ void Parser::parseAutoInitializer(VariableDeclaration& declaration) {
 	}
 }
 
+// True when the parenthesised list ahead reads as the parameters of a function
+// declaration: every comma group is a type, then "(", an optional name and ")"
+// ("float(a)"), as C++ resolves "float3 v(float(a));". Empty parentheses are
+// not matched here. The position is restored.
+bool Parser::parensDeclareFunction() {
+	const size_t start = _position;
+	advance();
+	bool declares = true;
+	do {
+		if (atKeyword("const")) {
+			advance();
+		}
+		size_t typeTokens = 0;
+		Type probe;
+		const bool named = kind() == TokenKind::Identifier || at(TokenKind::ColonColon);
+		const std::string name = named ? peekResolved(typeTokens) : std::string();
+		const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
+			&& isLocal(name);
+		if (!named || objectHidesTag(name)
+			|| !(resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct))
+			|| lookahead(typeTokens).kind != TokenKind::LParen) {
+			declares = false;
+			break;
+		}
+		for (size_t i = 0; i <= typeTokens; ++i) {
+			advance();
+		}
+		while (at(TokenKind::Star) || at(TokenKind::Ampersand)) {
+			advance();
+		}
+		if (kind() == TokenKind::Identifier) {
+			advance();
+		}
+		const bool closed = at(TokenKind::RParen);
+		if (closed) {
+			advance();
+		}
+		if (!closed || !(at(TokenKind::Comma) || at(TokenKind::RParen))) {
+			declares = false;
+			break;
+		}
+	} while (match(TokenKind::Comma));
+	_position = start;
+	return declares;
+}
+
 // The initialiser a local may have after its name: "= value", a braced list,
 // or constructor arguments. A const local has to have one.
 void Parser::parseLocalInitializer(VariableDeclaration& declaration) {
@@ -3756,6 +3802,12 @@ void Parser::parseLocalInitializer(VariableDeclaration& declaration) {
 	} else if (at(TokenKind::LBrace)) {
 		declaration.initializer = parseInitializerList();
 	} else if (at(TokenKind::LParen)) {
+		if (parensDeclareFunction()) {
+			throw CompileError("\"" + declaration.name + "\" is followed by a parameter list, so C++ and "
+				"xcrun metal declare a function here, not a variable (the most vexing parse), and mslc does not "
+				"lower block-scope function declarations; write braces, \"" + declaration.name + "{...}\", or "
+				"\"= " + typeName(declaration.type) + "(...)\" to construct the variable");
+		}
 		// Direct initialisation, float3 specularTerm(0); . The name comes
 		// first here, so the list after it constructs the variable's own
 		// type rather than calling it, and the two spellings are the same
