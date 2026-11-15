@@ -1366,7 +1366,7 @@ void TypeTable::requireCapability(spirv::CapabilityValue capability) {
 
 // The Dim, Arrayed flag and capability a texture kind's image type takes; the
 // sampled and the storage image of a kind differ only in the Sampled operand.
-Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sampled) {
+Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sampled, bool depth) {
 	const bool cube = kind == ResourceKind::TextureCube || kind == ResourceKind::TextureCubeArray;
 	const bool oneD = kind == ResourceKind::Texture1D || kind == ResourceKind::Texture1DArray;
 	const bool arrayed = kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture1DArray
@@ -1380,14 +1380,14 @@ Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sample
 	return _builder.emitDecl(spirv::OpTypeImage, { scalar(sampledType),
 		cube ? spirv::Dim::Cube : kind == ResourceKind::Texture3D ? spirv::Dim::Dim3D
 			: oneD ? spirv::Dim::Dim1D : spirv::Dim::Dim2D,
-		sampled == 2 ? 0u : 2u, arrayed ? 1u : 0u, 0u, sampled,
+		depth ? 1u : sampled == 2 ? 0u : 2u, arrayed ? 1u : 0u, 0u, sampled,
 		static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 }
 
-Id TypeTable::image(ResourceKind kind, ScalarKind sampledType) {
-	Id& cached = _images[{ kind, sampledType }];
+Id TypeTable::image(ResourceKind kind, ScalarKind sampledType, bool depth) {
+	Id& cached = _images[{ kind, sampledType, depth }];
 	if (cached == InvalidId) {
-		cached = imageOf(kind, sampledType, 1u);
+		cached = imageOf(kind, sampledType, 1u, depth);
 	}
 
 	return cached;
@@ -1406,7 +1406,7 @@ Id TypeTable::storageImage(ResourceKind kind, TextureAccess access, ScalarKind e
 	}
 	Id& cached = _storageImages[{ kind, element }];
 	if (cached == InvalidId) {
-		cached = imageOf(kind, element, 2u);
+		cached = imageOf(kind, element, 2u, false);
 	}
 	return cached;
 }
@@ -1430,9 +1430,9 @@ Id TypeTable::samplerType() {
 	return _samplerType;
 }
 
-Id TypeTable::sampledImage(ResourceKind kind, ScalarKind sampledType) {
-	const Id imageType = image(kind, sampledType);
-	Id& cached = _sampledImages[{ kind, sampledType }];
+Id TypeTable::sampledImage(ResourceKind kind, ScalarKind sampledType, bool depth) {
+	const Id imageType = image(kind, sampledType, depth);
+	Id& cached = _sampledImages[{ kind, sampledType, depth }];
 	if (cached == InvalidId) {
 		cached = _builder.emitDecl(spirv::OpTypeSampledImage, { imageType });
 	}
@@ -2555,6 +2555,7 @@ namespace {
 		Id appendArrayLayer(Id coordinate, ScalarKind component, const Expression& layer,
 			const std::string& callName);
 		Id texturePixels(const Binding& texture, Id sampled);
+		Id textureTexel(const Binding& texture, Id sampled);
 		Id emitLod(const Expression& expression, const std::string& callName);
 		const StructDecl* structValue(const Type& type) const;
 		StageVariable declareStageVariable(const Type& type, spirv::StorageClassValue storageClass,
@@ -6691,6 +6692,7 @@ namespace {
 			const Binding* binding = argument.kind == OverloadArgument::Kind::Resource ? argument.binding : nullptr;
 			return binding && binding->pointeeMsl.resource == type.resource
 				&& (!type.isTexture() || (binding->pointeeMsl.scalar == type.scalar
+					&& binding->pointeeMsl.isDepth == type.isDepth
 					&& binding->pointeeMsl.textureAccess == type.textureAccess)) ? exact(-1) : none;
 		}
 		if (type.isPointer || type.arrayLength) {
@@ -6843,7 +6845,7 @@ namespace {
 		if (type.textureAccess != TextureAccess::Sample) {
 			return _types.storageImage(type.resource, type.textureAccess, textureSampledKind(type.scalar));
 		}
-		return type.isTexture() ? _types.image(type.resource, textureSampledKind(type.scalar)) : _types.samplerType();
+		return type.isTexture() ? _types.image(type.resource, textureSampledKind(type.scalar), type.isDepth) : _types.samplerType();
 	}
 
 	// The variable behind a texture or sampler argument: it has to be a name for a
@@ -6861,6 +6863,7 @@ namespace {
 		const Type& wanted = parameter.type;
 		const bool matches = binding && binding->pointeeMsl.resource == wanted.resource
 			&& (!wanted.isTexture() || (binding->pointeeMsl.scalar == wanted.scalar
+				&& binding->pointeeMsl.isDepth == wanted.isDepth
 				&& binding->pointeeMsl.textureAccess == wanted.textureAccess));
 		if (!matches) {
 			throw CompileError(what + " is \"" + argument.name + "\", which is not a "
@@ -9803,6 +9806,17 @@ namespace {
 		return convert(sampled, _builder.typeOf(sampled), _types.vector(element, 4));
 	}
 
+	// What sample and read return: a depth texture gives the first channel of the image's
+	// four, one float (or half), and any other texture its four narrowed channels.
+	Id Emitter::textureTexel(const Binding& texture, Id sampled) {
+		if (!texture.pointeeMsl.isDepth) {
+			return texturePixels(texture, sampled);
+		}
+		const Id depth = _builder.emitTyped(spirv::OpCompositeExtract, _types.scalar(ScalarKind::Float), { sampled, 0u });
+		return texture.pointeeMsl.scalar == ScalarKind::Half
+			? convert(depth, _types.scalar(ScalarKind::Float), _types.scalar(ScalarKind::Half)) : depth;
+	}
+
 	const Binding& Emitter::textureReceiver(const Expression& call) {
 		const Expression& member = *call.left;
 		if (member.left->kind != ExpressionKind::Identifier) {
@@ -10179,7 +10193,7 @@ namespace {
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id loadedSampler = loadFrom(sampler.id, sampler.pointeeType);
 		const Id combined = _builder.emitTyped(spirv::OpSampledImage,
-			_types.sampledImage(kind, textureSampledKind(texture.pointeeMsl.scalar)),
+			_types.sampledImage(kind, textureSampledKind(texture.pointeeMsl.scalar), texture.pointeeMsl.isDepth),
 			{ image, loadedSampler });
 		std::vector<uint32_t> words { combined, coordinate, constantU32(component) };
 		if (offset != InvalidId && constantOffset) {
@@ -10343,7 +10357,7 @@ namespace {
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id loadedSampler = loadFrom(sampler.id, sampler.pointeeType);
 		const Id combined = _builder.emitTyped(spirv::OpSampledImage,
-			_types.sampledImage(texture.pointeeMsl.resource, textureSampledKind(texture.pointeeMsl.scalar)),
+			_types.sampledImage(texture.pointeeMsl.resource, textureSampledKind(texture.pointeeMsl.scalar), texture.pointeeMsl.isDepth),
 			{ image, loadedSampler });
 
 		const Id float4 = _types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4);
@@ -10392,7 +10406,7 @@ namespace {
 		}
 		const Id sampled = _builder.emitTyped(implicit ? spirv::OpImageSampleImplicitLod : spirv::OpImageSampleExplicitLod,
 			float4, words);
-		return texturePixels(texture, sampled);
+		return textureTexel(texture, sampled);
 	}
 
 	// read(uint2 coordinate [, lod]), a uint3 coordinate on a texture3d, or a uint2
@@ -10445,7 +10459,7 @@ namespace {
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id fetched = _builder.emitTyped(spirv::OpImageFetch,
 			_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4), { image, coordinate, kImageOperandsLod, lod });
-		return texturePixels(texture, fetched);
+		return textureTexel(texture, fetched);
 	}
 
 	// get_width(), get_height() and get_depth() or get_array_size() (component 0,

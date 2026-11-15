@@ -3809,6 +3809,12 @@ void Parser::parseResourceType(Type& type) {
 		return;
 	}
 
+	static const std::map<std::string_view, ResourceKind> depthTextures = {
+		{ "depth2d", ResourceKind::Texture2D },
+		{ "depth2d_array", ResourceKind::Texture2DArray },
+		{ "depthcube", ResourceKind::TextureCube },
+		{ "depthcube_array", ResourceKind::TextureCubeArray },
+	};
 	static const std::map<std::string_view, ResourceKind> textures = {
 		{ "texture1d", ResourceKind::Texture1D },
 		{ "texture2d", ResourceKind::Texture2D },
@@ -3818,10 +3824,13 @@ void Parser::parseResourceType(Type& type) {
 		{ "texture1d_array", ResourceKind::Texture1DArray },
 		{ "texturecube_array", ResourceKind::TextureCubeArray },
 	};
-	const auto lowered = textures.find(name);
-	if (lowered == textures.end()) {
+	const auto depth = depthTextures.find(name);
+	const bool isDepth = depth != depthTextures.end();
+	const auto color = textures.find(name);
+	if (!isDepth && color == textures.end()) {
 		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture1d, texture2d, texturecube, "
-			"texture3d, texture2d_array, texture1d_array and texturecube_array of float or half, and sampler");
+			"texture3d, texture2d_array, texture1d_array and texturecube_array, depth2d, depth2d_array, depthcube and "
+			"depthcube_array, and sampler");
 	}
 
 	expect(TokenKind::Less, ("to open the sampled type of " + name).c_str());
@@ -3889,7 +3898,12 @@ void Parser::parseResourceType(Type& type) {
 	}
 
 	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
-	type.resource = lowered->second;
+	type.resource = isDepth ? depth->second : color->second;
+	type.isDepth = isDepth;
+	if (type.isDepth && (element->second != ScalarKind::Float || access != "sample")) {
+		throw CompileError(name + "<" + component + (access == "sample" ? "" : ", access::" + access)
+			+ "> is not lowered yet; mslc lowers depth textures of float with access::sample (Apple has no depth half)");
+	}
 	type.textureAccess = access == "write" ? TextureAccess::Write
 		: access == "read" ? TextureAccess::Read
 		: access == "read_write" ? TextureAccess::ReadWrite : TextureAccess::Sample;

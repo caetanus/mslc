@@ -127,6 +127,9 @@ struct Type {
 
 	ResourceKind resource = ResourceKind::None;
 	TextureAccess textureAccess = TextureAccess::Sample;
+	// A depth2d, depth2d_array, depthcube or depthcube_array: the texture kind above with a
+	// depth image, whose lookups return one float instead of a four-channel texel.
+	bool isDepth = false;
 
 	bool isScalar() const { return vectorWidth == 0; }
 	bool isVector() const { return vectorWidth > 1; }
