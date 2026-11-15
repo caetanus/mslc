@@ -76,9 +76,10 @@ the local size through spec constants 0, 1 and 2, which is what indium does.
   a separate multiply and add, and the results differ by a ULP or more under cancellation. Fusing
   inside one expression is permitted, so the Apple side compiles with `#pragma clang fp contract(off)`
   to give a deterministic reference; `--apple-contract` restores what an app's build does.
-  That does not make the module safe on every driver: mslc emits no `NoContraction` and no
-  `SignedZeroInfNanPreserve`, so a NIR driver may fuse, re-associate or drop -0, inf and NaN
-  (#368, a real divergence, see below).
+  mslc decorates every float conversion, `OpFAdd`, `OpFSub` and `OpFMul` `NoContraction` and sets
+  `SignedZeroInfNanPreserve` (32, and 16 when half is used) on each entry point (#368), so a NIR
+  driver no longer folds, re-associates or drops -0, inf and NaN, and it does not fuse a separate
+  multiply and add either. Apple's in-expression fusion stays out of scope (known-issues.md).
 - Not supported yet, skipped with the reason: textures, samplers, threadgroup memory, argument
   buffers, atomics, graphics stages.
 
@@ -100,13 +101,9 @@ Triage of the first corpus sweeps (1,295 probe kernels at grid 1, 1,086 compared
   `newLibraryWithSource` pre-includes `<metal_stdlib>`; that is the unverified reading of the
   other `pp_metal_*` probe.
 - Lavapipe rejects some valid modules (an empty struct: `vkCreateComputePipelines` -13).
-- **Not a harness artifact, #368:** lavapipe folds `float(half(x))` to `x`, `float(int(x))` to
-  `trunc(x)`, `x * 0` to `0`, and re-associates `(x + 1) - 1`, so a half or a negative fraction held
-  in a register, a signed zero, or a cancellation differs from Apple. NIR does that to every
-  float instruction that is not `exact`; mslc's SPIR-V has no `NoContraction` and no
-  `SignedZeroInfNanPreserve`, so RADV, ANV and the other NIR drivers behave the same. Until #368
-  is fixed these mismatches are mslc results; compare through a buffer store or exclude with a
-  reason that names #368.
+- **Fixed, #368:** lavapipe used to fold `float(half(x))` to `x`, `float(int(x))` to `trunc(x)`,
+  `x * 0` to `0` and `(x + 1) - 1` to `x`, because mslc's SPIR-V carried no `NoContraction` and no
+  `SignedZeroInfNanPreserve`. The `safe_math_*` probes pin each case; a mismatch of that shape now is a new bug.
 
 ## Tests and CI
 
