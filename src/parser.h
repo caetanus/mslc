@@ -17,6 +17,13 @@ namespace mslc {
 // the emitter knows: a parameter is free to be called "position".
 bool isMSLBuiltinName(std::string_view name);
 
+// One instance of a function template as an ordinary helper: the template's tokens re-parsed
+// with the arguments bound, one per template parameter and in order. With withBody false only
+// the signature is read, so that a call can be ranked before an instance is committed to.
+// A CompileError says what in the template the subset does not lower.
+FunctionDecl instantiateTemplate(const FunctionTemplate& declaration,
+	const std::vector<TemplateArgument>& arguments, bool withBody);
+
 // Parses an MSL token stream into a translation unit.
 //
 // The subset covers what the target corpus needs: struct declarations, kernel,
@@ -169,6 +176,40 @@ private:
 	};
 	std::map<std::string, ConstructorInfo> _constructors;
 
+	// Everything a name lookup reads, copied where a function template is declared, so that
+	// each instance of it is parsed as if at that point of the file.
+	struct Names {
+		std::map<std::string, Type> typedefs;
+		std::map<std::string, std::string> enumTypes;
+		std::map<std::string, EnumConstant> enumConstants;
+		std::map<std::string, ScalarKind> enumUnderlying;
+		std::map<std::string, std::string> declared;
+		std::map<std::string, std::string> declaredBesideTag;
+		std::vector<std::string> namespacePath;
+		std::set<std::string> namespaces;
+		std::map<std::string, std::string> namespaceAliases;
+		std::map<std::string, NamespaceScope> scopes;
+		std::vector<StructDecl> structs;
+		std::set<std::string> functionTemplates;
+		std::map<std::string, ConstructorInfo> constructors;
+	};
+	std::shared_ptr<const Names> captureNames() const;
+	void restoreNames(const Names& names);
+	// The name state where a template's declaration ends, read from the file once and kept.
+	static std::shared_ptr<const Names> namesAt(const FunctionTemplate& declaration);
+	size_t _stopAt = SIZE_MAX;
+	// An instance being read: the block that holds its parameters, and the parameters whose declared type
+	// names a template parameter.
+	size_t _parameterBlock = SIZE_MAX;
+	std::set<std::string> _dependentParameters;
+	bool namesDependentParameter(const std::string& name) const;
+	friend FunctionDecl instantiateTemplate(const FunctionTemplate&, const std::vector<TemplateArgument>&, bool);
+	FunctionDecl parseInstance(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments,
+		bool withBody);
+	// Binds the parameters of a template in an outermost block: a type as a typedef, a constant
+	// as an enumerator-like constant, each under a key no source spelling can reach.
+	void bindTemplateArguments(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments);
+	TemplateArgument parseTemplateArgument();
 	void parseTemplateHeader(FunctionTemplate& declaration);
 	std::vector<size_t> _pendingMembers;
 	// The fields of the struct whose member function is being parsed: a bare use of

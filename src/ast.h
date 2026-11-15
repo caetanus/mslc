@@ -132,6 +132,16 @@ struct Type {
 	}
 };
 
+// One argument of a template: a type, or an integer constant (a bool is 0 or 1).
+struct TemplateArgument {
+	bool isType = true;
+	Type type;
+	int64_t value = 0;
+	// A constant that is not known, as when a template's signature is read to deduce the rest:
+	// its name is bound, and using it in the signature is an error.
+	bool unbound = false;
+};
+
 // The MSL spelling of a resource kind, such as "texture2d".
 const char* resourceKindName(ResourceKind kind);
 const char* scalarKindName(ScalarKind kind);
@@ -281,6 +291,14 @@ struct Expression {
 	// Identifier: written "::name" while a local of that name is in scope, so the name
 	// is the file-scope declaration and the local does not hide it.
 	bool fileScope = false;
+
+	// Identifier: the explicit template arguments of "f<float, 3>", as written, when it has any.
+	bool hasTemplateArguments = false;
+	std::vector<TemplateArgument> templateArguments;
+
+	// Identifier: in a function template's instance, names a parameter (not a local of the same name) whose
+	// declared type names a template parameter, so what it is stands or falls with the arguments.
+	bool templateDependent = false;
 
 	// InitList
 	std::vector<InitializerElement> elements;
