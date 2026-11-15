@@ -2560,6 +2560,7 @@ namespace {
 		};
 		Id emitArrayInit(const Type& type, const std::vector<InitializerElement>& entries, size_t& position,
 			bool braced, const ArrayLeaves& leaves);
+		Id emitArrayListValue(const Type& type, const Expression& list);
 		Id emitLocalArrayIndex(const Expression& expression, bool asAddress);
 		const Binding* arrayRootBinding(const Expression& expression, size_t& depth) const;
 		void declareFileScopeArray(const VariableDeclaration& declaration, size_t position);
@@ -4498,6 +4499,10 @@ namespace {
 				throw CompileError("excess elements in " + spelled + " initializer");
 			}
 			const Type& field = decl.fields[next].type;
+			if (field.arrayLength && element.value->kind != ExpressionKind::InitList) {
+				throw CompileError("brace elision into the array member " + decl.fields[next].name + " of " + spelled
+					+ " is not lowered yet; add the braces");
+			}
 			InitSlot slot;
 			slot.index = cursor;
 			const StructDecl* fieldDecl = field.namedType.empty() || field.arrayLength.has_value()
@@ -4577,6 +4582,7 @@ namespace {
 			throw CompileError("a local in the " + std::string(addressSpaceName(target.addressSpace))
 				+ " address space is not lowered yet; every local mslc declares is thread-private");
 		}
+		if (target.arrayLength) { return emitArrayListValue(target, list); }
 		const Id toType = declaredTypeOf(target);
 		const std::string spelled = typeName(target);
 		if (!target.namedType.empty()) {
@@ -4603,10 +4609,6 @@ namespace {
 				if (sourceName && *sourceName == target.namedType) {
 					return convertImplicit(*values[0], toType);
 				}
-			}
-			if (hasArrayMember) {
-				throw CompileError("brace initialization of " + spelled + ", which has an array member, "
-					"is not lowered yet; assign the members one by one");
 			}
 			return emitStructElements(target, decl, list.elements, values);
 		}
@@ -12051,6 +12053,30 @@ namespace {
 		return leaves.compose(arrayTypeOf(type), parts);
 	}
 
+	// The value of an array built from a braced list, in the function's own storage.
+	Id Emitter::emitArrayListValue(const Type& type, const Expression& list) {
+		Expression none;
+		none.kind = ExpressionKind::InitList;
+		ArrayLeaves leaves;
+		leaves.element = [&](const Type& leaf, const Expression* entry) {
+			if (!entry) {
+				return emitInitListValue(leaf, none);
+			}
+			if (entry->kind == ExpressionKind::InitList) {
+				return emitInitListValue(leaf, *entry);
+			}
+			const Id value = emitExpression(*entry);
+			return leaf.namedType.empty() && leaf.isScalar()
+				? convertListScalar(value, leaf, *entry)
+				: convertImplicit(value, declaredTypeOf(leaf));
+		};
+		leaves.compose = [&](Id composite, const std::vector<uint32_t>& parts) {
+			return _builder.emitTyped(spirv::OpCompositeConstruct, composite, parts);
+		};
+		size_t position = 0;
+		return emitArrayInit(type, list.elements, position, true, leaves);
+	}
+
 	// A fixed-length array in the function's own storage: float a[4], float a[2][3],
 	// const float3 d[3] = {...} and a[] = {...}. A shorter list zero-fills the rest, as in
 	// C++, and a longer one is an error. An index is not checked at run time, and a
@@ -12124,26 +12150,7 @@ namespace {
 			} else if (declaration.initializer->kind != ExpressionKind::InitList) {
 				throw CompileError("array initializer must be an initializer list");
 			} else {
-				Expression none;
-				none.kind = ExpressionKind::InitList;
-				ArrayLeaves leaves;
-				leaves.element = [&](const Type& leaf, const Expression* entry) {
-					if (!entry) {
-						return emitInitListValue(leaf, none);
-					}
-					if (entry->kind == ExpressionKind::InitList) {
-						return emitInitListValue(leaf, *entry);
-					}
-					const Id value = emitExpression(*entry);
-					return leaf.namedType.empty() && leaf.isScalar()
-						? convertListScalar(value, leaf, *entry)
-						: convertImplicit(value, declaredTypeOf(leaf));
-				};
-				leaves.compose = [&](Id composite, const std::vector<uint32_t>& parts) {
-					return _builder.emitTyped(spirv::OpCompositeConstruct, composite, parts);
-				};
-				size_t position = 0;
-				initial = emitArrayInit(type, declaration.initializer->elements, position, true, leaves);
+				initial = emitArrayListValue(type, *declaration.initializer);
 			}
 		}
 

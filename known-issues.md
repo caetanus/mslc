@@ -390,14 +390,21 @@ supported. Dropped or type-probed initialisers no longer leave dead function loc
 
 ## S{...} temporary forms still refused (#251)
 
-Apple accepts the first four, which are refused loudly. It also rejects the last two, so for those only the wording differs.
+Apple accepts the first five, which are refused loudly. It also rejects the last two, so for those only the wording differs.
 
 - `using T = S; T{1,2}`: every alias declaration is rejected ("a using declaration has to name a
   member of a namespace"). It needs the parser's using and lookup code; `typedef S T; T{1,2}` works,
   at statement start too.
 - `sizeof(S{1,2})`: a braced temporary is not an operand sizeof can type, so it is refused (`sizeof(S)` works, #361).
-- `S{{1,2},3}.a[1]`, a member of a temporary that is an array: brace-initialising a struct with an
-  array member is not lowered, and indexing a value that is not a named variable is not either.
+- A struct with an array member is brace-initialised with the array in its own braces (`A x{{1,2},3}`, designators
+  included). Still refused where Apple accepts: brace elision into the array member (`A x{1,2,3}`), a
+  struct member that is an array of structs ("an array of structs field in value struct is not lowered yet"),
+  indexing a temporary (`S{{1,2},3}.a[1]`), a braced return (`return {1,2};`, for any struct), and the
+  parenthesised copy `A z(A{{1},2})` ("constructing a A is not lowered yet", as for any struct).
+- File-scope `constant` structs with a positional or array-member initialiser (a plain `constant P g = {1, 4};` gets the same "initialised by field name" error; designators on a plain struct work), which Apple accepts: `constant Q g =
+  {{1,2,3},4};` ("initialised by field name, so a has to be named"), `constant Q g{{1,2,3},4};` ("needs an
+  initialiser, found {") and `constant Q g = {.a = {1,2,3}, .s = 4};` ("a constant of \"\" is not a struct this
+  source declares").
 - Assigning to a conditional or comma that yields a place, including `(c ? s : t) = S{3,4}`,
   `(c ? S{1,2} : S{3,4}) = S{3,4}`, `(c ? s : t).a = 9` and a reference bound to a member of one;
   a store, `++`, reference binding or by-reference argument on such a member is refused with a
