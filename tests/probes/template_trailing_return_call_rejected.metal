@@ -1,4 +1,4 @@
-// EXPECT: error needs an instantiation, which is not lowered yet
+// EXPECT: error a trailing return type on function template "conv" is not lowered yet
 #include <metal_stdlib>
 using namespace metal;
 template <typename T> auto conv(T c) -> decltype(c) { return c * 2.0f; }

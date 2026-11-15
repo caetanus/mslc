@@ -1,6 +1,5 @@
-// EXPECT: error needs an instantiation, which is not lowered yet
-// Refs #341: "f<float>(x)" would otherwise read as a chain of comparisons; it parses now, and the call is refused
-// like any other call to a template until one is instantiated.
+// EXPECT: error explicit template arguments are not lowered yet
+// Refs #341: "f<float>(x)" would otherwise read as a chain of comparisons.
 #include <metal_stdlib>
 using namespace metal;
 template <typename T> T f(T x) { return x; }

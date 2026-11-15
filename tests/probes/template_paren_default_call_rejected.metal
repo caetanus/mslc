@@ -1,4 +1,4 @@
-// EXPECT: error needs an instantiation, which is not lowered yet
+// EXPECT: error the default argument of the template parameter "N" of "pl" is not lowered
 #include <metal_stdlib>
 using namespace metal;
 template <int N = (1 > 0) + int(2), typename T> T pl(T x) { return x; }

@@ -1,6 +1,7 @@
-// EXPECT: error needs an instantiation
+// EXPECT: valid
+// DISASM-NOT: %float_2
 // A function template in the argument's namespace is a candidate too (Apple calls it, f(T,int)
-// beats f(S,float) here); instantiating it is not lowered, so the call is refused.
+// beats f(S,float) here), so the helper's body, which returns 2.0f, is never emitted.
 #include <metal_stdlib>
 using namespace metal;
 namespace A { struct S { float v; }; template <typename T> float f(T x, int y) { return 1.0f; } }
