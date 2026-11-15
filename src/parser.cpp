@@ -2698,6 +2698,18 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 		if (const std::string candidate = blockQualifier(parts[0], mode); !candidate.empty()) {
 			return isNamespacePath(candidate) ? rest(candidate) : std::string();
 		}
+		// A block's type, or a using declaration of one, is found before any namespace of that name.
+		if (mode == NamespaceLookup::Qualifier) {
+			for (auto block = _blocks.rbegin(); block != _blocks.rend(); ++block) {
+				if (const auto binding = block->names.find(parts[0]); binding != block->names.end()) {
+					for (const std::string_view kind : kindsOf(binding->second)) {
+						if (kind == "struct" || kind == "enum" || kind == "typedef" || kind == kAnonymousStructTypedef) {
+							return std::string();
+						}
+					}
+				}
+			}
+		}
 	} else if (const std::string candidate = aliasQualifier(name, mode); !candidate.empty()) {
 		return isNamespacePath(candidate) ? rest(candidate) : std::string();
 	}
@@ -2708,9 +2720,10 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 			throw CompileError("reference to \"" + parts[0] + "\" is ambiguous: it names " + *tier.found.begin()
 				+ " and " + *std::next(tier.found.begin()));
 		}
-		// A struct, enum or typedef is not a namespace: the lookup goes on outward.
-		if (!tier.found.empty() && _namespaces.count(*tier.found.begin())) {
-			return rest(*tier.found.begin());
+		// [basic.lookup.qual]/1: a struct, enum or typedef found nearer than an outer namespace
+		// hides it; the caller then treats the qualifier as the type (an enum's enumerators).
+		if (!tier.found.empty()) {
+			return _namespaces.count(*tier.found.begin()) ? rest(*tier.found.begin()) : std::string();
 		}
 	}
 	return "";
