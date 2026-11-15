@@ -2542,9 +2542,10 @@ namespace {
 		const Binding& textureReceiver(const Expression& call);
 		void emitTextureWrite(const Expression& call, const Binding& texture);
 		Id emitTextureCall(const Expression& call);
-		Id emitTextureSample(const Expression& call, const Binding& texture);
+		Id emitTextureSample(const Expression& call, const Binding& texture, bool compare = false);
+		Id compareValue(const Expression& argument, const std::string& callName);
 		Id emitTextureRead(const Expression& call, const Binding& texture);
-		Id emitTextureGather(const Expression& call, const Binding& texture);
+		Id emitTextureGather(const Expression& call, const Binding& texture, bool compare = false);
 		const Binding& samplerArgument(const Expression& argument, ResourceKind kind, const std::string& callName);
 		Id samplingCoordinate(const Expression& coordinate, ResourceKind kind, const Expression* layer, const std::string& callName);
 		Id emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component);
@@ -9909,6 +9910,12 @@ namespace {
 		if (method == "gather" && access == TextureAccess::Sample) {
 			return emitTextureGather(call, texture);
 		}
+		if (method == "sample_compare" && access == TextureAccess::Sample && texture.pointeeMsl.isDepth) {
+			return emitTextureSample(call, texture, true);
+		}
+		if (method == "gather_compare" && access == TextureAccess::Sample && texture.pointeeMsl.isDepth) {
+			return emitTextureGather(call, texture, true);
+		}
 		if (method == "get_num_mip_levels" && access == TextureAccess::Sample) {
 			if (!call.arguments.empty()) {
 				throw CompileError("get_num_mip_levels takes no arguments");
@@ -10115,7 +10122,7 @@ namespace {
 	// four texels of a 2x2 footprint at one channel, as OpImageGather. The offset is a
 	// texture2d and texture2d_array argument; a literal one is ConstOffset, any other an
 	// Offset operand, which needs ImageGatherExtended. A coord::pixel sampler is refused.
-	Id Emitter::emitTextureGather(const Expression& call, const Binding& texture) {
+	Id Emitter::emitTextureGather(const Expression& call, const Binding& texture, bool compare) {
 		const auto& arguments = call.arguments;
 		const ResourceKind kind = texture.pointeeMsl.resource;
 		const bool arrayed = kind == ResourceKind::Texture2DArray || kind == ResourceKind::TextureCubeArray;
@@ -10123,17 +10130,19 @@ namespace {
 			throw CompileError(std::string("gather is defined on texture2d, texture2d_array, texturecube and texturecube_array; ")
 				+ resourceKindName(kind) + " has none");
 		}
-		const size_t fixed = arrayed ? 3 : 2;
+		const size_t fixed = (arrayed ? 3 : 2) + (compare ? 1 : 0);
+		const std::string callName = compare ? "gather_compare" : "gather";
 		if (arguments.size() < fixed) {
-			throw CompileError(std::string("gather takes a sampler, a coordinate") + (arrayed ? ", an array index" : "")
-				+ ", and optionally an int2 offset and a component");
+			throw CompileError(callName + " takes a sampler, a coordinate" + (arrayed ? ", an array index" : "")
+				+ (compare ? ", a comparison value" : "") + ", and optionally an int2 offset" + (compare ? "" : " and a component"));
 		}
-		const Binding& sampler = samplerArgument(*arguments[0], kind, "gather");
+		const Binding& sampler = samplerArgument(*arguments[0], kind, callName);
 		if (sampler.unnormalizedSampler) {
 			throw CompileError("gather through a coord::pixel sampler is not lowered: Vulkan allows no gather on an "
 				"unnormalized sampler");
 		}
-		const Id coordinate = samplingCoordinate(*arguments[1], kind, arrayed ? arguments[2].get() : nullptr, "gather");
+		const Id coordinate = samplingCoordinate(*arguments[1], kind, arrayed ? arguments[2].get() : nullptr, callName);
+		const Id reference = compare ? compareValue(*arguments[fixed - 1], callName) : InvalidId;
 
 		Id offset = InvalidId;
 		bool constantOffset = false;
@@ -10146,6 +10155,9 @@ namespace {
 				: std::string();
 			const bool isComponent = argument.kind == ExpressionKind::Identifier
 				&& argument.name.find("component::") != std::string::npos;
+			if (isComponent && compare) {
+				throw CompileError("gather_compare takes no component: it compares the depth channel");
+			}
 			if (isComponent) {
 				const auto found = std::string("xyzw").find(tail);
 				// Apple takes the component only after the offset, where there is one.
@@ -10177,7 +10189,7 @@ namespace {
 		const Id combined = _builder.emitTyped(spirv::OpSampledImage,
 			_types.sampledImage(kind, textureSampledKind(texture.pointeeMsl.scalar), texture.pointeeMsl.isDepth),
 			{ image, loadedSampler });
-		std::vector<uint32_t> words { combined, coordinate, constantU32(component) };
+		std::vector<uint32_t> words { combined, coordinate, compare ? reference : constantU32(component) };
 		if (offset != InvalidId && constantOffset) {
 			words.push_back(0x8);  // ConstOffset
 			words.push_back(offset);
@@ -10189,7 +10201,7 @@ namespace {
 			words.push_back(kImageOperandsOffset);
 			words.push_back(offset);
 		}
-		return texturePixels(texture, _builder.emitTyped(spirv::OpImageGather,
+		return texturePixels(texture, _builder.emitTyped(compare ? spirv::OpImageDrefGather : spirv::OpImageGather,
 			_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4), words));
 	}
 
@@ -10223,19 +10235,31 @@ namespace {
 	// sampler with pixel coordinates, which Vulkan does not allow an implicit lod on.
 	// bias and min_lod_clamp need those derivatives and so a fragment function, and an
 	// offset has to be a vector of integer literals (ConstOffset).
-	Id Emitter::emitTextureSample(const Expression& call, const Binding& texture) {
+	// The comparison value of sample_compare and gather_compare, a float.
+	Id Emitter::compareValue(const Expression& argument, const std::string& callName) {
+		const Id value = emitExpression(argument);
+		const Id type = _builder.typeOf(value);
+		if (_types.vectorWidth(type) != 1 || _types.bitWidth(type) < 8) {
+			throw CompileError("the comparison value of " + callName + " has to be a number");
+		}
+		return convert(value, type, _types.scalar(ScalarKind::Float));
+	}
+
+	Id Emitter::emitTextureSample(const Expression& call, const Binding& texture, bool compare) {
 		const auto& arguments = call.arguments;
 		const ResourceKind kind = texture.pointeeMsl.resource;
 		const bool arrayed = isArrayKind(kind);
-		const size_t fixed = arrayed ? 3 : 2;
+		const size_t fixed = (arrayed ? 3 : 2) + (compare ? 1 : 0);
 		if (arguments.size() < fixed || arguments.size() > fixed + 3) {
 			throw CompileError(std::string("sample takes a sampler, a coordinate")
 				+ (arrayed ? ", an array index" : "") + " and optionally an option, min_lod_clamp(m) and an offset; "
 				"this call passes " + std::to_string(arguments.size()));
 		}
 
-		const Binding& sampler = samplerArgument(*arguments[0], kind, "sample");
-		const Id coordinate = samplingCoordinate(*arguments[1], kind, arrayed ? arguments[2].get() : nullptr, "sample");
+		const std::string callName = compare ? "sample_compare" : "sample";
+		const Binding& sampler = samplerArgument(*arguments[0], kind, callName);
+		const Id coordinate = samplingCoordinate(*arguments[1], kind, arrayed ? arguments[2].get() : nullptr, callName);
+		const Id reference = compare ? compareValue(*arguments[fixed - 1], callName) : InvalidId;
 
 		if (isOneDimensional(kind) && arguments.size() > fixed) {
 			throw CompileError(std::string("a ") + resourceKindName(kind) + " samples with a sampler and a coordinate only; "
@@ -10355,7 +10379,12 @@ namespace {
 			lod = _builder.emitDeclTyped(spirv::OpConstant, floatType, { 0u });
 		}
 		uint32_t mask = 0;
-		std::vector<uint32_t> words { combined, coordinate, 0 };
+		std::vector<uint32_t> words { combined, coordinate };
+		if (compare) {
+			words.push_back(reference);
+		}
+		const size_t maskAt = words.size();
+		words.push_back(0);
 		if (bias != InvalidId) {
 			mask |= 0x1;
 			words.push_back(bias);
@@ -10384,7 +10413,11 @@ namespace {
 		if (mask == 0) {
 			words.pop_back();
 		} else {
-			words[2] = mask;
+			words[maskAt] = mask;
+		}
+		if (compare) {
+			return _builder.emitTyped(implicit ? spirv::OpImageSampleDrefImplicitLod : spirv::OpImageSampleDrefExplicitLod,
+				_types.scalar(ScalarKind::Float), words);
 		}
 		const Id sampled = _builder.emitTyped(implicit ? spirv::OpImageSampleImplicitLod : spirv::OpImageSampleExplicitLod,
 			float4, words);
@@ -13283,7 +13316,7 @@ namespace {
 					+ "\", \"min_filter\": \"" + samplerFilterName(state.minFilter)
 					+ "\", \"mip_filter\": \"" + samplerMipFilterName(state.mipFilter)
 					+ "\", \"normalized_coordinates\": " + (state.normalizedCoordinates ? "true" : "false")
-					+ ", \"compare_function\": \"Never\", \"anisotropy\": 1"
+					+ ", \"compare_function\": \"" + samplerCompareName(state.compare) + "\", \"anisotropy\": 1"
 					+ ", \"border_color\": \"TransparentBlack\", \"lod_min\": 0, \"lod_max\": 65504"
 					+ " }";
 			}

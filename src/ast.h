@@ -373,6 +373,7 @@ struct SwitchCase {
 enum class SamplerAddress { ClampToZero, ClampToEdge, Repeat, MirroredRepeat };
 enum class SamplerFilter { Nearest, Linear };
 enum class SamplerMipFilter { None, Nearest, Linear };
+enum class SamplerCompare { Never, Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual, Always };
 
 // The state of a sampler declared in the shader, with the defaults of a
 // sampler declared with no options. Compare/anisotropy/LOD/border options are
@@ -384,18 +385,20 @@ struct SamplerState {
 	SamplerFilter magFilter = SamplerFilter::Nearest;
 	SamplerFilter minFilter = SamplerFilter::Nearest;
 	SamplerMipFilter mipFilter = SamplerMipFilter::None;
+	SamplerCompare compare = SamplerCompare::Never;
 	bool normalizedCoordinates = true;
 
 	bool operator==(const SamplerState& other) const {
 		return sAddress == other.sAddress && tAddress == other.tAddress && rAddress == other.rAddress
 			&& magFilter == other.magFilter && minFilter == other.minFilter
-			&& mipFilter == other.mipFilter && normalizedCoordinates == other.normalizedCoordinates;
+			&& mipFilter == other.mipFilter && compare == other.compare && normalizedCoordinates == other.normalizedCoordinates;
 	}
 };
 
 const char* samplerAddressName(SamplerAddress mode);
 const char* samplerFilterName(SamplerFilter filter);
 const char* samplerMipFilterName(SamplerMipFilter filter);
+const char* samplerCompareName(SamplerCompare compare);
 
 struct VariableDeclaration {
 	Type type;
