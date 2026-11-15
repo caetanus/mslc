@@ -16,7 +16,6 @@ import json
 import os
 import random
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -29,21 +28,6 @@ import hosts
 import inputs
 
 OK, MISMATCH, ERROR, SKIPPED = 0, 1, 2, 3
-
-
-def run_mslc(mslc, source, work, includes):
-    spv, refl = os.path.join(work, "mslc.spv"), os.path.join(work, "mslc.json")
-    cmd = [mslc, "--stage", "kernel", "-o", spv, "--reflect", refl, source] + ["-I" + i for i in includes]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=hosts.TIMEOUT)
-    if r.returncode < 0:
-        return None, None, "CRASH mslc died with signal %d (%s)" % (-r.returncode, signal.Signals(-r.returncode).name)
-    if r.returncode != 0:
-        return None, None, (r.stderr.strip().splitlines() or ["mslc failed"])[-1]
-    val = subprocess.run([shutil.which("spirv-val") or "spirv-val", "--target-env", "vulkan1.3", spv],
-                         capture_output=True, text=True)
-    if val.returncode != 0:
-        return None, None, "INVALID mslc output fails spirv-val: " + (val.stdout + val.stderr).strip().splitlines()[0]
-    return spv, hostenv.read_json(refl), None
 
 
 def check_entry(opts, source, spv, reflection, entry, params, work, includes):
@@ -163,12 +147,10 @@ def check_file(opts, path, std=None):
     d = directives.parse(text)
     work = tempfile.mkdtemp(prefix="diffcheck-", dir=os.environ.get("TMPDIR"))
     try:
-        spv, refl, error = run_mslc(opts.mslc, path, work, includes)
+        spv, refl, error = hosts.run_mslc(opts.mslc, path, work, includes)
         if error:
-            for prefix, status in (("INVALID ", "invalid"), ("CRASH ", "error")):
-                if error.startswith(prefix):
-                    return [{"entry": opts.entry or "*", "status": status, "reason": error[len(prefix):], "cases": []}]
-            return [{"entry": opts.entry or "*", "status": "skipped", "reason": error, "cases": []}]
+            status, reason = hosts.mslc_failure(error)
+            return [{"entry": opts.entry or "*", "status": status, "reason": reason, "cases": []}]
         entries = [e for e in refl["entry_points"] if e["stage"] == "compute"]
         if opts.entry:
             entries = [e for e in entries if e["name"] == opts.entry]

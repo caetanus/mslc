@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 
@@ -96,6 +98,31 @@ def run_vulkan(binary, manifest_path):
     if "llvmpipe" not in r.stdout:
         raise HostError("vkhost ran on %r, not lavapipe" % r.stdout.strip())
     return r.stdout
+
+
+def run_mslc(mslc, source, work, includes, stage="kernel"):
+    """(spv path, reflection, None) or (None, None, "CRASH|INVALID <reason>" or a compile error)."""
+    spv, refl = os.path.join(work, "mslc-%s.spv" % stage), os.path.join(work, "mslc-%s.json" % stage)
+    cmd = [mslc, "--stage", stage, "-o", spv, "--reflect", refl, source] + ["-I" + i for i in includes]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
+    if r.returncode < 0:
+        return None, None, "CRASH mslc died with signal %d (%s)" % (-r.returncode, signal.Signals(-r.returncode).name)
+    if r.returncode != 0:
+        return None, None, (r.stderr.strip().splitlines() or ["mslc failed"])[-1]
+    val = subprocess.run([shutil.which("spirv-val") or "spirv-val", "--target-env", "vulkan1.3", spv],
+                         capture_output=True, text=True)
+    if val.returncode != 0:
+        return None, None, "INVALID mslc output fails spirv-val: " + (val.stdout + val.stderr).strip().splitlines()[0]
+    return spv, hostenv.read_json(refl), None
+
+
+def mslc_failure(error):
+    """(status, reason) for a run_mslc error: a crash is an error and invalid output is a
+    finding; only a compile error is a skip."""
+    for prefix, status in (("INVALID ", "invalid"), ("CRASH ", "error")):
+        if error.startswith(prefix):
+            return status, error[len(prefix):]
+    return "skipped", error
 
 
 def apple_source_lines(source, work, includes, std, contract=False):
