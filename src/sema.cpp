@@ -2609,6 +2609,10 @@ namespace {
 		const StructDecl* adlStructOf(const Expression& argument);
 		bool inConstantSpace(const Expression& place) const;
 		std::optional<Type> placeType(const Expression& place);
+		std::optional<Type> sizeofPlaceType(const Expression& place);
+		bool sizeofLeavesTyped(const Expression& expression);
+		bool namesPointerParameter(const std::string& name) const;
+		uint64_t sizeofOperand(const Expression& operand);
 		bool isVectorPlace(const Expression& place);
 		bool isVectorComponent(const Expression& place);
 		bool bindsTemporary(const Expression& place);
@@ -4295,6 +4299,13 @@ namespace {
 				}
 				return false;
 			}
+			case ExpressionKind::Sizeof:
+				try {
+					sizeofOperand(*expression.left);
+					return true;
+				} catch (const CompileError&) {
+					return false;
+				}
 			case ExpressionKind::Binary:
 			case ExpressionKind::Conditional: return provenByFolding(expression, excluded);
 			case ExpressionKind::Construct: {
@@ -4343,6 +4354,7 @@ namespace {
 			case ExpressionKind::IntLiteral:
 			case ExpressionKind::BoolLiteral:
 			case ExpressionKind::FloatLiteral:
+			case ExpressionKind::Sizeof:
 			case ExpressionKind::Identifier: return canFoldExpression(expression, excluded);
 			case ExpressionKind::Unary: return constantLeaves(*expression.left, excluded);
 			case ExpressionKind::Binary:
@@ -4854,6 +4866,7 @@ namespace {
 			case ExpressionKind::IntLiteral:
 			case ExpressionKind::FloatLiteral:
 			case ExpressionKind::BoolLiteral:
+			case ExpressionKind::Sizeof:
 				return true;
 			case ExpressionKind::Identifier: {
 				const Binding* binding = findResourceBinding(expression.name);
@@ -7311,6 +7324,116 @@ namespace {
 		}
 	}
 
+	// The type a sizeof operand that is a name, an element or a member has, as the source spelled it:
+	// a packed vector is 12 bytes where the value of one is a float3 of 16. A swizzle of a vector
+	// place is an unpacked vector of its length.
+	std::optional<Type> Emitter::sizeofPlaceType(const Expression& place) {
+		if (place.kind == ExpressionKind::Member && !structOf(*place.left)) {
+			std::optional<Type> base = sizeofPlaceType(*place.left);
+			const size_t lanes = place.memberName.size();
+			if (!base || !base->isVector() || base->isMatrix() || base->arrayLength || base->isPointer
+				|| lanes < 1 || lanes > 4) {
+				return std::nullopt;
+			}
+			base->isPacked = false;
+			base->vectorWidth = lanes > 1 ? static_cast<uint32_t>(lanes) : 0;
+			return base;
+		}
+		return placeType(place);
+	}
+
+	// Whether every leaf of an arithmetic operand has a type that is known from the source and is not a
+	// packed vector: a packed operand of + or - gives a packed result (Apple: sizeof is 12), which the
+	// value's SPIR-V type cannot say.
+	bool Emitter::sizeofLeavesTyped(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+			case ExpressionKind::FloatLiteral:
+			case ExpressionKind::BoolLiteral:
+			case ExpressionKind::Construct:
+			case ExpressionKind::Sizeof:
+				return true;
+			case ExpressionKind::Identifier:
+			case ExpressionKind::Member:
+			case ExpressionKind::Index: {
+				const std::optional<Type> type = sizeofPlaceType(expression);
+				return type && !type->isPacked && !type->isPointer && !type->arrayLength;
+			}
+			case ExpressionKind::Unary:
+			case ExpressionKind::Binary:
+				return sizeofLeavesTyped(*expression.left)
+					&& (expression.kind == ExpressionKind::Unary || sizeofLeavesTyped(*expression.right));
+			default:
+				return false;
+		}
+	}
+
+	bool Emitter::namesPointerParameter(const std::string& name) const {
+		const FunctionDecl* function = _helper ? _helper : _entryPoint;
+		return function && std::any_of(function->parameters.begin(), function->parameters.end(),
+			[&](const Parameter& parameter) { return parameter.name == name && parameter.type.isPointer; });
+	}
+
+	// The size sizeof gives the expression's type; the expression itself is never evaluated. Only what
+	// can be typed from the declarations, or an arithmetic result of such parts, is sized: a guess at
+	// the type of anything else would be a silent wrong size.
+	uint64_t Emitter::sizeofOperand(const Expression& operand) {
+		const auto sized = [&](const Type& type) {
+			if (type.scalar == ScalarKind::Void && type.namedType.empty() && !type.isPointer
+				&& type.resource == ResourceKind::None && !type.isAuto) {
+				throw CompileError("the type of this sizeof operand is not recorded; write sizeof(<type>)");
+			}
+			return sizeofType(type, _unit);
+		};
+
+		switch (operand.kind) {
+			case ExpressionKind::IntLiteral: { Type type; type.scalar = operand.intKind; return sized(type); }
+			case ExpressionKind::FloatLiteral: {
+				Type type;
+				type.scalar = operand.floatIsHalf ? ScalarKind::Half : ScalarKind::Float;
+				return sized(type);
+			}
+			case ExpressionKind::BoolLiteral: { Type type; type.scalar = ScalarKind::Bool; return sized(type); }
+			case ExpressionKind::Construct:
+				if (!operand.constructType) {
+					break;
+				}
+				return sized(*operand.constructType);
+			case ExpressionKind::Identifier:
+			case ExpressionKind::Member:
+			case ExpressionKind::Index: {
+				if (operand.kind == ExpressionKind::Identifier && namesPointerParameter(operand.name)) {
+					throw CompileError("sizeof of the pointer parameter \"" + operand.name
+						+ "\" is not lowered; write sizeof(<pointer type>)");
+				}
+				const std::optional<Type> type = sizeofPlaceType(operand);
+				if (!type) {
+					break;
+				}
+				return sized(*type);
+			}
+			case ExpressionKind::Binary:
+			case ExpressionKind::Unary: {
+				const bool changes = operand.kind == ExpressionKind::Unary
+					&& (operand.unaryOperator == UnaryOperator::PreIncrement
+						|| operand.unaryOperator == UnaryOperator::PreDecrement
+						|| operand.unaryOperator == UnaryOperator::PostIncrement
+						|| operand.unaryOperator == UnaryOperator::PostDecrement
+						|| operand.unaryOperator == UnaryOperator::AddressOf);
+				if (changes || !(_helper || _entryPoint) || !sizeofLeavesTyped(operand)) {
+					break;
+				}
+				Id value = InvalidId;
+				discardLifted([&] { value = emitExpression(operand); });
+				return sized(deduceAutoType(Type(), _builder.typeOf(value), "the operand of sizeof"));
+			}
+			default:
+				break;
+		}
+		throw CompileError("sizeof of this expression is not lowered: its type is not one mslc reads "
+			"from the declarations; write sizeof(<type>)");
+	}
+
 	// A place whose value is a whole vector.
 	bool Emitter::isVectorPlace(const Expression& place) {
 		const std::optional<Type> type = placeType(place);
@@ -7882,6 +8005,11 @@ namespace {
 
 				return found->second;
 			}
+
+			case ExpressionKind::Sizeof:
+				folded.scalar = ScalarKind::ULong;
+				folded.integer = sizeofOperand(*expression.left);
+				return folded;
 
 			case ExpressionKind::Binary: return foldBinary(expression);
 			case ExpressionKind::Unary: return foldUnary(expression);
@@ -8852,6 +8980,11 @@ namespace {
 			case ExpressionKind::Comma:
 				emitExpressionStatement(*expression.left);
 				return emitExpression(*expression.right);
+			case ExpressionKind::Sizeof: {
+				const uint64_t size = sizeofOperand(*expression.left);
+				return _builder.emitDeclTyped(spirv::OpConstant, _types.scalar(ScalarKind::ULong),
+					{ static_cast<uint32_t>(size), static_cast<uint32_t>(size >> 32) });
+			}
 			case ExpressionKind::InitList:
 				// S{...} names its struct; a bare list does not and is only an initialiser.
 				if (expression.constructType) {
@@ -11560,6 +11693,7 @@ namespace {
 			case ExpressionKind::IntLiteral:
 			case ExpressionKind::FloatLiteral:
 			case ExpressionKind::BoolLiteral:
+			case ExpressionKind::Sizeof:
 				return false;
 			case ExpressionKind::Assign:
 				return true;

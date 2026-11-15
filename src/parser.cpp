@@ -3399,6 +3399,9 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 			}
 			break;
 		}
+		case ExpressionKind::Sizeof:
+			throw CompileError("the size of an expression is worked out after parsing, so it is not an "
+				"array length or an attribute index; write sizeof(<type>)");
 		case ExpressionKind::Construct: {
 			// A cast is only taken of a sizeof, which is the one ulong an attribute index or an array
 			// length is written from; (uint)sizeof(S) and int(sizeof(S)) hold the same value.
@@ -5669,8 +5672,13 @@ ExpressionPtr Parser::parseSizeof() {
 		_position = open;
 	}
 
-	parseUnary();
-	throw CompileError("sizeof of an expression is not lowered yet; write sizeof(<type>)");
+	auto expression = std::make_unique<Expression>();
+	expression->kind = ExpressionKind::Sizeof;
+	expression->line = startLine;
+	const NestingScope scope(*this);
+	expression->left = parseUnary();
+	measure(*expression);
+	return expression;
 }
 
 ExpressionPtr Parser::parseUnary() {

@@ -374,7 +374,7 @@ them on master as well), so none is a regression.
   bitwise not of a half.
 
 Forms Apple accepts that the validity proof still leaves as the unsupported-proof diagnostic:
-`sizeof(...)` and char literals such as `'a'` in a constant (parser limits), arithmetic on a bool
+char literals such as `'a'` in a constant (parser limit), arithmetic on a bool
 (`float x{true + 1}`), a ternary whose unchosen arm is not a constant (`float x{true ? 1 : 5 / 0}`),
 a float-to-integer cast inside a vector constructor of a constexpr list
 (`constexpr int3 v{int3(1.5f)}`), and a file-scope `constant` initialised with a float division by
@@ -394,7 +394,7 @@ Apple accepts the first four, which are refused loudly. It also rejects the last
 - `using T = S; T{1,2}`: every alias declaration is rejected ("a using declaration has to name a
   member of a namespace"). It needs the parser's using and lookup code; `typedef S T; T{1,2}` works,
   at statement start too.
-- `sizeof(S{1,2})` and `sizeof(S)`: `sizeof` is not implemented at all, so any use is refused.
+- `sizeof(S{1,2})`: a braced temporary is not an operand sizeof can type, so it is refused (`sizeof(S)` works, #361).
 - `S{{1,2},3}.a[1]`, a member of a temporary that is an array: brace-initialising a struct with an
   array member is not lowered, and indexing a value that is not a named variable is not either.
 - Assigning to a conditional or comma that yields a place, including `(c ? s : t) = S{3,4}`,
@@ -508,3 +508,20 @@ All of these predate those fixes; counts are from generated differentials agains
   undeclared identifier (about 34 cases).
 - The library's names are visible without `#include <metal_stdlib>` (about 11 cases).
 - `namespace NB { typedef int metal; }` followed by `metal::abs` is accepted (2 cases).
+
+## sizeof: what is refused (#361)
+
+`sizeof(type)` is folded by the parser with Metal's layout, and `sizeof expr` is sized by sema from
+the operand's declared type; every accepted size was compared with `xcrun metal`. A refusal stands in
+for a size mslc cannot give with certainty. Apple accepts, and mslc refuses:
+
+- `sizeof(x)` as an array length or attribute index, where `x` is a declared name: the parser folds
+  lengths before declared types are known. `sizeof(type)` works there.
+- `sizeof(p)` where `p` is a pointer parameter (Apple: 8). The binding no longer says whether a
+  name is the parameter or a local that hides it. Write `sizeof(device float *)`.
+- Operands that are not a name, element, member, literal, cast or arithmetic of those: calls,
+  `?:`, assignments, `i++` (never evaluated by Apple), `S{...}`, a bool operand of `+`.
+- Arithmetic with a packed vector operand (`sizeof(p + p)` is 12 in Apple; the value is a float3).
+- `sizeof(texture2d<float>)` and `sizeof(sampler)` (Apple answers), and an empty struct (Apple: 1).
+- A constant expression where the unsigned sizeof would wrap: `-sizeof(int) + 8`, `sizeof(int) - 8`
+  (Apple rejects the latter), a negative operand beside it, or a cast that truncates it.

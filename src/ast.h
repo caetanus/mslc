@@ -248,6 +248,9 @@ enum class ExpressionKind {
 	Conditional,
 	// left, right: left is evaluated and dropped, the value is right's.
 	Comma,
+	// left: the operand of a sizeof whose size sema works out, since it needs the operand's type.
+	// sizeof(type) never gets here: the parser folds it to a ulong IntLiteral.
+	Sizeof,
 };
 
 enum class BinaryOperator {
