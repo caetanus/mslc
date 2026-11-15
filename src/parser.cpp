@@ -5843,6 +5843,18 @@ ExpressionPtr Parser::parseCast() {
 	std::optional<Type> type;
 	try {
 		type = peekCastTargetName(nameTokens);
+		// A variable or function of the name hides the struct or enum tag, so "(S) - 1" is
+		// S minus one and not a cast ([basic.scope.hiding]); parseSizeof reads the same rule.
+		if (type && (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))) {
+			size_t spelledTokens = 0;
+			const std::string spelled = peekResolved(spelledTokens);
+			Type probe;
+			const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
+				&& isLocal(spelled) && !resolveTypeName(spelled, probe);
+			if (objectHidesTag(spelled) || localHidesStruct) {
+				type.reset();
+			}
+		}
 	} catch (...) {
 		_position = open;
 		throw;
