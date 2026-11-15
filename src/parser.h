@@ -168,6 +168,8 @@ private:
 		bool hasDefault = false;
 	};
 	std::map<std::string, ConstructorInfo> _constructors;
+
+	void parseTemplateHeader(FunctionTemplate& declaration);
 	std::vector<size_t> _pendingMembers;
 	// The fields of the struct whose member function is being parsed: a bare use of
 	// one means this.field.
