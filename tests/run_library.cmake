@@ -307,6 +307,10 @@ expect_contains("${overloads_dis}" "LinkageAttributes \"mixed(float3)\" Export" 
 expect_contains("${overloads_dis}" "LinkageAttributes \"mixed(float,thread const int&)\" Export" "overloaded helpers")
 expect_contains("${overloads_dis}" "LinkageAttributes \"solo\" Export" "overloaded helpers")
 
+# Importing one overload of an overloaded name is refused (#266).
+run_mslc(output 1 --compile-library -o "${OUT_DIR}/overload_import.spv" "${TEST_DIR}/library/overload_import.metal")
+expect_contains("${output}" "importing one overload of a name is not lowered yet" "overload import")
+
 # The helpers link with a real shader into a valid Vulkan executable.
 set(linked_helpers "${OUT_DIR}/linked_helpers.spv")
 file(REMOVE "${linked_helpers}")

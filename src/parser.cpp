@@ -4989,7 +4989,7 @@ ExpressionPtr Parser::parsePrimary() {
 		expression->overloadNames = alternatives;
 		// An unqualified name in a call also finds the functions of its arguments' namespaces.
 		expression->unqualifiedCall = spelledTokens == 1 && lookahead(spelledTokens).kind == TokenKind::LParen
-			&& !blockName(std::string(current().text));
+			&& !isLocal(std::string(current().text));
 		// A qualified call is looked up at the scope it WROTE, not at the scope the member
 		// it found happens to live in: "B::clamp" can resolve to "A::clamp" through a using
 		// declaration or directive in B, but it is still B's lookup that also reaches the

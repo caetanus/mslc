@@ -2550,6 +2550,7 @@ namespace {
 		size_t callerOrder() const { return (_helper ? _helper : _entryPoint)->order; }
 		void noteCall(const FunctionDecl& callee);
 		bool isPlainVariable(const Expression& expression) const;
+		bool isWholeVariable(const Expression& expression) const;
 		struct PointerFit {
 			Type element;
 			Type wanted;
@@ -2569,6 +2570,8 @@ namespace {
 			std::optional<std::string> tag;
 			// A non-const local of this function, which a mutable reference can name.
 			bool changeable = false;
+			// A variable of this function's own storage: a reference to thread memory binds only to it.
+			bool inThread = false;
 			// Names a pointer or a buffer that is not a local array: not lowered as an argument.
 			bool pointerLike = false;
 		};
@@ -5518,16 +5521,23 @@ namespace {
 				const auto tag = enumOf(*argument);
 				type = tag && *tag != "<anonymous>" ? *tag : std::string();
 			}
-			const size_t scope = type.rfind("::");
-			if (scope == std::string::npos) {
+			if (type.empty()) {
 				continue;
 			}
-			const std::string associated = type.substr(0, scope) + "::" + last;
+			// A type of the file scope associates the file scope: its f is found from inside a namespace too.
+			const size_t scope = type.rfind("::");
+			const std::string associated = scope == std::string::npos ? last : type.substr(0, scope) + "::" + last;
 			const std::vector<HelperFunction*> found = helpersNamed(associated);
 			const bool visible = std::any_of(found.begin(), found.end(), [&](const HelperFunction* entry) {
 				return entry->firstOrder <= callerOrder();
-			});
+			}) || _unit.functionTemplates.count(associated);
 			if (visible && std::find(names.begin(), names.end(), associated) == names.end()) {
+				// The library's own overloads compete with it, which mslc does not model here.
+				if (isMSLBuiltinName(last) || findMathBuiltin(last)) {
+					throw CompileError("argument-dependent lookup finds \"" + associated + "\", which competes with the "
+						"standard library's \"" + last + "\"; Apple resolves the two by overload, which mslc "
+						"does not model");
+				}
 				names.push_back(associated);
 			}
 		}
@@ -5666,7 +5676,23 @@ namespace {
 					+ "\" is not known to be a particular enum, and an overload takes an enum; that is not "
 					"lowered yet");
 			}
+			if (bound && argument.kind == OverloadArgument::Kind::Variable && !isWholeVariable(*argument.expression)) {
+				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \"" + name
+					+ "\" is an element or member that a mutable reference could bind, which is not lowered "
+					"when choosing among overloads (a vector component cannot be bound); name a local instead");
+			}
 			argument.value = emitExpression(*argument.expression);
+			// Unary - + ~ on a type narrower than int give an int, which mslc does not widen.
+			const std::optional<ScalarKind> narrow = _types.scalarKindOf(_builder.typeOf(argument.value));
+			if (narrow && argument.expression->kind == ExpressionKind::Unary
+				&& (argument.expression->unaryOperator == UnaryOperator::Negate
+					|| argument.expression->unaryOperator == UnaryOperator::Plus
+					|| argument.expression->unaryOperator == UnaryOperator::BitNot)
+				&& scalarBitWidth(*narrow) < 32 && *narrow != ScalarKind::Half && *narrow != ScalarKind::Bool) {
+				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \"" + name
+					+ "\" applies a unary operator to a type narrower than int, whose result Apple promotes to "
+					"int and mslc does not; that is not lowered when choosing among overloads");
+			}
 			prepared.push_back(argument.value);
 		}
 		// Positions that are not evaluated keep their place, so prepared[i] is argument i.
@@ -5720,6 +5746,24 @@ namespace {
 		throw CompileError("call to \"" + name + "\" is ambiguous; candidates: " + describe(tied));
 	}
 
+	// A name, or an element of a local array of scalars: what a reference binds without question.
+	bool Emitter::isWholeVariable(const Expression& expression) const {
+		const Expression* root = &expression;
+		while (root->kind == ExpressionKind::Index) {
+			root = root->left.get();
+		}
+		if (root->kind != ExpressionKind::Identifier) {
+			return false;
+		}
+		if (root == &expression) {
+			return true;
+		}
+		const auto binding = _bindings.find(root->name);
+		return binding != _bindings.end() && binding->second.pointeeMsl.arrayLength
+			&& binding->second.pointeeMsl.vectorWidth <= 1 && binding->second.pointeeMsl.matrixColumns == 0
+			&& binding->second.pointeeMsl.namedType.empty();
+	}
+
 	// A name, an element or a member of one, with nothing in it that evaluating twice would repeat.
 	bool Emitter::isPlainVariable(const Expression& expression) const {
 		switch (expression.kind) {
@@ -5759,9 +5803,9 @@ namespace {
 		if (argument.kind == OverloadArgument::Kind::Variable) {
 			const Expression& root = storeRoot(expression);
 			const Binding* local = root.kind == ExpressionKind::Identifier ? findResourceBinding(root.name) : nullptr;
-			argument.changeable = local && !local->readOnly && !local->isBuffer && local->bufferPointeeType == InvalidId
-				&& local->storageClass == spirv::StorageClass::Function
-				&& !(expression.kind == ExpressionKind::Member && !structOf(*expression.left));
+			argument.inThread = local && !local->isBuffer && local->bufferPointeeType == InvalidId
+				&& local->storageClass == spirv::StorageClass::Function;
+			argument.changeable = argument.inThread && !local->readOnly;
 		}
 		return argument;
 	}
@@ -5781,6 +5825,10 @@ namespace {
 		}
 		if (type.isPointer || type.arrayLength) {
 			if (argument.kind != OverloadArgument::Kind::Array) {
+				if (argument.expression->kind == ExpressionKind::IntLiteral && argument.expression->intValue == 0) {
+					throw CompileError("a literal 0 chooses among overloads one of which takes a pointer; the "
+						"null pointer conversion is not lowered yet");
+				}
 				if (argument.pointerLike) {
 					throw CompileError("a pointer argument other than a local array (&x, a + n, a pointer or a "
 						"buffer) chooses among overloads, which is not lowered yet");
@@ -5792,18 +5840,31 @@ namespace {
 		}
 		if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
 			|| argument.pointerLike) {
+			if (declaredTypeOf(type) == _boolType) {
+				throw CompileError("a pointer or array argument chooses among overloads one of which takes a bool; "
+					"the pointer to bool conversion is not lowered yet");
+			}
 			return none;
 		}
 
 		const Id to = declaredTypeOf(type);
 		const Id from = _builder.typeOf(argument.value);
 		const bool enumArgument = argument.tag && !argument.tag->empty();
+		if (enumArgument && from != _intType) {
+			throw CompileError("an enum whose underlying type is not int chooses among overloads, which is not "
+				"lowered yet (it promotes to its own type)");
+		}
 		if (parameter.isMutableReference()) {
 			// A reference names its argument as it is: same type, a non-const local of this function.
 			return argument.changeable && from == to
 				&& type.enumName == (argument.tag ? *argument.tag : std::string()) ? exact(0) : none;
 		}
 		const int qualification = parameter.isReference ? 1 : -1;
+		// A reference to thread memory cannot bind a variable of another address space.
+		if (parameter.isReference && argument.kind == OverloadArgument::Kind::Variable && !argument.inThread
+			&& from == to && type.enumName == (argument.tag ? *argument.tag : std::string())) {
+			return none;
+		}
 		if (!type.enumName.empty()) {
 			return enumArgument && *argument.tag == type.enumName ? exact(qualification) : none;
 		}
@@ -11307,7 +11368,8 @@ namespace {
 		// A name the unit only declares stands for the declaration. Not a standard library
 		// redeclaration (a call to it is the builtin), and not a member, whose call
 		// resolves through its struct.
-		if (_options.linkageObject) {
+		// (In an executable too: a call resolved among several names must see it, and then refuse it.)
+		{
 			for (const FunctionDecl& helper: _unit.helpers) {
 				if (helper.body || helper.name.compare(0, stdlibPrefix.size(), stdlibPrefix) == 0
 					|| isMemberName(helper.name) || _overloadedNames.count(helper.name)) {
