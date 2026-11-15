@@ -10154,7 +10154,7 @@ namespace {
 		}
 		const Binding& sampler = samplerArgument(*arguments[0], kind, callName);
 		if (sampler.unnormalizedSampler) {
-			throw CompileError("gather through a coord::pixel sampler is not lowered: Vulkan allows no gather on an "
+			throw CompileError(callName + " through a coord::pixel sampler is not lowered: Vulkan allows no gather on an "
 				"unnormalized sampler");
 		}
 		const Id coordinate = samplingCoordinate(*arguments[1], kind, arrayed ? arguments[2].get() : nullptr, callName);
