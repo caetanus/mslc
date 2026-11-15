@@ -444,6 +444,23 @@ function(expect_library_refused label source needle)
 	set(output "${output}" PARENT_SCOPE)
 endfunction()
 
+# Function templates (#341): the helper that calls two instances is exported; the instances are not.
+set(template_spv "${OUT_DIR}/template_instances.spv")
+file(REMOVE "${template_spv}")
+run_mslc(output 0 --compile-library -o "${template_spv}" "${TEST_DIR}/library/template_instances.metal")
+validate_file("${template_spv}" spv1.5 TRUE "--compile-library on a helper that instantiates a template")
+disassemble("${template_spv}" template_dis)
+expect_contains("${template_dis}" "LinkageAttributes \"uses_template\" Export" "template instances")
+string(REGEX MATCHALL "LinkageAttributes" template_links "${template_dis}")
+list(LENGTH template_links template_link_count)
+if(NOT template_link_count EQUAL 1)
+	message(FATAL_ERROR "an instance of a template must not get a Linkage name, only the helper does:\n${template_dis}")
+endif()
+# An instance cannot import: the scan that orders imports before bodies runs before the instance exists.
+expect_library_refused(template_instance_import
+	"float outside(float x);\ntemplate <typename T> T viaoutside(T x) { return outside(x); }\nfloat uses(float x) { return viaoutside(x); }\n"
+	"importing from an instance of a template is not lowered")
+
 expect_library_refused(fwidth_export "float edge(float v) { return fwidth(v); }\n" "cannot be exported")
 expect_library_refused(implicit_lod_export
 	"float4 look(texture2d<float> t, sampler s, float2 uv) { return t.sample(s, uv); }\n" "cannot be exported")
