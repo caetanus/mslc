@@ -60,10 +60,11 @@ private:
 	std::map<ResourceKind, spirv::Id> _images;
 	std::map<ResourceKind, spirv::Id> _sampledImages;
 	spirv::Id _samplerType = spirv::InvalidId;
-	std::map<ScalarKind, spirv::Id> _storageImages;
+	std::map<std::pair<ResourceKind, ScalarKind>, spirv::Id> _storageImages;
 	std::map<ScalarKind, spirv::Id> _subpassImages;
 	bool _storageReadDeclared = false;
 	bool _storageWriteDeclared = false;
+	bool _image1DDeclared = false;
 
 	// A matrix member of a laid-out struct needs ColMajor and MatrixStride, which
 	// SPIR-V only allows on a struct member, so every struct with an Offset on a
@@ -99,11 +100,11 @@ public:
 	// src/iridium/air.cpp:771-785). The component type is not in the image type;
 	// a half texture's samples are narrowed after the lookup.
 	spirv::Id image(ResourceKind kind);
-	// The storage image (Sampled 2, format Unknown) an access::read or access::write
-	// texture2d is declared as, with a uint or a float sampled type; a half texture
+	// The storage image (Sampled 2, format Unknown) a texture of any access but
+	// sample is declared as, with a uint or a float sampled type; a half texture
 	// is a float image narrowed after the read, as for a sampled one. Iridium
 	// declares every non-sample texture this way (indium src/iridium/air.cpp:772).
-	spirv::Id storageImage(TextureAccess access, ScalarKind element);
+	spirv::Id storageImage(ResourceKind kind, TextureAccess access, ScalarKind element);
 	// An input attachment of the given sampled scalar, which is how Vulkan reads the
 	// framebuffer at the fragment's own pixel.
 	spirv::Id subpassImage(ScalarKind element);

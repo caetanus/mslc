@@ -36,14 +36,25 @@ const char* resourceKindName(ResourceKind kind) {
 	return "unknown";
 }
 
+const char* textureAccessName(TextureAccess access) {
+	switch (access) {
+		case TextureAccess::Sample: return "sample";
+		case TextureAccess::Write: return "write";
+		case TextureAccess::Read: return "read";
+		case TextureAccess::ReadWrite: return "read_write";
+	}
+
+	return "unknown";
+}
+
 std::string typeName(const Type& type) {
 	if (type.resource == ResourceKind::Sampler) {
 		return "sampler";
 	}
 	if (type.isTexture()) {
 		return std::string(resourceKindName(type.resource)) + "<" + scalarKindName(type.scalar)
-			+ (type.textureAccess == TextureAccess::Write ? ", access::write>"
-				: type.textureAccess == TextureAccess::Read ? ", access::read>" : ">");
+			+ (type.textureAccess == TextureAccess::Sample ? std::string(">")
+				: std::string(", access::") + textureAccessName(type.textureAccess) + ">");
 	}
 
 	std::string name = type.isAuto ? std::string("auto")
