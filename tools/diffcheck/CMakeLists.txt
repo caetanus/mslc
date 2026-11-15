@@ -19,3 +19,16 @@ if(DIFFCHECK_VULKAN_LIB AND DIFFCHECK_VULKAN_INCLUDE)
 else()
 	message(STATUS "diffcheck: no Vulkan loader or headers, the Vulkan host is not built")
 endif()
+
+if(APPLE)
+	enable_language(OBJCXX)
+	add_executable(diffcheck-metalhost ${DIFFCHECK_SRC}/metalhost.mm)
+	target_compile_options(diffcheck-metalhost PRIVATE -fobjc-arc)
+	target_link_libraries(diffcheck-metalhost PRIVATE "-framework Metal" "-framework Foundation")
+	add_test(NAME diffcheck/metalhost COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_metalhost_test.py
+		$<TARGET_FILE:diffcheck-metalhost> ${DIFFCHECK_TESTS}/diffcheck/fma_kernel.metal
+		${DIFFCHECK_TESTS}/diffcheck/struct_kernel.metal)
+	set_tests_properties(diffcheck/metalhost PROPERTIES SKIP_RETURN_CODE 77)
+else()
+	message(STATUS "diffcheck: not macOS, the Metal host is not built")
+endif()
