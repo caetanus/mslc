@@ -311,6 +311,10 @@ expect_contains("${overloads_dis}" "LinkageAttributes \"solo\" Export" "overload
 run_mslc(output 1 --compile-library -o "${OUT_DIR}/overload_import.spv" "${TEST_DIR}/library/overload_import.metal")
 expect_contains("${output}" "importing one overload of a name is not lowered yet" "overload import")
 
+# A declared-only function that only argument-dependent lookup finds is refused too (#266).
+run_mslc(output 1 --compile-library -o "${OUT_DIR}/adl_import.spv" "${TEST_DIR}/library/adl_import.metal")
+expect_contains("${output}" "finds it by argument-dependent lookup" "ADL import")
+
 # The helpers link with a real shader into a valid Vulkan executable.
 set(linked_helpers "${OUT_DIR}/linked_helpers.spv")
 file(REMOVE "${linked_helpers}")
