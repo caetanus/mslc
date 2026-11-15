@@ -24,6 +24,10 @@ bool isMSLBuiltinName(std::string_view name);
 FunctionDecl instantiateTemplate(const FunctionTemplate& declaration,
 	const std::vector<TemplateArgument>& arguments, bool withBody);
 
+// The default of template parameter "index", read under the arguments bound before it.
+TemplateArgument templateDefault(const FunctionTemplate& declaration, size_t index,
+	const std::vector<TemplateArgument>& bound);
+
 // Parses an MSL token stream into a translation unit.
 //
 // The subset covers what the target corpus needs: struct declarations, kernel,
@@ -204,6 +208,7 @@ private:
 	std::set<std::string> _dependentParameters;
 	bool namesDependentParameter(const std::string& name) const;
 	friend FunctionDecl instantiateTemplate(const FunctionTemplate&, const std::vector<TemplateArgument>&, bool);
+	friend TemplateArgument templateDefault(const FunctionTemplate&, size_t, const std::vector<TemplateArgument>&);
 	FunctionDecl parseInstance(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments,
 		bool withBody);
 	// Binds the parameters of a template in an outermost block: a type as a typedef, a constant

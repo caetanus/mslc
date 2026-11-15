@@ -1286,6 +1286,42 @@ FunctionDecl instantiateTemplate(const FunctionTemplate& declaration,
 	}
 }
 
+TemplateArgument templateDefault(const FunctionTemplate& declaration, size_t index,
+	const std::vector<TemplateArgument>& bound) {
+	const TemplateParameter& parameter = declaration.parameters.at(index);
+	const std::string what = "the default argument of the template parameter \"" + parameter.name + "\" of \""
+		+ declaration.name + "\"";
+	Parser parser(parameter.defaultTokens);
+	parser.restoreNames(*Parser::namesAt(declaration));
+	const Parser::LocalScope scope(parser);
+	// Only the parameters before this one are in scope.
+	FunctionTemplate earlier;
+	earlier.name = declaration.name;
+	earlier.parameters.assign(declaration.parameters.begin(), declaration.parameters.begin() + index);
+	parser.bindTemplateArguments(earlier, std::vector<TemplateArgument>(bound.begin(), bound.begin() + index));
+	TemplateArgument result;
+	result.isType = parameter.isType;
+	try {
+		if (parameter.isType) {
+			result.type = parser.parseType();
+			if (result.type.isPointer || result.type.arrayLength || result.type.resource != ResourceKind::None
+				|| !result.type.enumName.empty() || result.type.addressSpace != AddressSpace::None) {
+				throw CompileError("that is a pointer, an array, a resource, an enum or in an address space");
+			}
+		} else {
+			const ExpressionPtr expression = parser.parseAssignment();
+			result.value = expression->kind == ExpressionKind::BoolLiteral ? (expression->boolValue ? 1 : 0)
+				: parser.evaluateConstant(*expression, false);
+		}
+		if (!parser.at(TokenKind::EndOfFile)) {
+			throw CompileError("unexpected \"" + std::string(parser.current().text) + "\"");
+		}
+	} catch (const CompileError& error) {
+		throw CompileError(what + " is not lowered: " + error.what());
+	}
+	return result;
+}
+
 // One explicit template argument: a type, or an integer constant that stops at the "," or ">"
 // that ends it (a larger expression needs parentheses, as in C++).
 TemplateArgument Parser::parseTemplateArgument() {
