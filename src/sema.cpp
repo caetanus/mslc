@@ -464,6 +464,18 @@ namespace {
 			&& !expression.constructType->isMatrix() && expression.arguments.size() == 1;
 	}
 
+	// An expression of type void: a cast to void, a conditional whose arms are both
+	// void, or a comma whose last operand is.
+	static bool isVoidValued(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::Construct: return isVoidCast(expression);
+			case ExpressionKind::Comma: return isVoidValued(*expression.right);
+			case ExpressionKind::Conditional:
+				return isVoidValued(*expression.arguments.at(0)) && isVoidValued(*expression.arguments.at(1));
+			default: return false;
+		}
+	}
+
 	const MathBuiltin* findMathBuiltin(const std::string& name) {
 		for (const MathBuiltin& builtin: kMathBuiltins) {
 			if (name == builtin.name) {
@@ -5836,7 +5848,10 @@ namespace {
 
 		if (returnsVoid(*_helper)) {
 			if (statement.expression) {
-				throw CompileError(quoted + " returns void, so its return cannot carry a value");
+				if (!isVoidValued(*statement.expression)) {
+					throw CompileError(quoted + " returns void, so its return cannot carry a value");
+				}
+				emitExpressionStatement(*statement.expression);
 			}
 
 			terminate(spirv::OpReturn, { });
@@ -8913,8 +8928,13 @@ namespace {
 		}
 
 		if (_outputs.empty()) {
-			throw CompileError("\"" + _entryPoint->name + "\" returns void, so its return "
-				"cannot carry a value");
+			if (!isVoidValued(*statement.expression)) {
+				throw CompileError("\"" + _entryPoint->name + "\" returns void, so its return "
+					"cannot carry a value");
+			}
+			emitExpressionStatement(*statement.expression);
+			terminate(spirv::OpReturn, { });
+			return;
 		}
 
 		const Id value = emitExpression(*statement.expression);
@@ -9998,6 +10018,26 @@ namespace {
 		if (expression.kind == ExpressionKind::Comma) {
 			emitExpressionStatement(*expression.left);
 			emitExpressionStatement(*expression.right);
+			return;
+		}
+
+		// c ? (void)a : (void)b has no value, so it runs as the if it stands for.
+		if (expression.kind == ExpressionKind::Conditional && isVoidValued(expression)) {
+			const Id condition = asCondition(emitExpression(*expression.left));
+			const Id thenLabel = _builder.nextId();
+			const Id elseLabel = _builder.nextId();
+			const Id mergeLabel = _builder.nextId();
+			_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
+			terminate(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
+
+			const ControlDepthScope depth(_controlDepth);
+			beginBlock(thenLabel);
+			emitExpressionStatement(*expression.arguments.at(0));
+			branchUnlessTerminated(mergeLabel);
+			beginBlock(elseLabel);
+			emitExpressionStatement(*expression.arguments.at(1));
+			branchUnlessTerminated(mergeLabel);
+			beginBlock(mergeLabel);
 			return;
 		}
 
