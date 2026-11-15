@@ -401,6 +401,8 @@ struct Statement {
 	// are unreachable, as C++ says, and the preamble is where they are kept.
 	std::vector<SwitchCase> switchCases;
 	std::vector<StatementPtr> switchPreamble;
+	// The last case of a nested switch ends in [[fallthrough]];, which falls out of the switch.
+	bool switchFallsOut = false;
 
 	size_t line = 0;
 };

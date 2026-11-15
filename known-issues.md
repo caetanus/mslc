@@ -236,3 +236,25 @@ Refusals, not miscompiles; each fails with a diagnostic.
 - A member with a user constructor, `struct OC { Ctor k; float c; }; OC o{1.0f, 2.0f};`: Apple calls
   `Ctor(float)`; mslc rejects brace initialisation involving declared constructors.
 - A member struct with an array member reached by elision is rejected as not lowered (arrays: #131).
+
+## [[fallthrough]] placement: two shapes still differ from Apple (#355)
+
+The placement check follows a marker through nested blocks, `if` branches and nested
+switches (see `endsWithFallthrough` in `src/parser.cpp`). Two shapes still differ from
+Apple, both the same as before that change:
+
+- A marker before the first case label, inside a loop (`switch (i) { for (...) { [[fallthrough]]; } case 9: ... }`):
+  Apple rejects, mslc accepts. Statements in a switch preamble are not checked at all.
+- A marker after something that always jumps, but is not a plain `return`/`break`/`continue`
+  (`if (c) { return; } else { return; } [[fallthrough]]; x = 1u;`, or `while (true) { ... } [[fallthrough]]; x = 1u;`):
+  Apple accepts because the marker is unreachable, mslc rejects. Only a direct `return`,
+  `break` or `continue` earlier in the same block makes a marker unreachable here.
+
+Also unchanged from before #355, found by comparing 224 generated switch programs with Apple:
+
+- Shapes where a marker is made unreachable inside a nested block or an `if` and a statement
+  follows the block: `case 0: if (c) { break; [[fallthrough]]; } x = 1u;`,
+  `return; if (c) { [[fallthrough]]; } x = 1u;`, `return; [[fallthrough]]; if (c) { [[fallthrough]]; }`.
+  Apple rejects, mslc accepts.
+- `return; switch (y) { case 1: x = 1u; [[fallthrough]]; }` before an outer label (the inner
+  switch's marker after a jump): Apple accepts, mslc rejects.

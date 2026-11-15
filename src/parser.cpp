@@ -4164,6 +4164,138 @@ StatementPtr Parser::parseDoWhileStatement() {
 	return statement;
 }
 
+// A statement that does nothing: a null statement or a block of them.
+static bool isEmptyStatement(const Statement& statement) {
+	if (statement.kind == StatementKind::ExpressionStatement) {
+		return !statement.expression && !statement.isFallthrough;
+	}
+	return statement.kind == StatementKind::Compound
+		&& std::all_of(statement.children.begin(), statement.children.end(),
+			[](const StatementPtr& child) { return isEmptyStatement(*child); });
+}
+
+// Control never reaches the statement after one of these, and Apple ignores a marker there
+// (discard_fragment() does not count: Apple still checks what follows it).
+static bool leavesTheBlock(const Statement& statement) {
+	return statement.kind == StatementKind::Return || statement.kind == StatementKind::Break
+		|| statement.kind == StatementKind::Continue;
+}
+
+[[noreturn]] static void rejectFallthroughPlacement() {
+	throw CompileError("fallthrough annotation does not directly precede switch label");
+}
+
+// Whether a [[fallthrough]]; is anywhere in this statement, reachable or not.
+static bool containsFallthrough(const Statement& statement) {
+	switch (statement.kind) {
+		case StatementKind::ExpressionStatement:
+			return statement.isFallthrough;
+		case StatementKind::Compound:
+			return std::any_of(statement.children.begin(), statement.children.end(),
+				[](const StatementPtr& child) { return containsFallthrough(*child); });
+		case StatementKind::If:
+			return containsFallthrough(*statement.thenBranch)
+				|| (statement.elseBranch && containsFallthrough(*statement.elseBranch));
+		case StatementKind::For:
+			return containsFallthrough(*statement.forBody);
+		case StatementKind::While:
+			return containsFallthrough(*statement.whileBody);
+		case StatementKind::Switch:
+			return statement.switchFallsOut;
+		default:
+			return false;
+	}
+}
+
+// What the statements after a jump have shown so far: a marker was seen (only the last marker
+// of the run is ignored), and a marker was seen on the way to here (so what follows must flow
+// plainly on to the label).
+struct UnreachableRun {
+	bool seenMarker = false;
+	bool afterMarker = false;
+};
+
+// A statement after a jump. Apple ignores a marker there, except that only the last marker of
+// such a run is ignored, it still has to reach the label through plain statements (no jump,
+// loop, switch or if with an else after it), and a marker in a loop body is an error whether it
+// is reached or not.
+static void checkUnreachable(const Statement& statement, UnreachableRun& run) {
+	const bool branches = statement.kind == StatementKind::For || statement.kind == StatementKind::While
+		|| statement.kind == StatementKind::Switch
+		|| (statement.kind == StatementKind::If && statement.elseBranch);
+	if (run.afterMarker && (branches || leavesTheBlock(statement))) rejectFallthroughPlacement();
+	switch (statement.kind) {
+		case StatementKind::ExpressionStatement:
+			if (statement.isFallthrough) {
+				if (run.seenMarker) rejectFallthroughPlacement();
+				run.seenMarker = run.afterMarker = true;
+			}
+			return;
+		case StatementKind::Compound:
+			for (const StatementPtr& child: statement.children) checkUnreachable(*child, run);
+			return;
+		case StatementKind::If: {
+			// A jump in a branch leaves only that branch, so a branch starts without the
+			// "after a marker" demand and the if as a whole carries a marker out of either.
+			UnreachableRun inThen{ run.seenMarker, false };
+			UnreachableRun inElse{ run.seenMarker, false };
+			checkUnreachable(*statement.thenBranch, inThen);
+			if (statement.elseBranch) checkUnreachable(*statement.elseBranch, inElse);
+			run.seenMarker = inThen.seenMarker || inElse.seenMarker;
+			run.afterMarker = run.afterMarker || inThen.afterMarker || inElse.afterMarker;
+			return;
+		}
+		default:
+			if (containsFallthrough(statement)) rejectFallthroughPlacement();
+			return;
+	}
+}
+
+// Whether a [[fallthrough]]; inside this statement is the last thing it does, so that
+// control leaves the statement straight from the marker. A marker anywhere else, or in a
+// loop (whose body goes back to the head, not on to a label), is an error.
+static bool endsWithFallthrough(const Statement& statement) {
+	const auto reject = rejectFallthroughPlacement;
+	switch (statement.kind) {
+		case StatementKind::ExpressionStatement:
+			return statement.isFallthrough;
+		case StatementKind::Compound: {
+			bool ends = false;
+			UnreachableRun run;
+			bool jumped = false;
+			for (const StatementPtr& child: statement.children) {
+				if (jumped) {
+					checkUnreachable(*child, run);
+					continue;
+				}
+				if (ends && !isEmptyStatement(*child)) reject();
+				if (leavesTheBlock(*child)) {
+					jumped = true;
+					continue;
+				}
+				ends = ends || endsWithFallthrough(*child);
+			}
+			return ends;
+		}
+		case StatementKind::If: {
+			const bool inThen = endsWithFallthrough(*statement.thenBranch);
+			const bool inElse = statement.elseBranch && endsWithFallthrough(*statement.elseBranch);
+			return inThen || inElse;
+		}
+		case StatementKind::For:
+			if (containsFallthrough(*statement.forBody)) reject();
+			return false;
+		case StatementKind::While:
+			if (containsFallthrough(*statement.whileBody)) reject();
+			return false;
+		case StatementKind::Switch:
+			// A marker ending the last case of this switch falls out of it.
+			return statement.switchFallsOut;
+		default:
+			return false;
+	}
+}
+
 // A switch parses into a flat list of labels, each holding the statements up
 // to the next label: the block structure the lowering wants is one block per
 // label, branching to the next for a fall-through. Statements before the first
@@ -4194,15 +4326,9 @@ StatementPtr Parser::parseSwitchStatement() {
 
 	SwitchCase* kase = nullptr;
 	bool markerPending = false;
+	bool unreachable = false;
+	UnreachableRun unreachableRun;
 	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
-		// A [[fallthrough]]; directly in a case has to be the last statement before
-		// the next label, as Apple requires.
-		// A null statement between the marker and the label does not count, as in Apple.
-		if (markerPending && !atKeyword("case") && !atKeyword("default") && !at(TokenKind::Semicolon)) {
-			throw CompileError("fallthrough annotation does not directly precede switch label");
-		}
-		const bool carriedMarker = markerPending;
-		markerPending = false;
 		if (atKeyword("case")) {
 			advance();
 			SwitchCase next;
@@ -4211,6 +4337,9 @@ StatementPtr Parser::parseSwitchStatement() {
 			expect(TokenKind::Colon, "after a case value");
 			statement->switchCases.push_back(std::move(next));
 			kase = &statement->switchCases.back();
+			markerPending = false;
+			unreachable = false;
+			unreachableRun = UnreachableRun();
 			continue;
 		}
 		if (atKeyword("default")) {
@@ -4220,19 +4349,44 @@ StatementPtr Parser::parseSwitchStatement() {
 			expect(TokenKind::Colon, "after 'default'");
 			statement->switchCases.push_back(std::move(next));
 			kase = &statement->switchCases.back();
+			markerPending = false;
+			unreachable = false;
+			unreachableRun = UnreachableRun();
 			continue;
 		}
 
+		// A [[fallthrough]]; has to reach the next label with nothing in between, as Apple
+		// requires: it may end a nested block or an if branch, but not be followed by a
+		// statement, and a loop body never reaches a label. Null statements and empty
+		// blocks do not count.
 		std::vector<StatementPtr>& into = kase ? kase->body : statement->switchPreamble;
+		const size_t before = into.size();
 		appendStatement(into);
-		const Statement* added = into.empty() ? nullptr : into.back().get();
-		markerPending = added && (added->isFallthrough
-			|| (carriedMarker && added->kind == StatementKind::ExpressionStatement && !added->expression));
+		for (size_t index = before; index < into.size(); ++index) {
+			const Statement& added = *into[index];
+			// Nothing after a jump, and nothing before the first label, is reached.
+			if (!kase) continue;
+			if (unreachable) {
+				checkUnreachable(added, unreachableRun);
+				continue;
+			}
+			if (markerPending && !isEmptyStatement(added)) {
+				throw CompileError("fallthrough annotation does not directly precede switch label");
+			}
+			if (leavesTheBlock(added)) {
+				unreachable = true;
+				continue;
+			}
+			markerPending = markerPending || endsWithFallthrough(added);
+		}
 	}
 
-	if (markerPending) {
+	// In a nested switch the marker falls out to whatever follows the switch, which the
+	// enclosing switch checks; in the outermost one no label can follow it.
+	if (markerPending && _switchDepth == 1) {
 		throw CompileError("fallthrough annotation does not directly precede switch label");
 	}
+	statement->switchFallsOut = markerPending;
 	expect(TokenKind::RBrace, "to close a switch body");
 
 	return statement;
