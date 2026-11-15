@@ -2658,6 +2658,8 @@ namespace {
 		std::optional<Type> placeType(const Expression& place);
 		bool isVectorPlace(const Expression& place);
 		bool isVectorComponent(const Expression& place);
+		bool bindsTemporary(const Expression& place);
+		std::optional<Type> computedPartType(const Expression& part);
 		Id constantReferenceArgument(const Expression& argument, const Parameter& parameter,
 			const std::string& function, size_t position, Id prepared);
 		HelperFunction* definedHelper(HelperFunction* entry);
@@ -6774,8 +6776,7 @@ namespace {
 			throw CompileError(what + " has to be a variable, an element or a member: parameter \""
 				+ parameter.name + "\" is a reference to it");
 		}
-		rejectPlaceThroughConditional(argument, "passing by reference");
-		if (isTemporaryPart(argument)) {
+		if (bindsTemporary(argument)) {
 			throw CompileError("no matching function for call to \"" + function + "\": " + what
 				+ " is a temporary, which parameter \"" + parameter.name + "\" cannot bind as a reference");
 		}
@@ -6783,6 +6784,7 @@ namespace {
 			throw CompileError(what + " is a component of a vector, which a reference parameter cannot "
 				"name (Apple refuses it too)");
 		}
+		rejectPlaceThroughConditional(argument, "passing by reference");
 
 		const Expression& root = storeRoot(argument);
 		if (root.kind == ExpressionKind::Identifier) {
@@ -6893,6 +6895,49 @@ namespace {
 	bool Emitter::isVectorPlace(const Expression& place) {
 		const std::optional<Type> type = placeType(place);
 		return type && !type->arrayLength && type->vectorWidth > 1 && !type->isMatrix();
+	}
+
+	// The type of a member or element chain of a computed value, by the struct declarations alone.
+	std::optional<Type> Emitter::computedPartType(const Expression& part) {
+		if (part.kind == ExpressionKind::Member) {
+			const StructDecl* decl = structOf(*part.left);
+			std::string name;
+			const size_t field = decl ? fieldIndexOf(*decl, part.memberName, name) : 0;
+			return decl && field != decl->fields.size() ? std::optional<Type>(decl->fields[field].type)
+				: std::nullopt;
+		}
+		if (part.kind != ExpressionKind::Index) {
+			return std::nullopt;
+		}
+		std::optional<Type> type = computedPartType(*part.left);
+		if (!type) {
+			return std::nullopt;
+		}
+		if (type->arrayLength) {
+			type->dropOuterDimension();
+		} else if (type->isMatrix()) {
+			type->matrixColumns = 0;
+		} else {
+			return std::nullopt;
+		}
+		return type;
+	}
+
+	// A member or element of a temporary that a reference cannot bind. A column of a matrix is left
+	// out: Metal's matrix operator[] gives an lvalue even for a prvalue, so Apple takes that.
+	bool Emitter::bindsTemporary(const Expression& place) {
+		if (!isTemporaryPart(place)) {
+			return false;
+		}
+		for (const Expression* node = &place; node->kind == ExpressionKind::Member
+			|| node->kind == ExpressionKind::Index; node = node->left.get()) {
+			const std::optional<Type> base = node->kind == ExpressionKind::Index
+				? computedPartType(*node->left) : std::nullopt;
+			if (base && !base->arrayLength && base->isMatrix()) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	// A component of a vector (v.x, v[1], m[1][0]), which no reference binds (Apple refuses it too).
@@ -10554,6 +10599,11 @@ namespace {
 			_builder.emit(spirv::OpStore, { variable, value });
 			bindLocal(declaration.name, variable, _builder.typeOf(value), referenced);
 			return;
+		}
+		if (bindsTemporary(place) && !declaration.type.isConst
+			&& declaration.type.addressSpace != AddressSpace::Constant) {
+			throw CompileError("the reference \"" + declaration.name + "\" is bound to a member or element of "
+				"a temporary, which a non-const reference cannot bind (Apple refuses it too)");
 		}
 		rejectPlaceThroughConditional(place, "binding a reference to");
 

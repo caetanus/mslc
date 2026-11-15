@@ -388,3 +388,19 @@ Apple accepts the first four, which are refused loudly. It also rejects the last
   says `&` is not supported.
 - `S{1,2} += S{1,2}`: Apple rejects it too and names the operator ("no viable overloaded '+='");
   mslc says "no viable overloaded compound assignment" for a S temporary.
+
+## Wording gaps on references to members of temporaries (#251)
+
+Every form here is refused, and none is a wrong accept; only the reason differs from Apple's.
+
+- `thread float& r = (c ? s : S{1,2}).v.x;` and the `(c ? S{1,2} : s)` form (d6/d7), and the same as an
+  argument: mslc names the vector component, Apple says it cannot bind a temporary.
+- `sw(Q{}.m[0])` and `sw(mkq().m[1])` with `void sw(thread float2&)` (z3/z11): Apple accepts them, since a
+  matrix `operator[]` gives an lvalue even on a prvalue; mslc says "a member or an index has to start at a
+  name mslc knows". Binding a reference to such a column (`thread float2& r = Q{}.m[0];`) says "a place
+  mslc cannot name", and through a conditional it names the conditional.
+- `constant int& r = S{1,2}.a;` and the other address-space refusals (y10, y11, y31, y38): Apple says the
+  binding "changes address space"; mslc says "a place mslc cannot name" or names the space.
+- Arms that are constant buffers in a conditional (x15) and x27 from the same measurement table.
+- `one(ds[0].a)` for a `device` buffer element (x14): Apple takes the argument's space as the reason,
+  mslc words it as a variable that is not of this function.
