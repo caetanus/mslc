@@ -1745,6 +1745,17 @@ std::vector<std::string_view> Parser::kindsOf(const std::string& name) const {
 	return kinds;
 }
 
+// A function or a variable of a name hides a struct or enum tag of that name, so
+// "S(...)" and "S{...}" name the object and not the type ([basic.scope.hiding]).
+bool Parser::objectHidesTag(const std::string& name) const {
+	for (const std::string_view kindName : kindsOf(name)) {
+		if (kindName == "function" || kindName == "variable") {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool Parser::conflictsWithUsing(const std::string& own, const std::vector<std::string_view>& ownKinds,
 	const std::string& target, const FunctionDecl* function, bool wideTagExemption) const {
 	const auto named = [&](const std::string& name, const auto& visit) {
@@ -3959,7 +3970,7 @@ StatementPtr Parser::parseStatement() {
 			&& (_unit.findStruct(name) != nullptr
 				|| (resolveTypeName(name, typedefOf) && _unit.findStruct(typedefOf.namedType) != nullptr));
 		const bool looksLikeType = !bracedTemporary &&
-			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && (resolveTypeName(name, probe)
+			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
 				|| (_unit.findStruct(name) != nullptr && !localHidesStruct)))
 			|| (kind() == TokenKind::Identifier && (isIntegerSpecifier(current().text) || current().text == "auto"))
@@ -4300,7 +4311,7 @@ StatementPtr Parser::parseForStatement() {
 		const bool looksLikeType = (kind() == TokenKind::Identifier
 				&& (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-				&& (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct)));
+				&& !objectHidesTag(name) && (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct)));
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
@@ -5291,7 +5302,8 @@ ExpressionPtr Parser::parsePrimary() {
 		const std::string_view text = resolved;
 
 		Type type;
-		if (resolveTypeName(text, type) && type.namedType.empty()) {
+		const bool tagHidden = objectHidesTag(resolved);
+		if (!tagHidden && resolveTypeName(text, type) && type.namedType.empty()) {
 			// A type name in expression position constructs a value: float(x),
 			// float3(0), float4(a, b, c, 1). T(...) is a constructor call, and the
 			// parenthesised part is a list of arguments; (T)x is parseCast's.
@@ -5319,7 +5331,7 @@ ExpressionPtr Parser::parsePrimary() {
 			&& _unit.findStruct(aliased.namedType)) {
 			braced = aliased.namedType;
 		}
-		if ((fileScoped || !isLocal(resolved)) && _unit.findStruct(braced) && lookahead(spelledTokens).kind == TokenKind::LBrace) {
+		if (!tagHidden && (fileScoped || !isLocal(resolved)) && _unit.findStruct(braced) && lookahead(spelledTokens).kind == TokenKind::LBrace) {
 			consumeName();
 			ExpressionPtr list = parseInitializerList();
 			Type type;
@@ -5329,7 +5341,7 @@ ExpressionPtr Parser::parsePrimary() {
 		}
 
 		// A struct's name and an argument list call its constructor.
-		if ((fileScoped || !isLocal(resolved)) && _constructors.count(resolved) && lookahead(spelledTokens).kind == TokenKind::LParen) {
+		if (!tagHidden && (fileScoped || !isLocal(resolved)) && _constructors.count(resolved) && lookahead(spelledTokens).kind == TokenKind::LParen) {
 			const size_t atLine = line();
 			consumeName();
 			advance();
