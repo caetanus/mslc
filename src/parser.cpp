@@ -9,6 +9,9 @@
 namespace mslc {
 
 namespace {
+	// Thrown to stop a re-read of the file where a template's declaration ends.
+	struct StopParsing {};
+
 	constexpr const char* kStdlibNamespace = "metal";
 	constexpr const char* kAnonymousNamespace = "(anonymous namespace)";
 
@@ -404,6 +407,21 @@ size_t Parser::line() const {
 	return current().line;
 }
 
+std::shared_ptr<const Parser::Names> Parser::namesAt(const FunctionTemplate& declaration) {
+	if (!declaration.names) {
+		Parser replay(*declaration.file);
+		replay._stopAt = declaration.endAt;
+		try {
+			while (!replay.at(TokenKind::EndOfFile)) {
+				replay.parseDeclaration();
+			}
+		} catch (const StopParsing&) {
+		}
+		declaration.names = replay.captureNames();
+	}
+	return std::static_pointer_cast<const Names>(declaration.names);
+}
+
 TranslationUnit Parser::parse() {
 	while (!at(TokenKind::EndOfFile)) {
 		parseDeclaration();
@@ -488,6 +506,9 @@ void Parser::parseDeclaration() {
 
 	if (atKeyword("template")) {
 		parseTemplateDeclaration();
+		if (_position == _stopAt) {
+			throw StopParsing();
+		}
 		return;
 	}
 
@@ -833,6 +854,40 @@ void Parser::skipBalanced(TokenKind open, TokenKind close) {
 	throw CompileError("unbalanced brackets in a template declaration");
 }
 
+std::shared_ptr<const Parser::Names> Parser::captureNames() const {
+	auto names = std::make_shared<Names>();
+	names->typedefs = _typedefs;
+	names->enumTypes = _enumTypes;
+	names->enumConstants = _enumConstants;
+	names->enumUnderlying = _enumUnderlying;
+	names->declared = _declared;
+	names->declaredBesideTag = _declaredBesideTag;
+	names->namespacePath = _namespacePath;
+	names->namespaces = _namespaces;
+	names->namespaceAliases = _namespaceAliases;
+	names->scopes = _scopes;
+	names->structs = _unit.structs;
+	names->functionTemplates = _unit.functionTemplates;
+	names->constructors = _constructors;
+	return names;
+}
+
+void Parser::restoreNames(const Names& names) {
+	_typedefs = names.typedefs;
+	_enumTypes = names.enumTypes;
+	_enumConstants = names.enumConstants;
+	_enumUnderlying = names.enumUnderlying;
+	_declared = names.declared;
+	_declaredBesideTag = names.declaredBesideTag;
+	_namespacePath = names.namespacePath;
+	_namespaces = names.namespaces;
+	_namespaceAliases = names.namespaceAliases;
+	_scopes = names.scopes;
+	_unit.structs = names.structs;
+	_unit.functionTemplates = names.functionTemplates;
+	_constructors = names.constructors;
+}
+
 // The parameters of a template, from the "<" to the ">" that closes them.
 void Parser::parseTemplateHeader(FunctionTemplate& declaration) {
 	expect(TokenKind::Less, "to open a template parameter list");
@@ -1077,6 +1132,190 @@ void Parser::parseTemplateDeclaration() {
 		return;
 	}
 	_unit.templates.push_back(std::move(declaration));
+}
+
+// Binds the template's parameters in the innermost block: a type is a typedef, a constant an
+// enumerator-like value, each under a key no spelling in the source can reach, and the
+// parameter's own name is mapped to it as a using declaration is, so a local of that name in a
+// nested block still hides it.
+void Parser::bindTemplateArguments(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments) {
+	if (arguments.size() != declaration.parameters.size()) {
+		throw CompileError("the template \"" + declaration.name + "\" takes " + std::to_string(declaration.parameters.size())
+			+ " arguments, and " + std::to_string(arguments.size()) + " are bound");
+	}
+	for (size_t i = 0; i < arguments.size(); ++i) {
+		const TemplateParameter& parameter = declaration.parameters[i];
+		const TemplateArgument& argument = arguments[i];
+		if (argument.isType != parameter.isType) {
+			throw CompileError("the template argument for \"" + parameter.name + "\" of \"" + declaration.name
+				+ "\" has to be " + (parameter.isType ? "a type" : "a constant"));
+		}
+		if (parameter.name.empty()) {
+			continue;
+		}
+		const std::string key = "<template " + parameter.name + ">";
+		if (parameter.isType) {
+			_typedefs[key] = argument.type;
+		} else if (!argument.unbound) {
+			_enumConstants[key] = EnumConstant { argument.value, parameter.kind, std::string() };
+		}
+		_blocks.back().names[parameter.name] = key;
+	}
+}
+
+// One instance of a template as a helper. The declaration's tokens are the whole input.
+FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments,
+	bool withBody) {
+	restoreNames(*namesAt(declaration));
+	const LocalScope templateScope(*this);
+	bindTemplateArguments(declaration, arguments);
+
+	const auto skipAttributes = [&] {
+		while (atKeyword("__attribute__") && lookahead().kind == TokenKind::LParen) {
+			advance();
+			skipBalanced(TokenKind::LParen, TokenKind::RParen);
+		}
+	};
+	FunctionDecl decl;
+	decl.line = declaration.line;
+	decl.name = declaration.name;
+	decl.order = declaration.bodyOrder;
+	decl.globalsBefore = declaration.globalsBefore;
+	const std::string quoted = "function template \"" + declaration.name + "\"";
+
+	for (;;) {
+		skipAttributes();
+		if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
+			advance();
+			continue;
+		}
+		break;
+	}
+	if (at(TokenKind::LBracket)) {
+		throw CompileError("an attribute in the declaration of " + quoted + " is not lowered yet");
+	}
+	if (atKeyword("auto")) {
+		throw CompileError("a trailing return type on " + quoted + " is not lowered yet");
+	}
+	decl.returnType = parseType();
+	rejectUnloweredReturn(decl.returnType, quoted);
+	const std::string written = declaration.name.substr(declaration.name.rfind("::") == std::string::npos
+		? 0 : declaration.name.rfind("::") + 2);
+	if (kind() != TokenKind::Identifier || current().text != written) {
+		throw CompileError("the declaration of " + quoted + " is not a return type and a name that mslc reads "
+			"when it is instantiated (found \"" + std::string(current().text) + "\" where its name is)");
+	}
+	advance();
+	if (at(TokenKind::LBracket)) {
+		throw CompileError("an attribute in the declaration of " + quoted + " is not lowered yet");
+	}
+	expect(TokenKind::LParen, "to open the parameters of a function template");
+
+	const LocalScope parameters(*this);
+	_parameterBlock = _blocks.size() - 1;
+	const size_t parametersFrom = _position;
+	parseHelperParameters(decl, quoted);
+	// A parameter is dependent when the tokens that declare it name a template parameter.
+	{
+		size_t index = 0;
+		bool dependent = false;
+		int depth = 0;
+		for (size_t i = parametersFrom; i + 1 < _position; ++i) {
+			const Token& token = _tokens[i];
+			if (token.kind == TokenKind::LParen || token.kind == TokenKind::LBracket || token.kind == TokenKind::Less) {
+				++depth;
+			} else if (token.kind == TokenKind::RParen || token.kind == TokenKind::RBracket || token.kind == TokenKind::Greater) {
+				--depth;
+			}
+			if (token.kind == TokenKind::Comma && depth == 0) {
+				if (dependent && index < decl.parameters.size()) {
+					_dependentParameters.insert(decl.parameters[index].name);
+				}
+				++index;
+				dependent = false;
+			} else if (token.kind == TokenKind::Identifier) {
+				for (const TemplateParameter& parameter: declaration.parameters) {
+					dependent = dependent || (!parameter.name.empty() && parameter.name == token.text);
+				}
+			}
+		}
+		if (dependent && index < decl.parameters.size()) {
+			_dependentParameters.insert(decl.parameters[index].name);
+		}
+	}
+	// A struct the template's own tokens name has to be declared above it; one an argument brings is not
+	// looked up here (sema sees every struct, so it cannot tell the two apart).
+	std::set<std::string> bound;
+	for (const TemplateArgument& argument: arguments) {
+		bound.insert(argument.type.namedType);
+	}
+	const auto declared = [&](const Type& type) {
+		if (!type.namedType.empty() && !_unit.findStruct(type.namedType) && !bound.count(type.namedType)) {
+			throw CompileError("unknown type name \"" + type.namedType + "\" in the declaration of " + quoted);
+		}
+	};
+	declared(decl.returnType);
+	for (const Parameter& parameter: decl.parameters) {
+		declared(parameter.type);
+	}
+	skipAttributes();
+	if (at(TokenKind::LBracket)) {
+		throw CompileError("attributes on " + quoted + " are not lowered yet");
+	}
+	if (at(TokenKind::Arrow)) {
+		throw CompileError("a trailing return type on " + quoted + " is not lowered yet");
+	}
+	if (!withBody || match(TokenKind::Semicolon)) {
+		return decl;
+	}
+	decl.body = parseCompoundStatement(true);
+	if (!at(TokenKind::EndOfFile)) {
+		throw CompileError("unexpected \"" + std::string(current().text) + "\" after the body of " + quoted);
+	}
+	return decl;
+}
+
+FunctionDecl instantiateTemplate(const FunctionTemplate& declaration,
+	const std::vector<TemplateArgument>& arguments, bool withBody) {
+	Parser parser(declaration.tokens);
+	try {
+		return parser.parseInstance(declaration, arguments, withBody);
+	} catch (const CompileError& error) {
+		throw CompileError("in the function template \"" + declaration.name + "\" (declared at line "
+			+ std::to_string(declaration.line) + "), which a call instantiates: " + error.what());
+	}
+}
+
+// One explicit template argument: a type, or an integer constant that stops at the "," or ">"
+// that ends it (a larger expression needs parentheses, as in C++).
+TemplateArgument Parser::parseTemplateArgument() {
+	TemplateArgument argument;
+	Type probe;
+	size_t nameTokens = 0;
+	const bool named = kind() == TokenKind::Identifier || at(TokenKind::ColonColon);
+	const std::string name = named ? peekResolved(nameTokens) : std::string();
+	const bool localHides = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon && isLocal(name);
+	const bool isTypeArgument = (named && (resolveTypeName(name, probe) || isTypeQualifier(name)
+			|| (_unit.findStruct(name) != nullptr && !localHides)))
+		|| (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text));
+	if (isTypeArgument) {
+		argument.type = parseType();
+		if (argument.type.isPointer || argument.type.arrayLength || argument.type.resource != ResourceKind::None
+			|| !argument.type.enumName.empty() || argument.type.addressSpace != AddressSpace::None) {
+			throw CompileError("a template argument that is a pointer, an array, a resource, an enum or in an "
+				"address space is not lowered");
+		}
+		return argument;
+	}
+	argument.isType = false;
+	const ExpressionPtr value = parseAdditive();
+	if (!at(TokenKind::Comma) && !at(TokenKind::Greater)) {
+		throw CompileError("this template argument is not lowered: a constant that is more than an arithmetic "
+			"expression needs parentheses");
+	}
+	argument.value = value->kind == ExpressionKind::BoolLiteral ? (value->boolValue ? 1 : 0)
+		: evaluateConstant(*value, false);
+	return argument;
 }
 
 bool Parser::tryParseHelperFunction() {
@@ -1955,6 +2194,15 @@ const std::string* Parser::blockName(const std::string& name) const {
 		}
 	}
 	return nullptr;
+}
+
+bool Parser::namesDependentParameter(const std::string& name) const {
+	for (size_t i = _blocks.size(); i-- > 0;) {
+		if (_blocks[i].names.count(name)) {
+			return i == _parameterBlock && _dependentParameters.count(name);
+		}
+	}
+	return false;
 }
 
 bool Parser::isLocal(const std::string& name) const {
@@ -3289,6 +3537,9 @@ void Parser::parseDeclaratorStars(Type& type) {
 
 Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	Type type;
+	if (atKeyword("typename")) {
+		throw CompileError("a dependent type written with \"typename\" is not lowered");
+	}
 
 	// MSL writes the address space and the const qualifier in either order, and
 	// both orders are ordinary: "device const float*" and "const device Vertex *"
@@ -5493,6 +5744,12 @@ ExpressionPtr Parser::parsePrimary() {
 			consumeName();
 			expression->kind = ExpressionKind::IntLiteral;
 			const int64_t value = constant->second.value;
+			if (constant->second.kind == ScalarKind::Bool) {
+				// A bool template parameter's value.
+				expression->kind = ExpressionKind::BoolLiteral;
+				expression->boolValue = value != 0;
+				return expression;
+			}
 			expression->intKind = constant->second.kind;
 			expression->enumName = constant->second.owner;
 			expression->intValue = static_cast<uint64_t>(value < 0 ? -value : value);
@@ -5510,10 +5767,12 @@ ExpressionPtr Parser::parsePrimary() {
 			return negated;
 		}
 
-		if (_unit.functionTemplates.count(resolved) && lookahead(spelledTokens).kind == TokenKind::Less
-			&& !(spelledTokens == 1 && blockName(std::string(current().text)))) {
-			throw CompileError("explicit template arguments are not lowered yet (the call to \"" + resolved + "\")");
-		}
+		// "f<float, 3>(x)": the "<" after a function template's name opens its arguments. A name that
+		// a block declares (a local, a using declaration) is not looked up as the template.
+		const bool templateId = lookahead(spelledTokens).kind == TokenKind::Less
+			&& !(spelledTokens == 1 && blockName(std::string(current().text)))
+			&& (_unit.functionTemplates.count(resolved) || std::any_of(alternatives.begin(), alternatives.end(),
+				[&](const std::string& each) { return _unit.functionTemplates.count(each) != 0; }));
 
 		// A name that is also an MSL builtin is a plain identifier here. Whether
 		// it is the builtin or a parameter that shadows one is a question about
@@ -5523,6 +5782,7 @@ ExpressionPtr Parser::parsePrimary() {
 		expression->line = line();
 		expression->name = resolved;
 		expression->overloadNames = alternatives;
+		expression->templateDependent = spelledTokens == 1 && namesDependentParameter(std::string(current().text));
 		// An unqualified name in a call also finds the functions of its arguments' namespaces.
 		expression->unqualifiedCall = spelledTokens == 1 && lookahead(spelledTokens).kind == TokenKind::LParen
 			&& !isLocal(std::string(current().text));
@@ -5547,6 +5807,18 @@ ExpressionPtr Parser::parsePrimary() {
 		}
 		expression->besideStdlib = expression->besideStdlib || foundBesideStdlib;
 		consumeName();
+		if (templateId) {
+			advance();
+			expression->hasTemplateArguments = true;
+			while (!at(TokenKind::Greater)) {
+				expression->templateArguments.push_back(parseTemplateArgument());
+				if (!match(TokenKind::Comma)) {
+					break;
+				}
+			}
+			expect(TokenKind::Greater, "to close the template arguments");
+			expression->unqualifiedCall = spelledTokens == 1 && at(TokenKind::LParen) && !isLocal(std::string(spelled.parts.back()));
+		}
 		return expression;
 	}
 
