@@ -88,7 +88,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     ulp = compare.ulp_bound_for_source(text)
     excluded = {n: r for n, r in params["exclude"].items()}
 
-    profiles = [(inputs.PROFILES[c % 3], False) for c in range(params["cases"])]
+    profiles = [(opts.profiles[c % len(opts.profiles)], False) for c in range(params["cases"])]
     if opts.sentinel:
         profiles.append(("sentinel", True))
     nonzero = False
@@ -235,6 +235,9 @@ def parser():
     p.add_argument("--seed", type=int)
     p.add_argument("--cases", type=int, help="number of seeded cases, cycling the moderate, wide and edge profiles")
     p.add_argument("--elems", type=int, help="elements per buffer (default 4 x grid)")
+    p.add_argument("--profiles", default=",".join(inputs.PROFILES),
+                   help="input profiles the cases cycle through (default: all; use moderate for kernels that "
+                        "take loop bounds or indices from buffers)")
     p.add_argument("--sentinel", action="store_true", help="add a case whose buffers are all 0x7f bytes")
     p.add_argument("--poison-padding", action="store_true", help="fill struct padding with 0xA5")
     p.add_argument("--std", help="Metal language version for Apple's compiler (2.4, 3.0, 3.1, 3.2)")
@@ -262,6 +265,10 @@ def parser():
 def main(argv=None):
     opts = parser().parse_args(argv)
     hosts.TIMEOUT = opts.timeout
+    opts.profiles = opts.profiles.split(",")
+    if not opts.profiles or any(x not in inputs.PROFILES for x in opts.profiles):
+        print("diffcheck: --profiles takes a list of %s" % ", ".join(inputs.PROFILES), file=sys.stderr)
+        return ERROR
     try:
         opts.ranges = {n: (int(lo), int(hi)) for n, _, r in (x.partition("=") for x in opts.ranges)
                        for lo, hi in [r.split(":")]}
