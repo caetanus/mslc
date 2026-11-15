@@ -5730,6 +5730,7 @@ ExpressionPtr Parser::parsePrimary() {
 			Type type;
 			type.namedType = braced;
 			list->constructType = type;
+			list->namesConcreteStruct = resolved.rfind("<template ", 0) != 0;
 			return list;
 		}
 
@@ -5742,6 +5743,9 @@ ExpressionPtr Parser::parsePrimary() {
 			type.namedType = resolved;
 			std::vector<ExpressionPtr> arguments = parseArgumentList("to close a constructor's argument list");
 			ExpressionPtr call = constructWithConstructor(type, arguments, atLine);
+			if (call) {
+				call->namesConcreteStruct = resolved.rfind("<template ", 0) != 0;
+			}
 			if (!call) {
 				throw CompileError("\"" + resolved + "\" has a constructor with nothing to do, and a value of it is not lowered");
 			}
