@@ -53,6 +53,16 @@ class Parser {
 		std::string owner; // the tag of that enum, or "<anonymous>" when it has none
 	};
 	std::map<std::string, EnumConstant> _enumConstants;
+
+	// A const or constexpr integer whose initialiser folded, so an array length may name it.
+	// File-scope ones are kept by qualified name, local ones in the block that declares them.
+	struct ConstantInt {
+		int64_t value;
+		ScalarKind kind;
+	};
+	std::map<std::string, ConstantInt> _constantInts;
+	// The struct whose body is being parsed, so an array length can tell a member from a constant.
+	const StructDecl* _structBody = nullptr;
 	std::map<std::string, ScalarKind> _enumUnderlying; // tag or anonymous typedef name -> underlying type
 	ScalarKind _lastEnumUnderlying = ScalarKind::Int;
 
@@ -91,6 +101,7 @@ class Parser {
 	struct BlockScope {
 		std::map<std::string, std::string> names;
 		std::map<std::string, std::string> aliases;
+		std::map<std::string, ConstantInt> constants;
 		std::vector<std::string> directives;
 		// Set on the outermost block of a function body or a for body, whose names share a C++
 		// scope with the enclosing parameters or init declaration.
@@ -337,7 +348,12 @@ private:
 
 	// A constant integer expression: literals, enum constants and the operators
 	// on them. Anything that is not a constant is a CompileError.
-	int64_t evaluateConstant(const Expression& expression, bool nested) const;
+	int64_t evaluateConstant(const Expression& expression, bool nested, bool attribute = false) const;
+	// The value of a named integer constant in scope, or a CompileError saying why it is not one.
+	int64_t namedConstantValue(const Expression& identifier, bool nested, bool attribute) const;
+	// Remembers a const or constexpr integer declaration whose initialiser folds; local is the
+	// current block's, otherwise the file's.
+	void recordConstant(const VariableDeclaration& declaration, bool local);
 	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	// A file-scope function that is not an entry point. False, with the position
