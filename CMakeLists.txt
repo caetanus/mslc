@@ -306,11 +306,12 @@ set_tests_properties(harness/empty_disasm_capture_group PROPERTIES
 
 # DISASM-ENTRY-STORES-PER-RETURN against hand-assembled SPIR-V, so the directive
 # is shown to fail: a fake compiler assembles the .spvasm beside each fixture.
-# stores_valid must pass; the other three must fail with the directive's message
+# stores_valid must pass; every other fixture must fail with the directive's message
 # (CMake wraps it, hence the [ \n]+).
 find_program(SPIRV_AS spirv-as)
 if(SPIRV_AS)
-	foreach(case IN ITEMS stores_valid stores_duplicated stores_missing stores_nonreturn)
+	foreach(case IN ITEMS stores_valid stores_duplicated stores_missing stores_nonreturn
+			stores_no_return stores_chain_duplicated stores_kill stores_terminate)
 		add_test(NAME harness/${case} COMMAND ${CMAKE_COMMAND}
 			-DMSLC=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/assemble_sibling.sh
 			-DSPIRV_VAL=${SPIRV_VAL}
@@ -326,6 +327,14 @@ if(SPIRV_AS)
 		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpReturn[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+0[ \n]+times,[ \n]+expected[ \n]+1")
 	set_tests_properties(harness/stores_nonreturn PROPERTIES
 		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpUnreachable[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+1[ \n]+times,[ \n]+expected[ \n]+0")
+	set_tests_properties(harness/stores_no_return PROPERTIES
+		PASS_REGULAR_EXPRESSION "has[ \n]+no[ \n]+block[ \n]+ending[ \n]+in[ \n]+OpReturn")
+	set_tests_properties(harness/stores_chain_duplicated PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpReturn[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+2[ \n]+times,[ \n]+expected[ \n]+1")
+	set_tests_properties(harness/stores_kill PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpKill[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+1[ \n]+times,[ \n]+expected[ \n]+0")
+	set_tests_properties(harness/stores_terminate PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpTerminateInvocation[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+1[ \n]+times,[ \n]+expected[ \n]+0")
 else()
 	message(WARNING "spirv-as not found: the DISASM-ENTRY-STORES-PER-RETURN self-tests are not registered")
 endif()

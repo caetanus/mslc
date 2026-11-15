@@ -70,15 +70,22 @@
 #                              block that ends in OpReturn holds exactly one
 #                              OpStore to an interface variable decorated BuiltIn
 #                              <builtin> (or to an access chain into it), and no
-#                              block ending in anything else (a branch, OpKill, a
-#                              switch) stores to it. Blocks are counted, so a
+#                              block ending in anything else (a branch, a switch,
+#                              OpKill, OpTerminateInvocation, OpUnreachable)
+#                              stores to it. Blocks are counted, so a
 #                              store hoisted into one shared exit block satisfies
 #                              it with that one block, a discard path owes no
 #                              store, and a duplicated store in one return block
 #                              fails even when another return block has its own.
-#                              Only the entry function is read, not helpers it
-#                              calls. It fails when the entry has no such
-#                              variable or no OpReturn block.
+#                              The check is structural, stricter than runtime
+#                              semantics: a store in a non-return predecessor
+#                              fails even when it is correct at run time. Only
+#                              the entry function is read, not helpers it calls.
+#                              Stores through OpCopyObject pointers, OpCopyMemory
+#                              and stores made by a call inside a return block
+#                              are not counted (mslc emits none of these). It
+#                              fails when the entry has no such variable or no
+#                              OpReturn block.
 #   A line like "// DISASM-X:" that is not one of the forms above is an error, so
 #   a misspelt or unspaced prefix cannot be silently ignored.
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
