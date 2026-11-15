@@ -79,6 +79,27 @@ the local size through spec constants 0, 1 and 2, which is what indium does.
 - Not supported yet, skipped with the reason: textures, samplers, threadgroup memory, argument
   buffers, atomics, graphics stages.
 
+## Reading a mismatch: what is not an mslc bug
+
+Triage of the first corpus sweeps (1,295 probe kernels at grid 1, 1,086 compared, 986 matched):
+
+- Inputs that are UB for the kernel. A float input converted to an array index, a `uchar` lane
+  index, a loop bound or a store index drawn from the full 32-bit range reads or writes out of
+  bounds or never terminates. Use `// DIFFCHECK-RANGE`, `--range`, or `--profiles moderate`
+  (probes are single-thread designs: run them with `--grid 1 --local 1`).
+- Uninitialised reads (a struct local with no initialiser, a threadgroup array read before any
+  write): Apple returns garbage, mslc zero. Exclude the buffer with a reason.
+- lavapipe folds `float(half(x))` to `x` and `float(int(x))` to `trunc(x)`, so a half or a
+  negative fraction held in a register differs from Apple (`-0.0` against `0.0`). The SPIR-V has
+  the OpFConvert and OpConvertFToS; storing the half to a buffer first (as a real kernel does)
+  matches. Compare through a buffer store, or exclude.
+- `newLibraryWithSource` pre-includes `<metal_stdlib>`, so a source that tests a macro before its
+  include sees it defined; the offline compiler does not. A quoted `#include` takes the offline
+  route and matches.
+- Lavapipe rejects some valid modules (an empty struct: `vkCreateComputePipelines` -13).
+- Apple may re-associate `(x + 1) - 1` (`out[i]++; --out[i].y`): a last-bits difference on
+  cancellation, reported as a mismatch until a ULP bound or exclusion is given.
+
 ## Tests and CI
 
 `-DMSLC_DIFFCHECK=ON` registers `diffcheck/*` tests; the default build and `ctest` are

@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1 cases=3
 // DISASM-MATCH: OpMemberDecorate %_struct_[0-9]+ 0 Offset 0
 // DISASM-MATCH: OpMemberDecorate %_struct_[0-9]+ 1 Offset 4
 // DISASM-MATCH: OpMemberDecorate %_struct_[0-9]+ 2 Offset 16
