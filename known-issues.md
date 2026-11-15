@@ -128,3 +128,29 @@ it. mslc type-checks it by emitting it and lifting the instructions out, so:
   ignored element adds OpCapability Float16 to a module that does not otherwise
   need it. A helper called only from an ignored element is still emitted as an
   uncalled OpFunction.
+
+## Compound assignment reads its target before the right operand runs (found 2026-11-15, #232)
+
+**Status:** open, pre-existing on master. For `n += (n = 10, 5);` Apple's AIR stores
+15 (the right operand runs first, then `n` is read), while mslc loads `n` before the
+right operand runs and stores the old `n` plus 5. Master does the same with
+`n += g(n)` where `g(thread int &r) { r = 10; return 5; }`. The ordering lives in
+`emitAssignment`'s compound-assignment path; the comma operator only opens another way
+to reach it. Valid SPIR-V, wrong value, so a fix needs a produced-value read-back.
+
+## Forms Apple accepts that the comma operator and void casts still reject (#232)
+
+**Status:** open, all loud rejections, none a miscompile.
+
+- `c ? f() : g();` with void helpers: `isVoidValued` treats only void casts, commas ending
+  in one and conditionals of them as void, not calls.
+- `return f();` with `f` void in a void function.
+- A comma in a constant context: an array size `[(1, 2)]`, `case (1, 2):`,
+  `constant int N = (1, 2);`.
+- A comma whose right operand writes, used as a value: `x = (a, b = 3)` and `x = (a, n++)`.
+- `(n = 1, s).b` on a struct: rejected with the misleading ".b swizzles a value that is
+  not a vector", because `structOf` has no Comma case. Making `structOf` throw is wrong
+  (it is called speculatively on any expression), so it needs a real case that returns the
+  right operand's struct and lowers the member of a value.
+- `(n, t) = 3;` is now rejected as "assigning to a comma expression is not lowered yet"
+  (probe `comma_assignment_target_rejected`).

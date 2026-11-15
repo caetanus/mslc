@@ -9892,6 +9892,9 @@ namespace {
 		} else if (left.kind == ExpressionKind::Conditional) {
 			throw CompileError("assigning to a conditional expression is not supported; "
 				"assign inside an if instead");
+		} else if (left.kind == ExpressionKind::Comma) {
+			throw CompileError("assigning to a comma expression is not lowered yet; "
+				"assign to its right operand on its own");
 		} else {
 			address = emitExpression(left);
 		}
