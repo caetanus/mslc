@@ -5297,11 +5297,17 @@ ExpressionPtr Parser::parsePrimary() {
 
 		// A struct's name and a braced list is a value of that struct: S{a, b} and
 		// S{.field = a}. It is spelled in a return, an argument or an initialiser.
-		if ((fileScoped || !isLocal(resolved)) && _unit.findStruct(resolved) && lookahead(spelledTokens).kind == TokenKind::LBrace) {
+		// A typedef of a struct names the same struct: T{a, b} after "typedef S T;".
+		std::string braced = resolved;
+		if (Type aliased; resolveTypeName(text, aliased) && !aliased.namedType.empty() && !aliased.isPointer
+			&& !aliased.arrayLength && _unit.findStruct(aliased.namedType)) {
+			braced = aliased.namedType;
+		}
+		if ((fileScoped || !isLocal(resolved)) && _unit.findStruct(braced) && lookahead(spelledTokens).kind == TokenKind::LBrace) {
 			consumeName();
 			ExpressionPtr list = parseInitializerList();
 			Type type;
-			type.namedType = resolved;
+			type.namedType = braced;
 			list->constructType = type;
 			return list;
 		}
