@@ -354,7 +354,7 @@ supported. Dropped or type-probed initialisers no longer leave dead function loc
 
 ## S{...} temporary forms still refused (#251)
 
-Apple accepts all of these. The first four are refused loudly; the last two change a message only.
+Apple accepts the first four, which are refused loudly. It also rejects the last two, so for those only the wording differs.
 
 - `using T = S; T{1,2}`: every alias declaration is rejected ("a using declaration has to name a
   member of a namespace"). It needs the parser's using and lookup code; `typedef S T; T{1,2}` works,
@@ -367,7 +367,7 @@ Apple accepts all of these. The first four are refused loudly; the last two chan
   a store, `++`, reference binding or by-reference argument on such a member is refused with a
   message that names the conditional or comma. A member of a conditional with an indexed array,
   read as `(c ? s : t).arr[1]`, says "a member or an index has to start at a name mslc knows".
-- `(&S{1,2})->a`: refused, Apple warns "taking the address of a temporary"; mslc says `&` is not
-  supported.
-- `S{1,2} += S{1,2}` says "no viable overloaded compound assignment", where Apple names the
-  operator (`'+='`).
+- `(&S{1,2})->a`: Apple rejects it too ("taking the address of a temporary object", an error); mslc
+  says `&` is not supported.
+- `S{1,2} += S{1,2}`: Apple rejects it too and names the operator ("no viable overloaded '+='");
+  mslc says "no viable overloaded compound assignment" for a S temporary.
