@@ -3669,6 +3669,14 @@ namespace {
 			// An element of a buffer has the buffer's own type.
 			case ExpressionKind::Index: return structOf(*expression.left);
 
+			// Either arm of c ? a : b names the struct both arms share.
+			case ExpressionKind::Conditional: {
+				const StructDecl* taken = structOf(*expression.arguments[0]);
+				return taken ? taken : structOf(*expression.arguments[1]);
+			}
+
+			case ExpressionKind::Comma: return structOf(*expression.right);
+
 			// S{...} is a value of the struct it names.
 			case ExpressionKind::InitList:
 				return expression.constructType && !expression.constructType->namedType.empty()
@@ -3808,6 +3816,20 @@ namespace {
 			? loadFromBuffer(address, fieldType) : loadFrom(address, fieldType);
 	}
 
+	// A struct that is computed rather than named: a call, S{...}, a conditional or
+	// comma of them, or a member of one. It has no address to walk, so its members
+	// are taken from the value.
+	static bool isStructValue(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::Call:
+			case ExpressionKind::InitList:
+			case ExpressionKind::Conditional:
+			case ExpressionKind::Comma: return true;
+			case ExpressionKind::Member: return isStructValue(*expression.left);
+			default: return false;
+		}
+	}
+
 	Id Emitter::emitMember(const Expression& expression) {
 		if (!structOf(*expression.left)) {
 			return emitSwizzle(expression);
@@ -3815,7 +3837,7 @@ namespace {
 
 		// A member of a value a helper returned has no address; the call is made and
 		// the field taken from the struct it produced.
-		if (expression.left->kind == ExpressionKind::Call || expression.left->kind == ExpressionKind::InitList) {
+		if (isStructValue(*expression.left)) {
 			const StructDecl* decl = structOf(*expression.left);
 			std::string declName;
 			const size_t field = fieldIndexOf(*decl, expression.memberName, declName);
