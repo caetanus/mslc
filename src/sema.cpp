@@ -6897,11 +6897,12 @@ namespace {
 		const std::vector<Id>& prepared) {
 		const FunctionDecl& definition = *generic.definition;
 		noteCall(definition);
-		// The scan before emission does not follow argument-dependent lookup, so a caller it did not
-		// mark would share one body between entry points and call the first one's sampler.
+		// The scan before emission does not follow argument-dependent lookup or template instances, so a
+		// caller it did not mark would share one body between entry points and call the first one's sampler.
 		if (_helper && _samplerDependent.count(&definition) && !_samplerDependent.count(_helper)) {
 			throw CompileError("\"" + _helper->name + "\" reaches \"" + definition.name + "\", which names a "
-				"file-scope sampler, only through argument-dependent lookup; call it by a qualified name");
+				"file-scope sampler, only through argument-dependent lookup or a template instance; pass the sampler "
+				"as a parameter or call it by a qualified name");
 		}
 		std::vector<Id> arrays(definition.parameters.size(), InvalidId);
 		HelperFunction& helper = pointerSpecialisation(call, generic, receiver ? 1 : 0, arrays);
