@@ -1,4 +1,8 @@
 // EXPECT: valid
+// DISASM-ENTRY-STORES-PER-RETURN: fa SampleMask
+// DISASM-ENTRY-STORES-PER-RETURN: fb SampleMask
+// DISASM-ENTRY-STORES-PER-RETURN: fl SampleMask
+// DISASM-ENTRY-STORES-PER-RETURN: fg SampleMask
 // DISASM: BuiltIn SampleMask
 // DISASM: DepthLess
 // DISASM: DepthGreater
