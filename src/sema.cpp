@@ -2233,8 +2233,9 @@ namespace {
 		// emitted names, which are looked up after its own parameters and locals.
 		std::map<std::string, const VariableDeclaration*> _fileScopeSamplers;
 		std::map<std::string, Binding> _fileScopeSamplerBindings;
-		// The entry point whose sampler a helper that names a file-scope one holds.
-		std::map<std::string, const FunctionDecl*> _samplerHelperOwner;
+		// The functions that name a file-scope sampler, or call one that does. Each entry point
+		// that reaches one gets its own copy, since the sampler is that entry point's variable.
+		std::set<const FunctionDecl*> _samplerDependent;
 		// What each constant folded to, so a later constant referring to this one
 		// needs the value rather than a reference to a constant.
 		std::map<std::string, FoldedConstant> _folded;
@@ -2335,7 +2336,7 @@ namespace {
 		// A helper's body is emitted once per stage that reaches it.
 		struct HelperFunction {
 			const FunctionDecl* definition = nullptr;
-			std::map<Stage, Id> ids;
+			std::map<std::pair<Stage, const FunctionDecl*>, Id> ids;
 			Id returnType = InvalidId;
 			std::vector<Id> parameterTypes;
 			Id type = InvalidId;
@@ -2448,7 +2449,7 @@ namespace {
 		}
 		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
 		void reserveFileScopeSamplers();
-		void rejectMemberFileScopeSamplers(const FunctionDecl& member);
+		std::vector<const FunctionDecl*> functionsCalledBy(const Expression& call);
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void addReflectionEntry(const std::string& entry);
 		std::string descriptorJson(uint32_t binding) const;
@@ -2701,7 +2702,7 @@ namespace {
 			return _overloadedNames.count(helper.name) ? helperKey(helper, _overloadedNames) : helper.name;
 		}
 		Id helperFunctionId(HelperFunction& helper);
-		Stage helperScope(const HelperFunction& helper) const;
+		std::pair<Stage, const FunctionDecl*> helperScope(const HelperFunction& helper) const;
 		void emitLibraryHelpers();
 		void emitImports();
 		bool isExported(const FunctionDecl& helper) const;
@@ -5803,7 +5804,6 @@ namespace {
 					+ " arguments, and it takes " + std::to_string(parameters.size() - 1));
 			}
 
-			rejectMemberFileScopeSamplers(*found->second.definition);
 			receiver = member.left.get();
 			return &found->second;
 		}
@@ -6871,10 +6871,14 @@ namespace {
 		return slot.first->second;
 	}
 
-	// A helper with a body is emitted once per stage that reaches it. One the unit only
-	// declares, and one a library exports, belong to no stage.
-	Stage Emitter::helperScope(const HelperFunction& helper) const {
-		return helper.definition->body ? _entryPoint->stage : Stage::None;
+	// A helper with a body is emitted once per stage that reaches it, or once per entry point
+	// when it names a file-scope sampler, which is that entry point's own variable. One the unit
+	// only declares, and one a library exports, belong to no stage.
+	std::pair<Stage, const FunctionDecl*> Emitter::helperScope(const HelperFunction& helper) const {
+		if (!helper.definition->body) {
+			return { Stage::None, nullptr };
+		}
+		return { _entryPoint->stage, _samplerDependent.count(helper.definition) ? _entryPoint : nullptr };
 	}
 
 	// Arguments are evaluated left to right and converted to the parameter types.
@@ -6883,6 +6887,12 @@ namespace {
 		const std::vector<Id>& prepared) {
 		const FunctionDecl& definition = *generic.definition;
 		noteCall(definition);
+		// The scan before emission does not follow argument-dependent lookup, so a caller it did not
+		// mark would share one body between entry points and call the first one's sampler.
+		if (_helper && _samplerDependent.count(&definition) && !_samplerDependent.count(_helper)) {
+			throw CompileError("\"" + _helper->name + "\" reaches \"" + definition.name + "\", which names a "
+				"file-scope sampler, only through argument-dependent lookup; call it by a qualified name");
+		}
 		std::vector<Id> arrays(definition.parameters.size(), InvalidId);
 		HelperFunction& helper = pointerSpecialisation(call, generic, receiver ? 1 : 0, arrays);
 
@@ -9801,37 +9811,28 @@ namespace {
 			+ ", \"name\": \"" + declaration.name + "\" }");
 	}
 
-	void Emitter::rejectMemberFileScopeSamplers(const FunctionDecl& member) {
-		std::set<const FunctionDecl*> seen { &member };
-		std::vector<const FunctionDecl*> pending { &member };
-		while (!pending.empty()) {
-			const FunctionDecl* function = pending.back();
-			pending.pop_back();
-			ScopeStack scopes(1);
-			for (const Parameter& parameter: function->parameters) {
-				scopes.back().insert(parameter.name);
-			}
-			std::set<std::string> names;
-			collectUnshadowed(function->body.get(), scopes, names);
-			for (const VariableDeclaration& global: _unit.globals) {
-				if (global.sampler && names.count(global.name)) {
-					throw CompileError("member helper \"" + member.name + "\" names a file-scope sampler, "
-						"pass the sampler to it as an argument");
-				}
-			}
-			std::vector<const Expression*> calls;
-			collectCalls(*function->body, calls);
-			for (const Expression* call: calls) {
-				if (call->left->kind != ExpressionKind::Identifier) {
-					continue;
-				}
-				for (const HelperFunction* helper: helpersCalled(*call)) {
-					if (helper->definition->body && seen.insert(helper->definition).second) {
-						pending.push_back(helper->definition);
-					}
+	// What a call can reach, for the passes that run before emission. An instance member is chosen
+	// by its receiver's struct, which is known only when the call is emitted, so every instance
+	// member of that name is taken.
+	std::vector<const FunctionDecl*> Emitter::functionsCalledBy(const Expression& call) {
+		std::vector<const FunctionDecl*> found;
+		const auto add = [&](const HelperFunction* helper) {
+			if (helper->definition->body) { found.push_back(helper->definition); }
+		};
+		if (call.left->kind == ExpressionKind::Identifier) {
+			for (const HelperFunction* helper: helpersCalled(call)) { add(helper); }
+		} else if (call.left->kind == ExpressionKind::Member) {
+			const std::string suffix = "::" + call.left->memberName;
+			for (const auto& entry: _helpers) {
+				const FunctionDecl& definition = *entry.second.definition;
+				const bool instance = !definition.parameters.empty() && definition.parameters[0].name == "this";
+				if (instance && definition.name.size() > suffix.size()
+					&& definition.name.compare(definition.name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+					add(&entry.second);
 				}
 			}
 		}
+		return found;
 	}
 
 	// A file-scope sampler is reserved, once the entry point's own are, if the body
@@ -9861,9 +9862,12 @@ namespace {
 
 		scan(*_entryPoint);
 
-		// A helper naming a file-scope sampler is owned by one entry point.
-		std::set<const FunctionDecl*> seen { _entryPoint };
+		// Every function the entry point reaches, with what it calls; one that names a sampler,
+		// or calls one that does, is emitted per entry point (helperScope).
+		std::map<const FunctionDecl*, std::vector<const FunctionDecl*>> callees;
+		std::set<const FunctionDecl*> naming;
 		std::vector<const FunctionDecl*> pending { _entryPoint };
+		callees[_entryPoint];
 		while (!pending.empty()) {
 			const FunctionDecl* function = pending.back();
 			pending.pop_back();
@@ -9871,28 +9875,29 @@ namespace {
 			std::vector<const Expression*> calls;
 			collectCalls(*function->body, calls);
 			for (const Expression* call: calls) {
-				if (call->left->kind != ExpressionKind::Identifier) {
-					continue;
-				}
-				for (const HelperFunction* helper: helpersCalled(*call)) {
-					if (!helper->definition->body || !seen.insert(helper->definition).second) {
-						continue;
-					}
-
-					pending.push_back(helper->definition);
-					if (scan(*helper->definition)) {
-						const std::string key = helperKey(*helper->definition, _overloadedNames);
-						const auto owner = _samplerHelperOwner.emplace(key, _entryPoint);
-						if (owner.first->second != _entryPoint) {
-							throw CompileError("helper function \"" + key + "\" names a file-scope "
-								"sampler, and entry points \"" + owner.first->second->name + "\" and \""
-								+ _entryPoint->name + "\" both reach it; helper file-scope samplers are "
-								"owned by one entry point, so pass the sampler to it as an argument");
+				for (const FunctionDecl* callee: functionsCalledBy(*call)) {
+					callees[function].push_back(callee);
+					if (callees.try_emplace(callee).second) {
+						pending.push_back(callee);
+						if (scan(*callee)) {
+							naming.insert(callee);
 						}
 					}
 				}
 			}
 		}
+		for (bool grew = true; grew;) {
+			grew = false;
+			for (const auto& [function, called]: callees) {
+				if (function != _entryPoint && !naming.count(function)
+					&& std::any_of(called.begin(), called.end(), [&](const FunctionDecl* callee) {
+						return naming.count(callee) > 0; })) {
+					naming.insert(function);
+					grew = true;
+				}
+			}
+		}
+		_samplerDependent.insert(naming.begin(), naming.end());
 
 		// They go in the order the file declares them.
 		for (const VariableDeclaration& global: _unit.globals) {

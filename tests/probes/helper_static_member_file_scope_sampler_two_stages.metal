@@ -1,4 +1,7 @@
-// EXPECT: error helper function "Lookup::look" names a file-scope sampler, and entry points "f" and "v" both reach it
+// EXPECT: valid
+// A static member that names S, reached by a fragment and a vertex entry point: each stage's copy
+// names its own stage's sampler.
+// REFLECT: "embedded_sampler": 0, "name": "S"
 #include <metal_stdlib>
 using namespace metal;
 constexpr sampler S(filter::linear);
