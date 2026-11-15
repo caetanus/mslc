@@ -6410,7 +6410,19 @@ namespace {
 			const OverloadArgument& argument = arguments[i];
 			Type value;
 			if (parameter.type.isPointer) {
-				throw refuse(i, "to a pointer parameter");
+				if (argument.kind != OverloadArgument::Kind::Array) {
+					if (argument.pointerLike || argument.kind == OverloadArgument::Kind::Resource) {
+						throw refuse(i, "which is a pointer, a buffer or a texture and not a local array");
+					}
+					return false;
+				}
+				value = argument.binding->pointeeMsl;
+				value.dropOuterDimension();
+				if (value.arrayLength || value.isPointer || value.resource != ResourceKind::None) {
+					throw refuse(i, "which is an array of arrays");
+				}
+				value.addressSpace = AddressSpace::None;
+				value.isConst = argument.binding->readOnly && !parameter.type.isConst;
 			} else {
 				if (parameter.type.arrayLength || parameter.type.resource != ResourceKind::None) {
 					throw refuse(i, "to a parameter that is an array or a texture");
@@ -6502,12 +6514,34 @@ namespace {
 		instance.depth = depth;
 		instance.committed = true;
 
-		// The scans for file-scope samplers and imports ran before any instance existed, so a unit with
-		// either is refused.
-		if (_options.linkageObject || std::any_of(_unit.globals.begin(), _unit.globals.end(),
-			[](const VariableDeclaration& global) { return global.sampler.has_value(); })) {
-			throw CompileError("the instance " + spelled + " is made in a library or beside a file-scope sampler, "
-				"which the scans that run before it exists would have to see through; that is not lowered yet");
+		// The scans for file-scope samplers and imports ran before any instance existed.
+		ScopeStack scopes(1);
+		for (const Parameter& parameter: instance.decl.parameters) {
+			scopes.back().insert(parameter.name);
+		}
+		std::set<std::string> names;
+		collectUnshadowed(instance.decl.body.get(), scopes, names);
+		for (size_t i = 0; i < instance.decl.globalsBefore && i < _unit.globals.size(); ++i) {
+			if (_unit.globals[i].sampler && names.count(_unit.globals[i].name)) {
+				throw CompileError("the instance " + spelled + " names the file-scope sampler \""
+					+ _unit.globals[i].name + "\", which an instance does not reach; pass the sampler to it as an argument");
+			}
+		}
+		if (_options.linkageObject) {
+			std::vector<const Expression*> calls;
+			collectCalls(*instance.decl.body, calls);
+			for (const Expression* call: calls) {
+				if (call->left->kind != ExpressionKind::Identifier) {
+					continue;
+				}
+				for (const HelperFunction* called: helpersCalled(*call)) {
+					if (!called->definition->body) {
+						throw CompileError("the instance " + spelled + " calls \"" + called->definition->name
+							+ "\", which this library only declares; importing from an instance of a template is "
+							"not lowered");
+					}
+				}
+			}
 		}
 	}
 
@@ -6690,6 +6724,13 @@ namespace {
 		}
 		if (!enumArgument && from == to) {
 			return exact(qualification);
+		}
+		// A struct read from a buffer has the buffer's layout, a type of its own: same-named is the same struct.
+		if (!type.namedType.empty()) {
+			const std::string* named = _types.structNameOf(from, nullptr);
+			return named && *named == type.namedType
+				&& !(parameter.isReference && argument.kind == OverloadArgument::Kind::Variable && !argument.inThread)
+				? exact(qualification) : none;
 		}
 		const std::optional<ScalarKind> fromKind = _types.scalarKindOf(from);
 		if (!fromKind) {
