@@ -1,4 +1,5 @@
-// EXPECT: error a call to the function template "util::twice" needs an instantiation
+// EXPECT: valid
+// DISASM: OpFunctionCall %float
 // Refs #341: a template in a namespace, reached through a using declaration.
 #include <metal_stdlib>
 using namespace metal;

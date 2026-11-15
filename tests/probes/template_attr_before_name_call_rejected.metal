@@ -1,4 +1,4 @@
-// EXPECT: error needs an instantiation, which is not lowered yet
+// EXPECT: error an attribute in the declaration of function template "conv" is not lowered yet
 #include <metal_stdlib>
 using namespace metal;
 template <typename T> [[deprecated("x")]] T conv(T c) { return c * 2.0f; }

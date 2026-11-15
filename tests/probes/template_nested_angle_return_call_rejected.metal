@@ -1,4 +1,4 @@
-// EXPECT: error needs an instantiation, which is not lowered yet
+// EXPECT: error is not a return type and a name that mslc reads when it is instantiated
 #include <metal_stdlib>
 using namespace metal;
 template <typename T> A<B<T>> hh(T x) { return x; }

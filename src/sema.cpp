@@ -2201,6 +2201,12 @@ namespace {
 				if (!call->left->overloadNames.empty()) {
 					continue;
 				}
+				// A template declared above the caller competes with the helper; one below is no candidate.
+				if (std::any_of(unit.templates.begin(), unit.templates.end(), [&](const FunctionTemplate& declaration) {
+					return declaration.name == name && declaration.order <= caller.order;
+				})) {
+					continue;
+				}
 
 				const auto declared = first.find(name);
 				if (declared == first.end()) {
@@ -2430,7 +2436,11 @@ namespace {
 			const std::vector<const FunctionDecl*>& entryPoints,
 			const ModuleOptions& options, TypeTable& types):
 			_builder(builder), _unit(unit), _entryPoints(entryPoints),
-			_options(options), _types(types) {}
+			_options(options), _types(types) {
+			for (const FunctionTemplate& declaration: unit.templates) {
+				_templatesByName[declaration.name].push_back(&declaration);
+			}
+		}
 
 		std::string run();
 
@@ -2660,12 +2670,38 @@ namespace {
 		bool isVectorComponent(const Expression& place);
 		Id constantReferenceArgument(const Expression& argument, const Parameter& parameter,
 			const std::string& function, size_t position, Id prepared);
+
+		// A template's signature, read with the arguments deduced from a call's, is an instance: a helper
+		// that competes by the usual ranks, and has its body read only if it is chosen.
+		static constexpr size_t kMaxInstantiationDepth = 64;
+		struct TemplateInstance {
+			const FunctionTemplate* declaration = nullptr;
+			std::vector<TemplateArgument> arguments;
+			FunctionDecl decl;
+			HelperFunction helper;
+			size_t depth = 0;
+			bool committed = false;
+		};
+		std::map<std::string, std::vector<const FunctionTemplate*>> _templatesByName;
+		std::map<std::string, std::unique_ptr<TemplateInstance>> _instances;
+		std::map<const FunctionDecl*, TemplateInstance*> _instanceOf;
+		std::map<std::string, std::unique_ptr<FunctionDecl>> _patterns;
+		std::vector<const FunctionTemplate*> templatesNamed(const std::string& name) const;
+		std::vector<const FunctionTemplate*> visibleTemplates(const std::vector<std::string>& names) const;
+		std::vector<const FunctionTemplate*> templatesCalled(const Expression& call) const;
+		const FunctionDecl* templatePattern(const FunctionTemplate& declaration, std::vector<TemplateArgument>& arguments);
+		struct OverloadArgument;
+		bool deduceTemplateArguments(const FunctionTemplate& declaration, const FunctionDecl& pattern,
+			const std::vector<OverloadArgument>& arguments, std::vector<TemplateArgument>& deduced);
+		TemplateInstance& templateInstance(const FunctionTemplate& declaration, std::vector<TemplateArgument> arguments);
+		void commitInstance(TemplateInstance& instance);
+		bool isInstance(const FunctionDecl* function) const { return function && _instanceOf.count(function) != 0; }
 		HelperFunction* definedHelper(HelperFunction* entry);
 		// What a call can denote before its arguments are known: every function of every name the
 		// parser found for it (not the ones argument-dependent lookup adds).
 		std::vector<HelperFunction*> helpersCalled(const Expression& call);
 		HelperFunction* resolveOverload(const Expression& call, const std::vector<HelperFunction*>& set,
-			std::vector<Id>& prepared);
+			const std::vector<const FunctionTemplate*>& templates, std::vector<Id>& prepared);
 		const HelperFunction* returningHelper(const Expression& call, std::string (*aspect)(const Type&));
 		size_t callerOrder() const { return (_helper ? _helper : _entryPoint)->order; }
 		void noteCall(const FunctionDecl& callee);
@@ -5796,24 +5832,21 @@ namespace {
 			return nullptr;
 		}
 
-		// Checked before the helpers: a template that shares its name with a helper is
-		// an overload, and the helper (one signature per name) must not take a call
-		// the template would have won.
 		const std::vector<std::string> names = namesOfCall(call);
-		for (const std::string& name: names) {
-			if (_unit.functionTemplates.count(name)) {
-				throw CompileError("a call to the function template \"" + name + "\" needs an "
-					"instantiation, which is not lowered yet; the template itself is parsed and accepted");
-			}
-		}
-
 		std::vector<HelperFunction*> set;
 		for (const std::string& name: names) {
 			const std::vector<HelperFunction*> named = helpersNamed(name);
 			set.insert(set.end(), named.begin(), named.end());
 		}
-		if (set.size() > 1) {
-			return resolveOverload(call, set, prepared);
+		// A template is an overload of a helper of its name, so the arguments choose between them.
+		const std::vector<const FunctionTemplate*> templates = visibleTemplates(names);
+		// validateHelpers checked the calls of a plain helper by name (arity, declared above, defined);
+		// an instance's calls are checked by resolving them.
+		if (call.left->hasTemplateArguments) {
+			throw CompileError("explicit template arguments are not lowered yet (the call to \"" + call.left->name + "\")");
+		}
+		if (!templates.empty() || set.size() > 1 || (isInstance(_helper) && !set.empty())) {
+			return resolveOverload(call, set, templates, prepared);
 		}
 		// One function found among several names (argument-dependent lookup found the only one) is
 		// still checked as a chosen one; a name found alone was checked by validateHelpers.
@@ -5864,6 +5897,14 @@ namespace {
 		for (const ExpressionPtr& argument: call.arguments) {
 			const StructDecl* decl = adlStructOf(*argument);
 			std::string type = decl ? decl->name : std::string();
+			if (!decl && argument->kind == ExpressionKind::Call && argument->left->kind == ExpressionKind::Identifier
+				&& !templatesCalled(*argument).empty()) {
+				// What the argument is is known only once its template is deduced, so whether it is a
+				// struct whose namespace this call searches is not.
+				throw CompileError("an unqualified call has an argument that is a call to a function template "
+					"whose result type is known only once it is deduced, and argument-dependent lookup would "
+					"search its namespace; assign that argument to a variable first");
+			}
 			if (!decl) {
 				const auto tag = enumOf(*argument);
 				if (argument->kind == ExpressionKind::Conditional && !tag) {
@@ -5896,9 +5937,18 @@ namespace {
 			for (const std::string& space: spaces) {
 				const std::string associated = space.empty() ? last : space + "::" + last;
 				const std::vector<HelperFunction*> found = helpersNamed(associated);
+				const std::vector<const FunctionTemplate*> foundTemplates = templatesNamed(associated);
 				const bool visible = std::any_of(found.begin(), found.end(), [&](const HelperFunction* entry) {
 					return entry->firstOrder <= callerOrder();
-				}) || _unit.functionTemplates.count(associated);
+				}) || std::any_of(foundTemplates.begin(), foundTemplates.end(), [&](const FunctionTemplate* declaration) {
+					return declaration->order <= callerOrder();
+				});
+				// An instance is looked up again where it is instantiated, which finds a function declared below
+				// the template; its parse cannot, so such a function is refused.
+				if (!visible && isInstance(_helper) && !(found.empty() && foundTemplates.empty())) {
+					throw CompileError("argument-dependent lookup in an instance of a template finds \"" + associated
+						+ "\", declared below the template; that is not lowered yet");
+				}
 				if (visible && std::find(names.begin(), names.end(), associated) == names.end()) {
 					// The library's own overloads compete with it, which mslc does not model here.
 					// (A struct argument matches no library overload, so there is nothing to compete with.)
@@ -5934,12 +5984,48 @@ namespace {
 		return found == _helpers.end() ? std::vector<HelperFunction*>() : std::vector<HelperFunction*> { &found->second };
 	}
 
+	std::vector<const FunctionTemplate*> Emitter::templatesNamed(const std::string& name) const {
+		const auto found = _templatesByName.find(name);
+		return found == _templatesByName.end() ? std::vector<const FunctionTemplate*>() : found->second;
+	}
+
+	// The templates a call's names denote that are declared above the call.
+	std::vector<const FunctionTemplate*> Emitter::visibleTemplates(const std::vector<std::string>& names) const {
+		std::vector<const FunctionTemplate*> visible;
+		for (const std::string& name: names) {
+			for (const FunctionTemplate* declaration: templatesNamed(name)) {
+				if (declaration->order > callerOrder()) {
+					continue;
+				}
+				visible.push_back(declaration);
+			}
+		}
+		return visible;
+	}
+
+	// What a call can denote before its arguments are known: the templates of the names the parser found.
+	std::vector<const FunctionTemplate*> Emitter::templatesCalled(const Expression& call) const {
+		std::vector<const FunctionTemplate*> all = templatesNamed(call.left->name);
+		for (const std::string& name: call.left->overloadNames) {
+			if (name != call.left->name) {
+				const std::vector<const FunctionTemplate*> named = templatesNamed(name);
+				all.insert(all.end(), named.begin(), named.end());
+			}
+		}
+		return all;
+	}
+
 	// The function a call's result is read from before the call is emitted, for one aspect of its
 	// type (the struct it returns, the enum it returns). An overloaded name has one only when every
 	// overload of the call's arity agrees on that aspect, since the arguments are not evaluated yet.
 	const Emitter::HelperFunction* Emitter::returningHelper(const Expression& call,
 		std::string (*aspect)(const Type&)) {
 		const HelperFunction* chosen = nullptr;
+		// A template's result type is known only once it is deduced, so a call it may take has none yet.
+		if (!templatesCalled(call).empty()) {
+			throw CompileError("the call to \"" + call.left->name + "\" may take a function template, whose result "
+				"type is known only once it is deduced; assign the call to a variable first");
+		}
 		const std::vector<HelperFunction*> named = helpersCalled(call);
 		for (const HelperFunction* candidate: named) {
 			const FunctionDecl& definition = *candidate->definition;
@@ -5964,7 +6050,7 @@ namespace {
 	// arguments are evaluated here, once, left to right, and handed on in prepared so the call
 	// does not evaluate them again.
 	Emitter::HelperFunction* Emitter::resolveOverload(const Expression& call, const std::vector<HelperFunction*>& set,
-		std::vector<Id>& prepared) {
+		const std::vector<const FunctionTemplate*>& templates, std::vector<Id>& prepared) {
 		// As written: Apple names the function as the call spells it.
 		const size_t tail = call.left->name.rfind("::");
 		const std::string name = call.left->unqualifiedCall && tail != std::string::npos
@@ -5977,7 +6063,12 @@ namespace {
 			}
 			return list;
 		};
-		const auto chosen = [&](HelperFunction* entry) { return definedHelper(entry); };
+		const auto chosen = [&](HelperFunction* entry) {
+			if (const auto instance = _instanceOf.find(entry->definition); instance != _instanceOf.end()) {
+				commitInstance(*instance->second);
+			}
+			return definedHelper(entry);
+		};
 		std::vector<HelperFunction*> visible;
 		std::vector<HelperFunction*> candidates;
 		for (HelperFunction* entry: set) {
@@ -5989,14 +6080,28 @@ namespace {
 				candidates.push_back(entry);
 			}
 		}
-		if (visible.empty()) {
+		// The templates whose signature takes this many arguments.
+		struct TemplateCandidate {
+			const FunctionTemplate* declaration;
+			const FunctionDecl* pattern;
+			std::vector<TemplateArgument> arguments;
+		};
+		std::vector<TemplateCandidate> patterns;
+		for (const FunctionTemplate* declaration: templates) {
+			TemplateCandidate candidate { declaration, nullptr, {} };
+			candidate.pattern = templatePattern(*declaration, candidate.arguments);
+			if (candidate.pattern->parameters.size() == call.arguments.size()) {
+				patterns.push_back(std::move(candidate));
+			}
+		}
+		if (visible.empty() && templates.empty()) {
 			throw CompileError("\"" + name + "\" is called before it is declared; declare it above its first use");
 		}
-		if (candidates.empty()) {
+		if (candidates.empty() && patterns.empty()) {
 			throw CompileError("no matching function for call to \"" + name + "\": it is called with "
 				+ std::to_string(call.arguments.size()) + " arguments; candidates: " + describe(visible));
 		}
-		if (candidates.size() == 1) {
+		if (candidates.size() == 1 && patterns.empty()) {
 			return chosen(candidates.front());
 		}
 
@@ -6026,9 +6131,17 @@ namespace {
 		for (const ExpressionPtr& argument: call.arguments) {
 			arguments.push_back(classifyArgument(*argument));
 		}
-		bool enumParameter = false;
+		// A template's signature before deduction still says what kind of argument each position takes.
+		std::vector<const std::vector<Parameter>*> lists;
 		for (const HelperFunction* entry: candidates) {
-			for (const Parameter& parameter: entry->definition->parameters) {
+			lists.push_back(&entry->definition->parameters);
+		}
+		for (const TemplateCandidate& candidate: patterns) {
+			lists.push_back(&candidate.pattern->parameters);
+		}
+		bool enumParameter = false;
+		for (const std::vector<Parameter>* list: lists) {
+			for (const Parameter& parameter: *list) {
 				enumParameter = enumParameter || !parameter.type.enumName.empty();
 				if (parameter.type.enumName == "<anonymous>") {
 					throw CompileError("an overload of \"" + name + "\" takes a parameter of an anonymous enum, "
@@ -6042,8 +6155,8 @@ namespace {
 				|| argument.pointerLike) {
 				continue;
 			}
-			const bool bound = std::any_of(candidates.begin(), candidates.end(), [&](const HelperFunction* entry) {
-				return entry->definition->parameters[i].isMutableReference();
+			const bool bound = std::any_of(lists.begin(), lists.end(), [&](const std::vector<Parameter>* list) {
+				return (*list)[i].isMutableReference();
 			});
 			if (bound && argument.kind == OverloadArgument::Kind::Variable && !isPlainVariable(*argument.expression)) {
 				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \"" + name
@@ -6075,6 +6188,15 @@ namespace {
 			}
 		}
 
+		// A template competes through its instance; one that cannot be deduced is no candidate (as in C++).
+		for (const TemplateCandidate& candidate: patterns) {
+			std::vector<TemplateArgument> deduced = candidate.arguments;
+			if (!deduceTemplateArguments(*candidate.declaration, *candidate.pattern, arguments, deduced)) {
+				continue;
+			}
+			candidates.push_back(&templateInstance(*candidate.declaration, std::move(deduced)).helper);
+		}
+
 		std::vector<std::pair<HelperFunction*, std::vector<ConversionCost>>> viable;
 		for (HelperFunction* entry: candidates) {
 			std::vector<ConversionCost> costs;
@@ -6090,8 +6212,10 @@ namespace {
 				+ describe(candidates));
 		}
 
-		// One wins when it is no worse on any argument and better on one, than every other.
-		const auto beats = [&](const std::vector<ConversionCost>& a, const std::vector<ConversionCost>& b) {
+		// One wins when no worse on any argument and better on one, or equal and a function beside a template.
+		const auto beats = [&](const auto& first, const auto& second) {
+			const std::vector<ConversionCost>& a = first.second;
+			const std::vector<ConversionCost>& b = second.second;
 			bool better = false;
 			for (size_t i = 0; i < a.size(); ++i) {
 				const bool ranked = a[i].rank != b[i].rank;
@@ -6102,11 +6226,11 @@ namespace {
 				}
 				better = better || (ranked ? a[i].rank < b[i].rank : qualified);
 			}
-			return better;
+			return better || (!isInstance(first.first->definition) && isInstance(second.first->definition));
 		};
 		for (const auto& winner: viable) {
 			if (std::all_of(viable.begin(), viable.end(), [&](const auto& other) {
-				return other.first == winner.first || beats(winner.second, other.second);
+				return other.first == winner.first || beats(winner, other);
 			})) {
 				return chosen(winner.first);
 			}
@@ -6116,6 +6240,170 @@ namespace {
 			tied.push_back(candidate.first);
 		}
 		throw CompileError("call to \"" + name + "\" is ambiguous; candidates: " + describe(tied));
+	}
+
+	// The type a template parameter stands for while its signature is read to deduce it.
+	static std::string templateMarker(const TemplateParameter& parameter) {
+		return "<" + parameter.name + ">";
+	}
+
+	static bool isTemplateMarker(const Type& type) {
+		return type.namedType.size() > 2 && type.namedType.front() == '<' && type.namedType.back() == '>';
+	}
+
+	// The argument as a name that tells instances apart.
+	static std::string templateArgumentName(const TemplateArgument& argument) {
+		if (argument.unbound) {
+			return "?";
+		}
+		if (!argument.isType) {
+			return std::to_string(argument.value);
+		}
+		Type bare = argument.type;
+		bare.addressSpace = AddressSpace::None;
+		return typeName(bare);
+	}
+
+	static bool sameValueType(const Type& a, const Type& b) {
+		return a.scalar == b.scalar && a.vectorWidth == b.vectorWidth && a.matrixColumns == b.matrixColumns
+			&& a.isPacked == b.isPacked && a.namedType == b.namedType && a.enumName == b.enumName
+			&& a.isAtomic == b.isAtomic;
+	}
+
+	// A template's signature, read with the type parameters standing for themselves (a marker type, to
+	// be deduced) and a constant left unknown. "arguments" is what was bound, one per parameter.
+	const FunctionDecl* Emitter::templatePattern(const FunctionTemplate& declaration,
+		std::vector<TemplateArgument>& arguments) {
+		arguments.clear();
+		for (const TemplateParameter& parameter: declaration.parameters) {
+			TemplateArgument argument;
+			if (parameter.hasDefault) {
+				throw CompileError("the default argument of the template parameter \"" + parameter.name + "\" of \""
+					+ declaration.name + "\" is not lowered yet");
+			}
+			if (parameter.isType) {
+				argument.type.namedType = templateMarker(parameter);
+			} else {
+				argument.isType = false;
+				argument.unbound = true;
+			}
+			arguments.push_back(std::move(argument));
+		}
+
+		std::string key = std::to_string(&declaration - _unit.templates.data()) + "<";
+		for (const TemplateArgument& argument: arguments) {
+			key += templateArgumentName(argument) + ",";
+		}
+		std::unique_ptr<FunctionDecl>& slot = _patterns[key];
+		if (!slot) {
+			slot = std::make_unique<FunctionDecl>(instantiateTemplate(declaration, arguments, false));
+		}
+		return slot.get();
+	}
+
+	// T takes the type of the argument it is passed by value, once: two types leave the template no
+	// candidate. What C++ deduces and mslc does not model is an error, never a template dropped.
+	bool Emitter::deduceTemplateArguments(const FunctionTemplate& declaration, const FunctionDecl& pattern,
+		const std::vector<OverloadArgument>& arguments, std::vector<TemplateArgument>& deduced) {
+		const auto parameterIndex = [&](const Type& type) {
+			for (size_t j = 0; j < declaration.parameters.size(); ++j) {
+				if (declaration.parameters[j].isType && isTemplateMarker(type)
+					&& type.namedType == templateMarker(declaration.parameters[j])) {
+					return j;
+				}
+			}
+			return declaration.parameters.size();
+		};
+		const auto refuse = [&](size_t position, const std::string& why) {
+			return CompileError("the type parameter of \"" + declaration.name + "\" is deduced from argument "
+				+ std::to_string(position + 1) + ", " + why + "; that is not lowered yet");
+		};
+		std::vector<bool> known(deduced.size(), false);
+		for (size_t i = 0; i < pattern.parameters.size(); ++i) {
+			const Parameter& parameter = pattern.parameters[i];
+			const size_t index = parameterIndex(parameter.type);
+			if (index == declaration.parameters.size()) {
+				continue;
+			}
+			const OverloadArgument& argument = arguments[i];
+			if (parameter.type.isPointer || parameter.isReference || parameter.type.arrayLength
+				|| parameter.type.resource != ResourceKind::None) {
+				throw refuse(i, "to a parameter that is a pointer, a reference, an array or a texture");
+			}
+			if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
+				|| argument.pointerLike) {
+				throw refuse(i, "which is an array, a pointer or a texture");
+			}
+			if (argument.tag && !argument.tag->empty()) {
+				throw refuse(i, "which is an enum");
+			}
+			const Type value = deduceAutoType(Type(), _builder.typeOf(argument.value), "argument " + std::to_string(i + 1));
+			if (known[index]) {
+				if (!sameValueType(deduced[index].type, value)) {
+					return false;
+				}
+				continue;
+			}
+			known[index] = true;
+			deduced[index].type = value;
+		}
+
+		for (size_t j = 0; j < declaration.parameters.size(); ++j) {
+			if (declaration.parameters[j].isType ? !known[j] : deduced[j].unbound) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// The instance for complete arguments, signature read and body not: one per argument list.
+	Emitter::TemplateInstance& Emitter::templateInstance(const FunctionTemplate& declaration,
+		std::vector<TemplateArgument> arguments) {
+		std::string key = std::to_string(&declaration - _unit.templates.data()) + "<";
+		for (const TemplateArgument& argument: arguments) {
+			key += templateArgumentName(argument) + ",";
+		}
+		std::unique_ptr<TemplateInstance>& slot = _instances[key];
+		if (slot) {
+			return *slot;
+		}
+		FunctionDecl signature = instantiateTemplate(declaration, arguments, false);
+		slot = std::make_unique<TemplateInstance>();
+		slot->declaration = &declaration;
+		slot->arguments = std::move(arguments);
+		slot->decl = std::move(signature);
+		slot->helper.definition = &slot->decl;
+		slot->helper.firstOrder = declaration.order;
+		_instanceOf[&slot->decl] = slot.get();
+		return *slot;
+	}
+
+	// The instance is the function a call chose: its body is read now.
+	void Emitter::commitInstance(TemplateInstance& instance) {
+		if (instance.committed) {
+			return;
+		}
+		const FunctionTemplate& declaration = *instance.declaration;
+		if (!declaration.hasBody) {
+			throw CompileError("the function template \"" + declaration.name + "\" is declared and never defined");
+		}
+		const auto caller = _instanceOf.find(_helper);
+		const size_t depth = caller == _instanceOf.end() ? 1 : caller->second->depth + 1;
+		if (depth > kMaxInstantiationDepth) {
+			throw CompileError("template instantiation depth exceeds " + std::to_string(kMaxInstantiationDepth)
+				+ " (instantiating " + declaration.name + "); Apple's limit is 1024");
+		}
+		instance.decl = instantiateTemplate(declaration, instance.arguments, true);
+		instance.depth = depth;
+		instance.committed = true;
+
+		// The scans for file-scope samplers and imports ran before any instance existed, so a unit with
+		// either is refused.
+		if (_options.linkageObject || std::any_of(_unit.globals.begin(), _unit.globals.end(),
+			[](const VariableDeclaration& global) { return global.sampler.has_value(); })) {
+			throw CompileError("an instance of " + declaration.name + " is made in a library or beside a file-scope sampler, "
+				"which the scans that run before it exists would have to see through; that is not lowered yet");
+		}
 	}
 
 	// A name, or an element of a local array of scalars: what a reference binds without question.
