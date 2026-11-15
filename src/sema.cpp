@@ -2382,6 +2382,7 @@ namespace {
 		// Set once the module needs ImageQuery, which is declared once.
 		bool _imageQueryDeclared = false;
 		bool _gatherExtendedDeclared = false;
+		bool _minLodDeclared = false;
 		bool _sampleRateShadingDeclared = false;
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
@@ -10093,14 +10094,37 @@ namespace {
 	// or kernel function has none, so it samples level 0 with an explicit lod,
 	// and so does a sampler with pixel coordinates, which Vulkan does not allow
 	// an implicit lod on.
+	// An integer written as a literal, with an optional minus: the only constant a
+	// texel offset can be here, since SPIR-V takes it as an OpConstant.
+	static bool literalInteger(const Expression& expression, int32_t& value) {
+		if (expression.kind == ExpressionKind::IntLiteral) {
+			value = static_cast<int32_t>(expression.intValue);
+			return expression.intValue <= INT32_MAX;
+		}
+		if (expression.kind == ExpressionKind::Unary && expression.unaryOperator == UnaryOperator::Negate
+			&& expression.left && literalInteger(*expression.left, value)) {
+			value = -value;
+			return true;
+		}
+		return false;
+	}
+
+	// sample(sampler, coordinate [, array index] [, option] [, min_lod_clamp(m)] [, offset]).
+	// The option is level(lod), bias(b), or gradient2d, gradient3d or gradientcube
+	// for the texture's dimension. A fragment function with no option takes the level
+	// from the derivatives, which is OpImageSampleImplicitLod; a vertex or kernel
+	// function has none, so it samples level 0 with an explicit lod, and so does a
+	// sampler with pixel coordinates, which Vulkan does not allow an implicit lod on.
+	// bias and min_lod_clamp need those derivatives and so a fragment function, and an
+	// offset has to be a vector of integer literals (ConstOffset).
 	Id Emitter::emitTextureSample(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
 		const ResourceKind kind = texture.pointeeMsl.resource;
 		const bool arrayed = kind == ResourceKind::Texture2DArray;
 		const size_t fixed = arrayed ? 3 : 2;
-		if (arguments.size() < fixed || arguments.size() > fixed + 1) {
+		if (arguments.size() < fixed || arguments.size() > fixed + 3) {
 			throw CompileError(std::string("sample takes a sampler, a coordinate")
-				+ (arrayed ? ", an array index" : "") + " and optionally level(lod); "
+				+ (arrayed ? ", an array index" : "") + " and optionally an option, min_lod_clamp(m) and an offset; "
 				"this call passes " + std::to_string(arguments.size()));
 		}
 
@@ -10112,35 +10136,111 @@ namespace {
 				"such as level(lod) is not accepted on it");
 		}
 
-		Id lod = InvalidId;
-		if (arguments.size() == fixed + 1) {
-			const Expression& option = *arguments[fixed];
-			const bool isCall = option.kind == ExpressionKind::Call
-				&& option.left->kind == ExpressionKind::Identifier;
-			if (isCall && option.left->name == "level") {
-				if (option.arguments.size() != 1) {
-					throw CompileError("level takes one argument");
+		const Id floatType = _types.scalar(ScalarKind::Float);
+		const auto scalarArgument = [&](const Expression& option, const std::string& what) {
+			if (option.arguments.size() != 1) {
+				throw CompileError(what + " takes one argument");
+			}
+			const Id value = emitExpression(*option.arguments[0]);
+			const Id valueType = _builder.typeOf(value);
+			if (_types.vectorWidth(valueType) != 1 || _types.bitWidth(valueType) < 8) {
+				throw CompileError(what + " takes a scalar number");
+			}
+			return convert(value, valueType, floatType);
+		};
+		const uint32_t gradientWidth = kind == ResourceKind::Texture3D || kind == ResourceKind::TextureCube ? 3 : 2;
+		const std::string gradientName = kind == ResourceKind::Texture3D ? "gradient3d"
+			: kind == ResourceKind::TextureCube ? "gradientcube" : "gradient2d";
+
+		Id lod = InvalidId, bias = InvalidId, minLod = InvalidId, gradientX = InvalidId, gradientY = InvalidId, offset = InvalidId;
+		int stage = 0;  // the option, then min_lod_clamp, then the offset, in this order
+		for (size_t i = fixed; i < arguments.size(); ++i) {
+			const Expression& option = *arguments[i];
+			const bool isCall = option.kind == ExpressionKind::Call && option.left->kind == ExpressionKind::Identifier;
+			const std::string name = isCall ? option.left->name : std::string();
+			if (isCall && (name == "level" || name == "bias" || name == "gradient2d" || name == "gradient3d" || name == "gradientcube")) {
+				if (stage > 0) {
+					throw CompileError("the sample option " + name + "(...) has to come first, before min_lod_clamp and the offset");
 				}
-				const Id value = emitExpression(*option.arguments[0]);
-				const Id valueType = _builder.typeOf(value);
-				if (_types.vectorWidth(valueType) != 1 || _types.bitWidth(valueType) < 8) {
-					throw CompileError("level takes a scalar number");
+				stage = 1;
+				if (name == "level") {
+					lod = scalarArgument(option, "level");
+				} else if (name == "bias") {
+					bias = scalarArgument(option, "bias");
+				} else {
+					if (name != gradientName) {
+						throw CompileError(std::string("a ") + resourceKindName(kind) + " takes " + gradientName
+							+ "(...), not " + name + "(...)");
+					}
+					if (option.arguments.size() != 2) {
+						throw CompileError(name + " takes two gradients");
+					}
+					const Id vectorType = _types.vector(ScalarKind::Float, gradientWidth);
+					Id* targets[2] = { &gradientX, &gradientY };
+					for (size_t g = 0; g < 2; ++g) {
+						*targets[g] = emitExpression(*option.arguments[g]);
+						if (_builder.typeOf(*targets[g]) != vectorType) {
+							throw CompileError(name + " takes two float" + std::to_string(gradientWidth) + " gradients");
+						}
+					}
 				}
-				lod = convert(value, valueType, _types.scalar(ScalarKind::Float));
-			} else if (isCall && (option.left->name == "bias" || option.left->name == "gradient2d"
-				|| option.left->name == "min_lod_clamp")) {
-				throw CompileError("the sample option " + option.left->name + "(...) is not lowered "
-					"yet; mslc lowers level(lod)");
+			} else if (isCall && name == "min_lod_clamp") {
+				if (stage > 1 || minLod != InvalidId) {
+					throw CompileError("min_lod_clamp(...) comes after the option and before the offset, once");
+				}
+				stage = 2;
+				minLod = scalarArgument(option, "min_lod_clamp");
 			} else {
-				throw CompileError(std::string("the ") + (arrayed ? "fourth" : "third")
-					+ " argument of sample has to be level(lod); an offset and the other options "
-					"are not lowered yet");
+				if (stage > 2 || offset != InvalidId || kind == ResourceKind::TextureCube) {
+					throw CompileError(kind == ResourceKind::TextureCube ? "a texturecube sample takes no offset"
+						: "the sample argument after the offset is not lowered");
+				}
+				stage = 3;
+				const uint32_t offsetWidth = kind == ResourceKind::Texture3D ? 3 : 2;
+				std::vector<uint32_t> parts;
+				const bool shape = option.kind == ExpressionKind::Construct && option.constructType
+					&& option.constructType->scalar == ScalarKind::Int && option.constructType->vectorWidth == offsetWidth
+					&& (option.arguments.size() == offsetWidth || option.arguments.size() == 1);
+				for (size_t k = 0; shape && k < option.arguments.size(); ++k) {
+					int32_t value = 0;
+					if (!literalInteger(*option.arguments[k], value)) {
+						parts.clear();
+						break;
+					}
+					parts.push_back(_builder.emitDeclTyped(spirv::OpConstant, _intType, { static_cast<uint32_t>(value) }));
+				}
+				if (parts.empty()) {
+					throw CompileError("the offset of sample has to be written as an int" + std::to_string(offsetWidth)
+						+ " of integer literals: Vulkan takes a constant texel offset");
+				}
+				parts.resize(offsetWidth, parts.front());
+				offset = _builder.emitDeclTyped(spirv::OpConstantComposite, _types.vector(ScalarKind::Int, offsetWidth), parts);
+			}
+		}
+
+		const bool derivatives = bias != InvalidId || (lod == InvalidId && gradientX == InvalidId);
+		if (sampler.unnormalizedSampler && (bias != InvalidId || minLod != InvalidId || gradientX != InvalidId || offset != InvalidId)) {
+			throw CompileError("a coord::pixel sampler takes level(lod) or no option only: Vulkan fixes Lod 0 on it");
+		}
+		if (minLod != InvalidId && lod != InvalidId) {
+			throw CompileError("min_lod_clamp(...) with level(...) is not lowered: Vulkan takes MinLod with an "
+				"implicit lod or gradients only");
+		}
+		const bool library = _entryPoint == &_libraryScope;
+		if (derivatives && !sampler.unnormalizedSampler && (bias != InvalidId || minLod != InvalidId)) {
+			if (library) {
+				throw StageError("bias or min_lod_clamp in a library helper: they need derivatives, which exist only in a "
+					"fragment function, and a library does not know its caller's stage");
+			}
+			if (_entryPoint->stage != Stage::Fragment) {
+				throw CompileError("bias and min_lod_clamp are lowered in a fragment function only: they act on the "
+					"level the derivatives give, which a vertex or kernel function does not have");
 			}
 		}
 
 		// Vulkan requires Lod 0 through an unnormalized sampler, whatever level() says.
 		if (sampler.unnormalizedSampler) {
-			lod = _builder.emitDeclTyped(spirv::OpConstant, _types.scalar(ScalarKind::Float), { 0u });
+			lod = _builder.emitDeclTyped(spirv::OpConstant, floatType, { 0u });
 		}
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
@@ -10149,22 +10249,51 @@ namespace {
 			{ image, loadedSampler });
 
 		const Id float4 = _types.vector(ScalarKind::Float, 4);
-		Id sampled = InvalidId;
-		if (lod == InvalidId && _entryPoint == &_libraryScope && !sampler.unnormalizedSampler) {
+		const bool noOption = lod == InvalidId && bias == InvalidId && gradientX == InvalidId;
+		if (noOption && minLod == InvalidId && library && !sampler.unnormalizedSampler) {
 			throw StageError("a sample with no explicit level in a library helper: whether it is implicit "
 				"depends on the stage of the entry point that calls it, which a library does not know; "
 				"pass level(...)");
 		}
-		if (lod == InvalidId && _entryPoint->stage == Stage::Fragment && !sampler.unnormalizedSampler) {
-			sampled = _builder.emitTyped(spirv::OpImageSampleImplicitLod, float4, { combined, coordinate });
-		} else {
-			if (lod == InvalidId) {
-				lod = _builder.emitDeclTyped(spirv::OpConstant, _types.scalar(ScalarKind::Float), { 0u });
-			}
-			sampled = _builder.emitTyped(spirv::OpImageSampleExplicitLod, float4,
-				{ combined, coordinate, kImageOperandsLod, lod });
+		const bool implicit = (noOption && _entryPoint->stage == Stage::Fragment && !sampler.unnormalizedSampler)
+			|| bias != InvalidId || (minLod != InvalidId && gradientX == InvalidId);
+		if (noOption && !implicit) {
+			lod = _builder.emitDeclTyped(spirv::OpConstant, floatType, { 0u });
 		}
-
+		uint32_t mask = 0;
+		std::vector<uint32_t> words { combined, coordinate, 0 };
+		if (bias != InvalidId) {
+			mask |= 0x1;
+			words.push_back(bias);
+		}
+		if (lod != InvalidId) {
+			mask |= kImageOperandsLod;
+			words.push_back(lod);
+		}
+		if (gradientX != InvalidId) {
+			mask |= 0x4;  // Grad
+			words.push_back(gradientX);
+			words.push_back(gradientY);
+		}
+		if (offset != InvalidId) {
+			mask |= 0x8;  // ConstOffset
+			words.push_back(offset);
+		}
+		if (minLod != InvalidId) {
+			mask |= 0x80;  // MinLod
+			words.push_back(minLod);
+			if (!_minLodDeclared) {
+				_minLodDeclared = true;
+				_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::MinLod) });
+			}
+		}
+		if (mask == 0) {
+			words.pop_back();
+		} else {
+			words[2] = mask;
+		}
+		const Id sampled = _builder.emitTyped(implicit ? spirv::OpImageSampleImplicitLod : spirv::OpImageSampleExplicitLod,
+			float4, words);
 		return texturePixels(texture, sampled);
 	}
 
