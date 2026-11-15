@@ -16,6 +16,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -34,19 +35,21 @@ def run_mslc(mslc, source, work, includes):
     spv, refl = os.path.join(work, "mslc.spv"), os.path.join(work, "mslc.json")
     cmd = [mslc, "--stage", "kernel", "-o", spv, "--reflect", refl, source] + ["-I" + i for i in includes]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=hosts.TIMEOUT)
+    if r.returncode < 0:
+        return None, None, "CRASH mslc died with signal %d (%s)" % (-r.returncode, signal.Signals(-r.returncode).name)
     if r.returncode != 0:
         return None, None, (r.stderr.strip().splitlines() or ["mslc failed"])[-1]
     val = subprocess.run([shutil.which("spirv-val") or "spirv-val", "--target-env", "vulkan1.3", spv],
                          capture_output=True, text=True)
     if val.returncode != 0:
         return None, None, "INVALID mslc output fails spirv-val: " + (val.stdout + val.stderr).strip().splitlines()[0]
-    return spv, json.load(open(refl)), None
+    return spv, hostenv.read_json(refl), None
 
 
 def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     """Compare one kernel; returns a result dict."""
     result = {"entry": entry, "status": None, "cases": [], "reason": None}
-    text = open(source, encoding="utf-8", errors="replace").read()
+    text = hostenv.read_text(source)
     local = params["local"]
     groups = params["grid"] // local
     if groups * local != params["grid"] or groups < 1:
@@ -86,7 +89,9 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     set_index = bindings[0]["descriptor"]["set"] if bindings else 0
     elements = params.get("elems") or max(64, 4 * params["grid"])
     ulp = compare.ulp_bound_for_source(text)
-    excluded = {n: r for n, r in params["exclude"].items()}
+    excluded = dict(params["exclude"])
+    result["buffers"] = sorted(l["name"] for l in layouts.values())
+    compared = {i: l for i, l in layouts.items() if l["name"] not in excluded}
 
     profiles = [(opts.profiles[c % len(opts.profiles)], False) for c in range(params["cases"])]
     if opts.sentinel:
@@ -95,8 +100,8 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     result["ulp_bound"] = ulp
     for case, (profile, sentinel) in enumerate(profiles):
         rng = random.Random(params["seed"] * 1000 + case)
-        data = {i: inputs.fill_buffer(l, elements, rng, "wide" if sentinel else profile, sentinel, opts.poison_padding,
-                                  params["range"].get(l["name"]))
+        data = {i: inputs.fill_buffer(l, elements, rng, profile, sentinel, opts.poison_padding,
+                                  params["range"].get(l["name"]), case)
                 for i, l in sorted(layouts.items())}
         outs = {}
         for backend, runner in (("apple", hosts.run_metal), ("mslc", hosts.run_vulkan)):
@@ -106,7 +111,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
                 idx = b["metal_index"]
                 inp = os.path.join(work, "in-%d-%d.bin" % (case, idx))
                 if backend == "apple":
-                    open(inp, "wb").write(data[idx])
+                    hostenv.write_bytes(inp, data[idx])
                 out = os.path.join(work, "%s-out-%d-%d.bin" % (backend, case, idx))
                 key = idx if backend == "apple" else b["member"]
                 rows.append("buffer %d %d %s %s" % (key, len(data[idx]), inp, out))
@@ -117,9 +122,9 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
                 text_m = ["spv " + spv, "entry " + entry, "set %d" % set_index, "local %d 1 1" % local,
                           "groups %d 1 1" % groups] + rows
                 binary = opts.vk
-            open(manifest, "w").write("\n".join(text_m) + "\n")
+            hostenv.write_text(manifest, "\n".join(text_m) + "\n")
             runner(binary, manifest)
-            outs[backend] = {b["metal_index"]: bytearray(open(os.path.join(work, "%s-out-%d-%d.bin" % (backend, case, b["metal_index"])), "rb").read())
+            outs[backend] = {b["metal_index"]: bytearray(hostenv.read_bytes(os.path.join(work, "%s-out-%d-%d.bin" % (backend, case, b["metal_index"]))))
                              for b in mbuf}
         if opts.corrupt_mslc:
             name, _, at = opts.corrupt_mslc.partition(":")
@@ -132,11 +137,10 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
                 continue
             for d in compare.compare(layout, outs["apple"][i], outs["mslc"][i], ulp):
                 case_diffs.append(d.to_json())
-        nonzero = nonzero or checks.written_nonzero(layouts, data, outs["apple"]) or checks.written_nonzero(layouts, data, outs["mslc"])
+        nonzero = nonzero or checks.written_nonzero(compared, data, outs["apple"]) or checks.written_nonzero(compared, data, outs["mslc"])
         # Negative control: a copy of the mslc result with one leaf of a compared buffer changed
         # must differ from Apple's, or the comparison above could not have told a miscompile from
         # a match. Excluded buffers are not candidates: perturbing one would test nothing.
-        compared = {i: l for i, l in layouts.items() if l["name"] not in excluded}
         control = checks.perturb(compared, outs["mslc"], outs["apple"])
         control_ok = False
         if control is not None:
@@ -155,15 +159,16 @@ def check_file(opts, path, std=None):
     """Results for every kernel in `path` (or the one named by --entry)."""
     here = os.path.dirname(os.path.abspath(path))
     includes = opts.includes + [here, os.path.dirname(here)]
-    text = open(path, encoding="utf-8", errors="replace").read()
+    text = hostenv.read_text(path)
     d = directives.parse(text)
     work = tempfile.mkdtemp(prefix="diffcheck-", dir=os.environ.get("TMPDIR"))
     try:
         spv, refl, error = run_mslc(opts.mslc, path, work, includes)
         if error:
-            invalid = error.startswith("INVALID ")
-            return [{"entry": opts.entry or "*", "status": "invalid" if invalid else "skipped",
-                     "reason": error[8:] if invalid else error, "cases": []}]
+            for prefix, status in (("INVALID ", "invalid"), ("CRASH ", "error")):
+                if error.startswith(prefix):
+                    return [{"entry": opts.entry or "*", "status": status, "reason": error[len(prefix):], "cases": []}]
+            return [{"entry": opts.entry or "*", "status": "skipped", "reason": error, "cases": []}]
         entries = [e for e in refl["entry_points"] if e["stage"] == "compute"]
         if opts.entry:
             entries = [e for e in entries if e["name"] == opts.entry]
@@ -181,6 +186,17 @@ def check_file(opts, path, std=None):
             sub = os.path.join(work, e["name"])
             os.makedirs(sub)
             results.append(check_entry(opts, path, spv, e, e["name"], params, sub, includes))
+        # A directive naming no buffer of any compared kernel is a typo that would silently do nothing.
+        known = set().union(*(r.get("buffers", []) for r in results))
+        if known:
+            named = {"DIFFCHECK-EXCLUDE": d["exclude"], "DIFFCHECK-RANGE": d["range"]}
+            if not opts.corpus:
+                named["--range"] = opts.ranges
+            for directive, table in named.items():
+                unknown = sorted(set(table) - known)
+                if unknown:
+                    results.append({"entry": "*", "status": "error", "cases": [], "reason": "%s names %s, which is not "
+                                    "a buffer (buffers: %s)" % (directive, ", ".join(unknown), ", ".join(sorted(known)))})
         return results
     finally:
         if not opts.keep:
@@ -192,7 +208,7 @@ def check_file(opts, path, std=None):
 def corpus_files(listing, root):
     """(path, std) for each line of a corpus list: `path [std=3.1]`, # comments, relative to root."""
     files = []
-    for line in open(listing):
+    for line in hostenv.read_text(listing).splitlines():
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
@@ -275,6 +291,11 @@ def main(argv=None):
     except ValueError:
         print("diffcheck: --range wants BUFFER=LO:HI", file=sys.stderr)
         return ERROR
+    for name in ("grid", "local", "cases", "elems", "jobs"):
+        value = getattr(opts, name)
+        if value is not None and value < 1:
+            print("diffcheck: --%s must be at least 1" % name, file=sys.stderr)
+            return ERROR
     if bool(opts.file) == bool(opts.corpus):
         print("diffcheck: give a file or --corpus list", file=sys.stderr)
         return ERROR
@@ -294,7 +315,7 @@ def main(argv=None):
         print("diffcheck: %s" % e, file=sys.stderr)
         return ERROR
     if opts.report:
-        json.dump({"results": results}, open(opts.report, "w"), indent=1)
+        hostenv.write_text(opts.report, json.dumps({"results": results}, indent=1))
     for r in results:
         print("%-17s %s::%s  %s" % (r["status"], r["file"], r["entry"], (r.get("reason") or "")[:160]))
     print(summary(results))

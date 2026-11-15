@@ -104,6 +104,25 @@ with tempfile.TemporaryDirectory() as d:
     open(listing, "a").write("%s\n" % kernel("zero_kernel.metal"))
     r = subprocess.run(base, capture_output=True, text=True)
     assert r.returncode == 1 and "1 zero-output" in r.stdout, r
+# Zero sizes are refused; a directive naming no buffer is an error, not a silent no-op.
+for flag in ("--grid", "--local", "--cases"):
+    rc, out, data = run("fma_kernel.metal", flag, "0")
+    assert rc == 2, (flag, rc, out)
+rc, out, data = run("unknown_exclude_kernel.metal")
+assert rc == 2 and "scratchh" in json.dumps(data), (rc, out)
+rc, out, data = run("fma_kernel.metal", "--range", "nosuch=0:3")
+assert rc == 2, (rc, out)
+
+# An mslc that dies on a signal is an error naming the signal, not a skipped file.
+with tempfile.TemporaryDirectory() as d:
+    crasher = os.path.join(d, "mslc-crash")
+    with open(crasher, "w") as f:
+        f.write("#!/bin/sh\nkill -SEGV $$\n")
+    os.chmod(crasher, 0o755)
+    r = subprocess.run([sys.executable, DRIVER, kernel("fma_kernel.metal"), "--mslc", crasher, "--metalhost", metalhost,
+                        "--vkhost", vkhost], capture_output=True, text=True)
+    assert r.returncode == 2 and "SIGSEGV" in r.stdout and r.stdout.startswith("error"), r
+
 with tempfile.TemporaryDirectory() as d:
     listing = os.path.join(d, "list.txt")
     open(os.path.join(d, "missing.metal"), "w").write("kernel void k() { nope(); }\n")

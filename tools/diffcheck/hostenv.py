@@ -1,6 +1,7 @@
 """Locating the pieces diffcheck needs outside the repo."""
 
 import glob
+import json
 import os
 import shutil
 
@@ -34,3 +35,28 @@ def vulkan_env():
 
 def have_tool(name):
     return shutil.which(name) is not None
+
+
+def read_text(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def write_text(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def write_bytes(path, data):
+    with open(path, "wb") as f:
+        f.write(data)

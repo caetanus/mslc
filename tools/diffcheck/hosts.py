@@ -26,7 +26,7 @@ class HostError(Exception):
 
 
 def _built(source, name, compile_cmd):
-    digest = hashlib.sha256(open(source, "rb").read()).hexdigest()[:12]
+    digest = hashlib.sha256(hostenv.read_bytes(source)).hexdigest()[:12]
     out_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "diffcheck-hosts")
     os.makedirs(out_dir, exist_ok=True)
     binary = os.path.join(out_dir, "%s-%s" % (name, digest))
@@ -108,7 +108,7 @@ def apple_source_lines(source, work, includes, std, contract=False):
     A quoted #include cannot be resolved from an in-memory source, so such a file is built
     with `xcrun metal` (same compiler, same flags) into a metallib instead.
     """
-    text = open(source, encoding="utf-8", errors="replace").read()
+    text = hostenv.read_text(source)
     if not re.search(r'^\s*#\s*include\s*"', text, re.M):
         return ["source " + source, "contract " + ("on" if contract else "off")] + (["std " + std] if std else [])
     air, lib = os.path.join(work, "apple.air"), os.path.join(work, "apple.metallib")
@@ -128,6 +128,6 @@ def apple_source_lines(source, work, includes, std, contract=False):
 def apple_reflection(binary, source_lines, entry, work):
     out = os.path.join(work, "apple-reflection.json")
     path = os.path.join(work, "apple-reflect.txt")
-    open(path, "w").write("\n".join(["mode reflect"] + source_lines + ["entry " + entry, "reflection " + out]) + "\n")
+    hostenv.write_text(path, "\n".join(["mode reflect"] + source_lines + ["entry " + entry, "reflection " + out]) + "\n")
     run_metal(binary, path)
-    return json.load(open(out))
+    return hostenv.read_json(out)
