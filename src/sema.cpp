@@ -1392,6 +1392,17 @@ Id TypeTable::storageImage(TextureAccess access, ScalarKind element) {
 	return cached;
 }
 
+Id TypeTable::subpassImage(ScalarKind element) {
+	Id& cached = _subpassImages[element];
+	if (cached == InvalidId) {
+		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::InputAttachment) });
+		cached = _builder.emitDecl(spirv::OpTypeImage, { scalar(element),
+			spirv::Dim::SubpassData, 0u, 0u, 0u, 2u,
+			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
+	}
+	return cached;
+}
+
 Id TypeTable::samplerType() {
 	if (_samplerType == InvalidId) {
 		_samplerType = _builder.emitDecl(spirv::OpTypeSampler);
@@ -2004,6 +2015,11 @@ namespace {
 		Id variable = InvalidId;
 		Id interfaceType = InvalidId;
 		Id valueType = InvalidId;
+		// Framebuffer fetch: the colour attachment read, instead of an Input variable.
+		// variable is the input attachment descriptor once declareAttachments has run.
+		std::optional<uint32_t> attachment;
+		ScalarKind sampled = ScalarKind::Float;
+		std::string name;
 	};
 
 
@@ -2365,6 +2381,13 @@ namespace {
 		const Parameter* _threadsPerThreadgroup = nullptr;
 		Id _localSize[3] = { InvalidId, InvalidId, InvalidId };
 		std::vector<StageVariable> _stageInputs;
+		// Framebuffer fetch: a [[color(n)]] parameter and the value it is read into.
+		struct AttachmentParameter {
+			const Parameter* parameter;
+			StageVariable variable;
+		};
+		std::vector<AttachmentParameter> _attachmentParameters;
+		std::set<uint32_t> _attachmentIndices;
 		// At most one BuiltIn FragCoord Input variable per fragment entry point,
 		// whether it comes from a stage-struct [[position]] field or a direct
 		// [[position]]/[[frag_coord]] parameter.
@@ -2504,6 +2527,10 @@ namespace {
 		std::vector<StageVariable> declareVertexAttributes(const StructDecl& decl);
 		void declareStageOutputs();
 		void loadStageInputs();
+		StageVariable declareFramebufferFetch(const Type& type, uint32_t index, const std::string& name,
+			const std::string& what);
+		void declareAttachments();
+		Id readAttachment(const StageVariable& attachment);
 		void emitReturn(const Statement& statement);
 		void checkStageInterfacesAgree() const;
 		void emitFunctionBody(const Statement& statement);
@@ -8424,7 +8451,8 @@ namespace {
 		for (const Parameter& parameter: entryPoint.parameters) {
 			if (parameter.attributes.bufferIndex || parameter.attributes.textureIndex
 				|| parameter.attributes.samplerIndex || parameter.attributes.builtin
-				|| parameter.attributes.stageIn || parameter.type.resource != ResourceKind::None) {
+				|| parameter.attributes.stageIn || parameter.attributes.colorIndex
+				|| parameter.type.resource != ResourceKind::None) {
 				continue;
 			}
 
@@ -8493,6 +8521,21 @@ namespace {
 				_stageInputs = _entryPoint->stage == Stage::Vertex
 					? declareVertexAttributes(*decl)
 					: declareStageStruct(*decl, spirv::StorageClass::Input);
+				continue;
+			}
+
+			if (parameter.attributes.colorIndex) {
+				if (_entryPoint->stage != Stage::Fragment) {
+					throw CompileError("parameter \"" + parameter.name + "\" is [[color(n)]], which only a "
+						"fragment function reads");
+				}
+				if (parameter.isReference || parameter.type.isPointer) {
+					throw CompileError("parameter \"" + parameter.name + "\" is [[color(n)]], which Apple's "
+						"compiler takes by value");
+				}
+				requireThreadAddressSpace(parameter, "[[color(n)]]");
+				_attachmentParameters.push_back({ &parameter, declareFramebufferFetch(parameter.type,
+					*parameter.attributes.colorIndex, parameter.name, "parameter \"" + parameter.name + "\"") });
 				continue;
 			}
 
@@ -8831,6 +8874,9 @@ namespace {
 		_threadgroupLocals.clear();
 		reserveThreadgroupLocals(*_entryPoint->body);
 		reserveFileScopeSamplers();
+		// Last, so the constexpr samplers keep the bindings right after the textures and samplers,
+		// the order indium binds by; an attachment is not part of Iridium's argument list.
+		declareAttachments();
 	}
 
 	// One entry per binding goes in the reflection. The separator goes before the
@@ -9730,7 +9776,7 @@ namespace {
 		std::vector<std::optional<uint32_t>> locations;
 		uint32_t next = 0;
 		for (const StructField& field: decl.fields) {
-			if (field.attributes.position) {
+			if (field.attributes.position || field.attributes.colorIndex) {
 				locations.emplace_back(std::nullopt);
 			} else if (const auto named = field.attributes.userName
 				? locnLocation(*field.attributes.userName) : std::nullopt) {
@@ -9774,12 +9820,16 @@ namespace {
 					: what + " has [[sample_mask]], which is not valid on a vertex output");
 			}
 			if (field.attributes.colorIndex) {
-				throw CompileError(isInput
-					? what + " is [[color(n)]] on a fragment input, which is framebuffer fetch: mslc does "
-						"not lower it, because Vulkan reads a previous colour attachment only through a "
-						"subpass input attachment, which needs a descriptor mslc does not assign"
-					: what + " is [[color(n)]], which is not valid on a vertex output; it names a "
+				if (!isInput) {
+					throw CompileError(what + " is [[color(n)]], which is not valid on a vertex output; it names a "
 						"fragment output's colour attachment");
+				}
+				if (field.attributes.position || field.attributes.pointSize || field.attributes.userName
+					|| field.attributes.attributeIndex || field.attributes.interpolation != Interpolation::None) {
+					throw CompileError(what + " is [[color(n)]], which cannot also carry another attribute");
+				}
+				variables.push_back(declareFramebufferFetch(field.type, *field.attributes.colorIndex, field.name, what));
+				continue;
 			}
 			const Interpolation interpolation = field.attributes.interpolation;
 			if (field.attributes.position && interpolation != Interpolation::None) {
@@ -10104,10 +10154,116 @@ namespace {
 		_outputs = declareStageStruct(*decl, spirv::StorageClass::Output);
 	}
 
+	// Framebuffer fetch, [[color(n)]] on a fragment input field or parameter: Vulkan reads the
+	// colour attachment a previous subpass wrote only through an input attachment, so the value
+	// is an OpImageRead of one whose InputAttachmentIndex is n. The descriptor is bound by
+	// declareAttachments, after every texture and sampler binding of the entry point.
+	StageVariable Emitter::declareFramebufferFetch(const Type& type, uint32_t index, const std::string& name,
+		const std::string& what) {
+		constexpr uint32_t maxColorAttachments = 8;
+		if (_entryPoint->stage != Stage::Fragment) {
+			throw CompileError(what + " is [[color(n)]], which only a fragment function reads");
+		}
+		const bool sampled = type.scalar == ScalarKind::Float || type.scalar == ScalarKind::Half
+			|| type.scalar == ScalarKind::Int || type.scalar == ScalarKind::UInt;
+		if (type.isPointer || type.arrayLength || !type.namedType.empty() || type.isMatrix()
+			|| type.isPacked || type.vectorWidth != 4 || !sampled) {
+			throw CompileError(what + " is [[color(n)]] with type " + typeName(type) + ", and mslc "
+				"reads a colour attachment only as a float4, half4, int4 or uint4");
+		}
+		if (index >= maxColorAttachments) {
+			throw CompileError(what + " is [[color(" + std::to_string(index) + ")]], and Apple's "
+				"compiler allows indices 0 to 7");
+		}
+		if (!_attachmentIndices.insert(index).second) {
+			throw CompileError(what + " reuses [[color(" + std::to_string(index) + ")]], which "
+				"another input of this function already reads");
+		}
+
+		// Apple pairs the fetched colour with the output of the same index and refuses a pair of
+		// different types, so a half4 read cannot be written back as a float4.
+		const Type& returned = _entryPoint->returnType;
+		const Type* output = nullptr;
+		if (const StructDecl* decl = structValue(returned)) {
+			for (const StructField& field: decl->fields) {
+				if (field.attributes.colorIndex == index) {
+					output = &field.type;
+				}
+			}
+		} else if (index == 0 && returned.scalar != ScalarKind::Void && !returned.isPointer) {
+			output = &returned;
+		}
+		if (output && (output->scalar != type.scalar || output->vectorWidth != type.vectorWidth)) {
+			throw CompileError(what + ": 'color' attachment " + std::to_string(index) + " has different "
+				"types on input (" + typeName(type) + ") and output (" + typeName(*output) + ")");
+		}
+
+		Type carried = type;
+		if (carried.scalar == ScalarKind::Half) {
+			carried.scalar = ScalarKind::Float;
+		}
+		StageVariable fetch;
+		fetch.attachment = index;
+		fetch.sampled = carried.scalar;
+		fetch.name = name;
+		fetch.valueType = declaredTypeOf(type);
+		fetch.interfaceType = declaredTypeOf(carried);
+		return fetch;
+	}
+
+	// One input attachment descriptor per fetched colour, after the textures and samplers and
+	// in colour order, in the fragment function's set. A consumer binds the attachment's
+	// view there and maps pInputAttachments[input_attachment_index] to the colour attachment.
+	void Emitter::declareAttachments() {
+		std::vector<StageVariable*> fetches;
+		for (StageVariable& input: _stageInputs) {
+			if (input.attachment) {
+				fetches.push_back(&input);
+			}
+		}
+		for (AttachmentParameter& fetched: _attachmentParameters) {
+			fetches.push_back(&fetched.variable);
+		}
+		std::sort(fetches.begin(), fetches.end(), [](const StageVariable* a, const StageVariable* b) {
+			return *a->attachment < *b->attachment;
+		});
+
+		for (StageVariable* fetch: fetches) {
+			const uint32_t binding = _nextBinding++;
+			const Id imageType = _types.subpassImage(fetch->sampled);
+			fetch->variable = declareDescriptorVariable(imageType, binding);
+			_builder.emit(spirv::OpDecorate, { fetch->variable,
+				static_cast<uint32_t>(spirv::Decoration::InputAttachmentIndex), *fetch->attachment });
+			addReflectionEntry("{ \"kind\": \"InputAttachment\", \"metal_index\": "
+				+ std::to_string(*fetch->attachment) + ", \"descriptor\": " + descriptorJson(binding)
+				+ ", \"input_attachment_index\": " + std::to_string(*fetch->attachment)
+				+ ", \"scalar\": \"" + std::string(fetch->sampled == ScalarKind::Float ? "float"
+					: fetch->sampled == ScalarKind::Int ? "int" : "uint") + "\""
+				+ ", \"name\": \"" + fetch->name + "\" }");
+		}
+	}
+
+	Id Emitter::readAttachment(const StageVariable& attachment) {
+		const Id imageType = _types.subpassImage(attachment.sampled);
+		const Id image = loadFrom(attachment.variable, imageType);
+		const Id origin = _types.zero(_types.vector(ScalarKind::Int, 2));
+		const Id texel = _builder.emitTyped(spirv::OpImageRead, attachment.interfaceType, { image, origin });
+		return convert(texel, attachment.interfaceType, attachment.valueType);
+	}
+
 	// The [[stage_in]] parameter becomes a local holding the struct, filled from
 	// the Input variables at the top of the function, so a field of it is read
 	// the way a field of any local is.
 	void Emitter::loadStageInputs() {
+		for (const AttachmentParameter& fetched: _attachmentParameters) {
+			const Id declared = fetched.variable.valueType;
+			const Id local = _builder.emitDeclTyped(spirv::OpVariable,
+				_types.pointer(spirv::StorageClass::Function, declared),
+				{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+			_builder.emit(spirv::OpStore, { local, readAttachment(fetched.variable) });
+			bindLocal(fetched.parameter->name, local, declared, fetched.parameter->type);
+		}
+
 		if (!_stageIn) {
 			return;
 		}
@@ -10115,6 +10271,10 @@ namespace {
 		const Id structType = declaredTypeOf(_stageIn->type);
 		std::vector<uint32_t> fields;
 		for (const StageVariable& input: _stageInputs) {
+			if (input.attachment) {
+				fields.push_back(readAttachment(input));
+				continue;
+			}
 			const Id loaded = loadFrom(input.variable, input.interfaceType);
 			fields.push_back(convert(loaded, input.interfaceType, input.valueType));
 		}
@@ -10242,7 +10402,7 @@ namespace {
 				const auto locations = stageLocations(*decl);
 				for (size_t index = 0; index < decl->fields.size(); ++index) {
 					const StructField& field = decl->fields[index];
-					if (!field.attributes.position && !field.attributes.pointSize) {
+					if (!field.attributes.position && !field.attributes.pointSize && !field.attributes.colorIndex) {
 						fields.push_back({ field.attributes.userName.value_or(field.name),
 							typeName(field.type), *locations[index] });
 					}
@@ -12198,6 +12358,8 @@ namespace {
 			_stageIn = nullptr;
 			_threadsPerThreadgroup = nullptr;
 			_stageInputs.clear();
+			_attachmentParameters.clear();
+			_attachmentIndices.clear();
 			_hasFragCoordInput = false;
 			_terminated = false;
 

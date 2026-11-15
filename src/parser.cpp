@@ -3478,9 +3478,10 @@ ParameterAttributes Parser::parseParameterAttributes() {
 		} else if (name == "stage_in") {
 			attributes.stageIn = true;
 		} else if (name == "color") {
-			throw CompileError("[[color(n)]] on a parameter is framebuffer fetch, which mslc does not "
-				"lower: Vulkan reads a previous colour attachment only through a subpass input "
-				"attachment, which needs a descriptor mslc does not assign");
+			if (!argument) {
+				throw CompileError("[[color]] needs an index");
+			}
+			attributes.colorIndex = argument;
 		} else if (auto builtin = builtinFromName(name)) {
 			attributes.builtin = builtin;
 		} else if (isMSLBuiltinName(name)) {

@@ -37,6 +37,23 @@ Original evidence (2026-10-10):
 If a *new* failure reproduces, record fresh evidence rather than reviving this
 entry, since the original cause was never identified.
 
+## Framebuffer fetch ([[color(n)]] input) limits (#118)
+
+mslc lowers a fragment `[[color(n)]]` parameter or stage-in field to a SubpassData input
+attachment. What it does not cover:
+
+- The image is always single-sample (MS 0). A consumer with a multisampled colour attachment
+  gets an invalid pipeline, where Metal's fetch reads per sample.
+- Same-subpass programmable blending, where the fragment reads the attachment it writes, needs
+  a GENERAL feedback-loop layout and rasterization-order attachment access when primitives
+  overlap. The module is the same; the consumer (indium) must provide both. indium binds no
+  input attachment yet.
+- `float`, `float2`, `float3`, `short4` and `[[color(n)]]` combined with another attribute
+  (`[[color(0), flat]]`) are refused as policy: Apple accepts some of them, so these are not
+  Apple's rules.
+- A mismatched input and output type at one index is refused with Apple's wording, but only
+  against the return type of the same function.
+
 ## half `fwidth` lowers via widen-to-float32, Apple parity unmeasured (#173)
 
 `fwidth` on a `half`/`half2`/`half3`/`half4` argument lowers by converting the

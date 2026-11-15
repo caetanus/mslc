@@ -175,6 +175,9 @@ struct ParameterAttributes {
 
 	// [[stage_in]]
 	bool stageIn = false;
+
+	// [[color(n)]]: framebuffer fetch of colour attachment n
+	std::optional<uint32_t> colorIndex;
 };
 
 struct Parameter {

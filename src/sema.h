@@ -61,6 +61,7 @@ private:
 	std::map<ResourceKind, spirv::Id> _sampledImages;
 	spirv::Id _samplerType = spirv::InvalidId;
 	std::map<ScalarKind, spirv::Id> _storageImages;
+	std::map<ScalarKind, spirv::Id> _subpassImages;
 	bool _storageReadDeclared = false;
 	bool _storageWriteDeclared = false;
 
@@ -103,6 +104,9 @@ public:
 	// is a float image narrowed after the read, as for a sampled one. Iridium
 	// declares every non-sample texture this way (indium src/iridium/air.cpp:772).
 	spirv::Id storageImage(TextureAccess access, ScalarKind element);
+	// An input attachment of the given sampled scalar, which is how Vulkan reads the
+	// framebuffer at the fragment's own pixel.
+	spirv::Id subpassImage(ScalarKind element);
 	spirv::Id samplerType();
 	spirv::Id sampledImage(ResourceKind kind);
 
@@ -305,6 +309,19 @@ struct ModuleOptions {
 // "name": field }. n is the field's [[attribute(n)]], the key of indium's vertex
 // descriptor attribute, and is also the Location of the Input variable. On this
 // entry metal_index is an attribute index, never a [[buffer(n)]] index.
+// A fragment function's [[color(n)]] parameter or [[stage_in]] field is framebuffer fetch,
+// one binding per attachment, in colour order, after the textures and samplers:
+// { "kind": "InputAttachment", "metal_index": n, "descriptor": { "set": 1, "binding": b },
+// "input_attachment_index": n, "scalar": "float"|"int"|"uint", "name": ... }. metal_index and
+// input_attachment_index are deliberately equal: both are the colour attachment's index n, the
+// first as Metal numbers it (Apple's render_target index) and the second as the subpass's
+// pInputAttachments slot. The binding comes after every texture, sampler and constexpr sampler.
+// The image is always single-sample (MS 0): a multisampled colour attachment would need a
+// different image type, which mslc does not emit.
+// The variable is an OpTypeImage SubpassData with InputAttachmentIndex n, read at the
+// fragment's own pixel. A consumer binds the colour attachment's view as an input
+// attachment descriptor at that binding and maps pInputAttachments[n] to colour attachment n
+// in the subpass. A half4 is a float image; the module converts.
 // reflection_version stays 2 because bindings are additive: a consumer switches
 // on "kind" and ignores kinds it does not know.
 //
