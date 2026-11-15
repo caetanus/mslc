@@ -2554,7 +2554,7 @@ namespace {
 		Id samplingCoordinate(const Expression& coordinate, ResourceKind kind, const Expression* layer, const std::string& callName);
 		Id emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component);
 		Id literalOffset(const Expression& expression, uint32_t width);
-		Id layerIndex(const Expression& layer, const std::string& callName);
+		Id layerIndex(const Expression& layer, const std::string& callName, const char* what = "array index");
 		Id appendLayers(Id coordinate, ResourceKind kind, const std::vector<ExpressionPtr>& arguments, size_t first,
 			const std::string& callName);
 		Id appendArrayLayer(Id coordinate, ScalarKind component, const Expression& layer,
@@ -9474,7 +9474,7 @@ namespace {
 	// A lod_clamp bound as a JSON number: the shortest decimal form of the float.
 	static std::string lodNumber(float value) {
 		char text[32];
-		std::snprintf(text, sizeof text, "%g", static_cast<double>(value));
+		std::snprintf(text, sizeof text, "%.9g", static_cast<double>(value));
 		return text;
 	}
 
@@ -10039,11 +10039,11 @@ namespace {
 	// A texture2d_array coordinate of `component` with its layer appended as the
 	// last component, which is where an arrayed image instruction takes it. The
 	// layer is a uint in Metal, so an int wraps to uint before a sample sees it.
-	Id Emitter::layerIndex(const Expression& layer, const std::string& callName) {
+	Id Emitter::layerIndex(const Expression& layer, const std::string& callName, const char* what) {
 		const Id value = emitExpression(layer);
 		const Id valueType = _builder.typeOf(value);
 		if (_types.vectorWidth(valueType) != 1 || _types.isFloat(valueType) || _types.bitWidth(valueType) < 8) {
-			throw CompileError("the array index of " + callName + " has to be an integer");
+			throw CompileError(std::string("the ") + what + " of " + callName + " has to be an integer");
 		}
 
 		return convert(value, valueType, _uintType);
@@ -10189,8 +10189,9 @@ namespace {
 				: std::string();
 			const bool isComponent = argument.kind == ExpressionKind::Identifier
 				&& argument.name.find("component::") != std::string::npos;
-			if (isComponent && compare) {
-				throw CompileError("gather_compare takes no component: it compares the depth channel");
+			if (isComponent && (compare || texture.pointeeMsl.isDepth)) {
+				throw CompileError(compare ? "gather_compare takes no component: it compares the depth channel"
+					: "gather on a depth texture takes no component: it gathers the depth channel");
 			}
 			if (isComponent) {
 				const auto found = std::string("xyzw").find(tail);
@@ -10555,7 +10556,7 @@ namespace {
 		if (arrayed) {
 			coordinate = appendArrayLayer(coordinate, ScalarKind::UInt, *arguments[1], "read");
 		}
-		const Id sampleIndex = layerIndex(*arguments[fixed - 1], "read");
+		const Id sampleIndex = layerIndex(*arguments[fixed - 1], "read", "sample index");
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		return textureTexel(texture, _builder.emitTyped(spirv::OpImageFetch,
 			_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4),
