@@ -11395,10 +11395,13 @@ namespace {
 		requireStorable(left);
 		// A struct prvalue takes the trivial assignment: the right side is evaluated first, as
 		// Apple does, then the left, and the result is dropped.
-		if (!compound && (left.kind == ExpressionKind::InitList || left.kind == ExpressionKind::Call)) {
+		if (left.kind == ExpressionKind::InitList || left.kind == ExpressionKind::Call) {
 			const StructDecl* target = structOf(left);
 			if (!target) {
 				throw CompileError("expression is not assignable");
+			}
+			if (compound) {
+				throw CompileError("no viable overloaded compound assignment for a " + target->name + " temporary");
 			}
 			const Id value = emitExpression(right);
 			const std::string* source = _types.structNameOf(_builder.typeOf(value), nullptr);
