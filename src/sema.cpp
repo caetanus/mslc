@@ -11522,8 +11522,11 @@ namespace {
 			}
 		}
 
+		// A threadgroup array gets no initialising store: Metal leaves threadgroup memory
+		// uninitialised and every invocation reaches this declaration, so a store would
+		// erase what the others had already written.
 		Id initial = InvalidId;
-		if (!storageOnly) {
+		if (!storageOnly && !threadgroup) {
 			if (!declaration.initializer) {
 				initial = _types.zero(arrayType);
 			} else if (declaration.initializer->kind != ExpressionKind::InitList) {
@@ -11569,7 +11572,7 @@ namespace {
 				_types.pointer(storage, arrayType),
 				{ static_cast<uint32_t>(storage) });
 		}
-		if (!storageOnly) {
+		if (!storageOnly && !threadgroup) {
 			_builder.emit(spirv::OpStore, { variable, initial });
 		}
 		bindLocal(declaration.name, variable, arrayType, type, storage);
