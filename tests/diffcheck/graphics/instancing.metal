@@ -9,7 +9,7 @@ struct VIn { float2 pos [[attribute(0)]]; };
 struct VOut { float4 pos [[position]]; float4 tint [[flat]]; };
 vertex VOut vs(VIn in [[stage_in]], uint iid [[instance_id]], constant float4* tints [[buffer(1)]]) {
 	VOut o;
-	o.pos = float4(in.pos.x + 0.04 * float(iid), in.pos.y, 0.5, 1.0);
+	o.pos = float4(in.pos.x + 0.0625 * float(iid), in.pos.y, 0.5, 1.0);
 	o.tint = tints[iid];
 	return o;
 }

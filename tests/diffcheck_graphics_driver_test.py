@@ -46,6 +46,13 @@ MUTANTS = [
     ("texture_sample", "fragment", [["OpConstant %float 0.625", "OpConstant %float 0.875"]]),
     ("instancing", "vertex", [["BuiltIn InstanceIndex", "BuiltIn VertexIndex"]]),
     ("depth_output", "fragment", [["OpFMul %float", "OpFAdd %float"]]),
+    # The last colour target is written by the source but moved to another location by the module:
+    # it must not vanish from the comparison.
+    ("multi_target", "fragment", [["Location 2", "Location 5"]], "reflection-mismatch"),
+    ("multi_target", "fragment", [["OpConstant %uint 7", "OpConstant %uint 8"]]),
+    # A constant output component sits next to interpolated ones: one and forty ULP must both show.
+    ("mixed_components", "fragment", [["OpConstant %float 0.375", "OpConstant %float 0.37500003"]]),
+    ("mixed_components", "fragment", [["OpConstant %float 0.375", "OpConstant %float 0.37500119"]]),
 ]
 
 rc, out, data = run(probe("flat_colour"))
@@ -53,16 +60,17 @@ if rc == 77:
     print(out)
     sys.exit(77)
 
-for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output"):
+for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
+             "multi_target", "mixed_components"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
 
-for name, stage, edits in MUTANTS:
+for name, stage, edits, *expect in MUTANTS:
     env = {"MSLC_REAL": mslc, "MUT": json.dumps(edits), "MUT_STAGE": stage}
     rc, out, data = run(probe(name), mslc_cmd=MUTATE, env=env)
-    assert rc == 1 and data["status"] == "mismatched", ("mutant not detected", name, stage, rc, out)
-    assert data["reason"].startswith("first difference"), data
+    status = expect[0] if expect else "mismatched"
+    assert rc == 1 and data["status"] == status, ("mutant not detected", name, stage, edits, rc, out)
 
 # The hook that damages one byte of mslc's attachment is reported with the attachment and offset.
 rc, out, data = run(probe("flat_colour"), "--corrupt-mslc", "color0:8")
@@ -83,6 +91,8 @@ rc, out, data = run(fixture("gfx_no_position"))
 assert rc == 2 and "DIFFCHECK-POSITION" in data["reason"], (rc, out)
 rc, out, data = run(fixture("gfx_clipped_geometry"))
 assert rc == 2 and "strictly inside" in data["reason"], (rc, out)
+rc, out, data = run(fixture("gfx_off_grid_geometry"))
+assert rc == 2 and "subpixel grid" in data["reason"], (rc, out)
 rc, out, data = run(fixture("gfx_writable_buffer"))
 assert rc == 3 and "writable" in data["reason"], (rc, out)
 

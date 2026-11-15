@@ -27,10 +27,12 @@ import compare
 import hostenv
 import hosts
 import inputs
+import outputs
 import spirvio
 
 # (host format name, scalar of the attachment) per fragment output scalar.
-COLOR_FORMATS = {"float": "rgba32float", "int": "rgba32sint", "uint": "rgba32uint", "half": "rgba16float"}
+COLOR_SUFFIX = {"float": "32float", "int": "32sint", "uint": "32uint", "half": "16float"}
+CHANNELS = {1: "r", 2: "rg", 4: "rgba"}  # a pixel format needs as many channels as the output has components
 # Clear values no plausible shader output equals, so "a pixel changed" means "a pixel was drawn".
 CLEAR = {"float": (-1.5, -2.5, -3.5, -4.5), "half": (-1.5, -2.5, -3.5, -4.5),
          "int": (-12345, 54321, -777, 31), "uint": (123456, 654321, 77777, 4242)}
@@ -40,6 +42,7 @@ DEPTH_INDEX = 100
 # because a ULP bound is useless near zero; measured on the probes, then rounded up.
 INTERP_ULP, INTERP_EPS = 32, 2e-5
 DEPTH_EPS = 1e-6
+SUBPIXEL = 256  # vertex positions must sit on this grid, in pixels
 SLOT_TOP = 30  # attribute at location n is vertex buffer slot 30 - n, away from [[buffer(n)]] arguments
 MAX_COLOR = 8
 TEXTURE_SIZE = 4
@@ -62,21 +65,31 @@ def ndc(point, width, height):
 
 
 def check_geometry(points, width, height):
+    if any(n < 2 or n & (n - 1) for n in (width, height)):
+        raise GraphicsError("width and height must be powers of two, so every pixel coordinate converts to clip "
+                            "space exactly (got %dx%d)" % (width, height))
     if not points or len(points) % 3:
         raise GraphicsError("DIFFCHECK-GEOMETRY needs a multiple of 3 points, got %d" % len(points))
     for x, y, z in points:
         if not (0 < x < width and 0 < y < height and 0 <= z <= 1):
             raise GraphicsError("geometry point %g,%g,%g is not strictly inside the %dx%d target "
                                 "(clipped geometry differs between the backends)" % (x, y, z, width, height))
+        if x * SUBPIXEL != int(x * SUBPIXEL) or y * SUBPIXEL != int(y * SUBPIXEL):
+            raise GraphicsError("geometry point %g,%g is off the 1/%d subpixel grid: the backends snap it "
+                                "differently and the interpolated values drift apart" % (x, y, SUBPIXEL))
 
 
 def format_name(scalar, comps):
     return scalar if comps == 1 else "%s%d" % (scalar, comps)
 
 
+def color_format(scalar, comps):
+    return CHANNELS[comps] + COLOR_SUFFIX[scalar]
+
+
 def attachment_layout(name, scalar, comps):
     size = compare.SCALARS[scalar][0]
-    return {"name": name, "stride": 4 * size, "access": "readwrite",
+    return {"name": name, "stride": comps * size, "access": "readwrite",
             "leaves": [{"off": i * size, "scalar": scalar} for i in range(comps)]}
 
 
@@ -84,9 +97,9 @@ def depth_layout():
     return {"name": "depth", "stride": 4, "access": "readwrite", "leaves": [{"off": 0, "scalar": "float"}]}
 
 
-def clear_image(scalar, pixels):
+def clear_image(scalar, comps, pixels):
     fmt = "<f" if scalar == "float" else "<e" if scalar == "half" else "<i" if scalar == "int" else "<I"
-    return bytearray(b"".join(struct.pack(fmt, v) for v in CLEAR[scalar]) * pixels)
+    return bytearray(b"".join(struct.pack(fmt, v) for v in CLEAR[scalar][:comps]) * pixels)
 
 
 def vertex_data(attributes, points, position, width, height, rng, profile):
@@ -111,6 +124,24 @@ def texture_data(rng, profile):
                               for _ in range(4 * TEXTURE_SIZE * TEXTURE_SIZE)))
 
 
+def split_leaves(layout, apple, primitives):
+    """(exact, smooth) leaves of one attachment. A float component whose Apple values take more
+    distinct values than there are primitives (plus the clear value) varies across a primitive,
+    so it is interpolated and gets a tolerance; a constant, a flat varying or anything that
+    takes at most one value per primitive is compared bit for bit. Decided from Apple's image,
+    not from mslc's module, so a miscompile cannot loosen its own comparison."""
+    exact, smooth = [], []
+    for leaf in layout["leaves"]:
+        scalar = leaf["scalar"]
+        size = compare.SCALARS[scalar][0]
+        if compare.SCALARS[scalar][1] != "float":
+            exact.append(leaf)
+            continue
+        seen = {bytes(apple[at:at + size]) for at in range(leaf["off"], len(apple), layout["stride"])}
+        (smooth if len(seen) > primitives + 1 else exact).append(leaf)
+    return exact, smooth
+
+
 def tolerance(source_ulp, interpolated, scalar):
     """(ulp, eps) for one attachment: exact for integers and flat floats."""
     if compare.SCALARS[scalar][1] != "float" or not interpolated:
@@ -122,7 +153,7 @@ def pipeline_lines(width, height, vs, fs, attributes, colors, depth):
     """The shape both Apple calls need: enough to build the render pipeline, no data."""
     lines = ["vertex " + vs, "fragment " + fs, "target %d %d" % (width, height)]
     lines += ["attr %d %s" % (loc, format_name(a["scalar"], a["comps"])) for loc, a in sorted(attributes.items())]
-    lines += ["color %d %s" % (i, COLOR_FORMATS[s]) for i, (s, _) in sorted(colors.items())]
+    lines += ["color %d %s" % (i, color_format(s, c)) for i, (s, c) in sorted(colors.items())]
     return lines + (["depth"] if depth else [])
 
 
@@ -189,14 +220,21 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         if b["kind"] == "VertexInput" and b["location"] in vif["inputs"]:
             attributes[b["location"]] = dict(vif["inputs"][b["location"]], name=b["name"])
     problems += ["half scalar vertex attribute %s" % a["name"] for a in attributes.values() if a["scalar"] == "half" and a["comps"] == 1]
-    colors = {i: (o["scalar"], o["comps"]) for i, o in fif["outputs"].items()}
-    if sorted(colors) != list(range(len(colors))) or len(colors) > MAX_COLOR:
-        problems.append("colour outputs are not locations 0..n-1")
-    depth = params["depth"] or fif["frag_depth"]
+    try:
+        colors, src_depth = outputs.fragment_outputs(hostenv.read_text(source), fs)
+    except outputs.Unsupported as e:
+        problems.append(str(e))
+        colors, src_depth = {}, False
+    depth = params["depth"] or src_depth
+    problems += ["colour %d has 3 components, which no pixel format holds" % i for i, (_, c) in colors.items() if c == 3]
     if not colors and not depth:
         problems.append("the fragment function writes no colour or depth output")
     if problems:
         return None, _skipped(res, "unsupported: " + "; ".join(problems))
+    findings = outputs.cross_check(colors, src_depth, fif)
+    if findings:
+        res.update(status="reflection-mismatch", reason="; ".join(findings))
+        return None, res
     position = params["position"]
     names = {a["name"]: a for a in attributes.values()}
     if attributes and position is None:
@@ -241,7 +279,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         res.update(status="reflection-mismatch", reason="; ".join(findings))
         return None, res
     return dict(res=res, compiled=compiled, attributes=attributes, position=position, colors=colors, depth=depth,
-                points=points, shape=shape, lines=lines, layouts=layouts, interpolated=any(not v["flat"] for v in fif["inputs"].values())), None
+                points=points, shape=shape, lines=lines, layouts=layouts), None
 
 
 def check_pair(opts, source, vs, fs, params, work, includes):
@@ -251,12 +289,13 @@ def check_pair(opts, source, vs, fs, params, work, includes):
         return early
     res, width, height = plan["res"], params["width"], params["height"]
     pixels = width * height
+    primitives = len(plan["points"]) // 3 * params["instances"]
     attach = {i: attachment_layout("color%d" % i, s, c) for i, (s, c) in plan["colors"].items()}
     if plan["depth"]:
         attach[DEPTH_INDEX] = depth_layout()
     excluded = dict(params["exclude"])
     compared = {i: l for i, l in attach.items() if l["name"] not in excluded}
-    before = {i: clear_image(plan["colors"][i][0], pixels) for i in plan["colors"]}
+    before = {i: clear_image(*plan["colors"][i], pixels) for i in plan["colors"]}
     if plan["depth"]:
         before[DEPTH_INDEX] = bytearray(struct.pack("<f", DEPTH_CLEAR) * pixels)
     ulp = compare.ulp_bound_for_source(hostenv.read_text(source))
@@ -311,10 +350,11 @@ def check_pair(opts, source, vs, fs, params, work, includes):
                     outs["mslc"][i][int(at)] ^= 0xff
         diffs = []
         for i, layout in sorted(compared.items()):
-            u, e = tolerance(ulp, plan["interpolated"], layout["leaves"][0]["scalar"])
-            if i == DEPTH_INDEX:
-                u, e = max(u, INTERP_ULP), DEPTH_EPS
-            diffs += [d.to_json() for d in compare.compare(layout, outs["apple"][i], outs["mslc"][i], u, eps=e)]
+            exact, smooth = split_leaves(layout, outs["apple"][i], primitives)
+            for leaves, (u, e) in ((exact, (ulp, 0.0)), (smooth, tolerance(ulp, True, "float"))):
+                if leaves:
+                    sub = dict(layout, leaves=leaves)
+                    diffs += [d.to_json() for d in compare.compare(sub, outs["apple"][i], outs["mslc"][i], u, eps=DEPTH_EPS if i == DEPTH_INDEX else e)]
         nonzero = nonzero or any(checks.written_nonzero(compared, before, outs[b]) for b in ("apple", "mslc"))
         control = checks.perturb(compared, outs["mslc"], outs["apple"])
         control_ok = False

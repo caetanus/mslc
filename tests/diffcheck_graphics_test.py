@@ -12,6 +12,7 @@ import checks  # noqa: E402
 import compare  # noqa: E402
 import directives  # noqa: E402
 import graphics  # noqa: E402
+import outputs  # noqa: E402
 import spirvio  # noqa: E402
 
 FLOAT = lambda v: struct.pack("<f", v)  # noqa: E731
@@ -82,9 +83,45 @@ class Geometry(unittest.TestCase):
             with self.assertRaises(graphics.GraphicsError, msg=points):
                 graphics.check_geometry(points, 32, 32)
 
+    def test_off_grid_vertices_and_non_power_of_two_targets_are_refused(self):
+        graphics.check_geometry([(8.25, 8.5, .5), (24, 8, .5), (8, 24.00390625, .5)], 32, 32)
+        for points, w, h in (([(8.3, 8, .5), (24, 8, .5), (8, 24, .5)], 32, 32), ([(8, 8, .5), (24, 8, .5), (8, 24.001, .5)], 32, 32),
+                             ([(8, 8, .5), (24, 8, .5), (8, 24, .5)], 30, 32)):
+            with self.assertRaises(graphics.GraphicsError, msg=points):
+                graphics.check_geometry(points, w, h)
+
     def test_pixel_to_ndc_keeps_row_zero_on_top(self):
         self.assertEqual(graphics.ndc((8, 8, .5), 32, 16), (-.5, 0.0, .5))
         self.assertEqual(graphics.ndc((16, 4, .5), 32, 16)[1], .5)
+
+
+class Outputs(unittest.TestCase):
+    SRC = ("struct F { float4 a [[color(0)]]; uint2 b [[color(1)]]; float d [[depth(any)]]; };\n"
+           "fragment F fs(int x) { }\n// fragment half4 other() {}\n")
+
+    def test_struct_members_give_colours_and_depth(self):
+        self.assertEqual(outputs.fragment_outputs(self.SRC, "fs"), ({0: ("float", 4), 1: ("uint", 2)}, True))
+
+    def test_plain_return_types(self):
+        self.assertEqual(outputs.fragment_outputs("fragment half4 fs() {}", "fs"), ({0: ("half", 4)}, False))
+        self.assertEqual(outputs.fragment_outputs("[[fragment]] void fs() {}", "fs"), ({}, False))
+
+    def test_unreadable_outputs_are_unsupported_not_guessed(self):
+        for src in ("fragment Mystery fs() {}", "fragment uchar4 fs() {}", "typedef int T;\nfragment T fs() {}",
+                    "struct F { float4 a [[color(1)]]; };\nfragment F fs() {}"):
+            with self.assertRaises(outputs.Unsupported, msg=src):
+                outputs.fragment_outputs(src, "fs")
+
+    def test_a_module_that_drops_or_retypes_an_output_is_a_finding(self):
+        colors = {0: ("float", 4), 1: ("uint", 2)}
+        iface = {"outputs": {0: {"scalar": "float", "comps": 4}, 1: {"scalar": "uint", "comps": 2}}, "frag_depth": False}
+        self.assertEqual(outputs.cross_check(colors, False, iface), [])
+        dropped = dict(iface, outputs={0: iface["outputs"][0]})
+        self.assertIn("[0, 1], mslc's module [0]", outputs.cross_check(colors, False, dropped)[0])
+        retyped = dict(iface, outputs={0: iface["outputs"][0], 1: {"scalar": "int", "comps": 2}})
+        self.assertIn("colour 1 is uint2", outputs.cross_check(colors, False, retyped)[0])
+        self.assertIn("writes a depth output", outputs.cross_check(colors, True, iface)[0])
+        self.assertEqual(outputs.cross_check({0: ("half", 4)}, False, {"outputs": {0: {"scalar": "float", "comps": 4}}, "frag_depth": False}), [])
 
 
 class Data(unittest.TestCase):
@@ -99,13 +136,15 @@ class Data(unittest.TestCase):
 
     def test_attachment_layout_compares_only_the_written_components(self):
         layout = graphics.attachment_layout("color0", "float", 2)
-        self.assertEqual((layout["stride"], [l["off"] for l in layout["leaves"]]), (16, [0, 4]))
-        clear = graphics.clear_image("int", 3)
-        self.assertEqual(struct.unpack("<12i", clear), graphics.CLEAR["int"] * 3)
+        self.assertEqual((layout["stride"], [l["off"] for l in layout["leaves"]]), (8, [0, 4]))
+        self.assertEqual(graphics.color_format("float", 2), "rg32float")
+        self.assertEqual(graphics.color_format("half", 4), "rgba16float")
+        clear = graphics.clear_image("int", 2, 3)
+        self.assertEqual(struct.unpack("<6i", clear), graphics.CLEAR["int"][:2] * 3)
 
     def test_a_drawn_pixel_counts_as_output_and_the_clear_colour_does_not(self):
         layout = {0: graphics.attachment_layout("color0", "float", 4)}
-        clear = {0: graphics.clear_image("float", 4)}
+        clear = {0: graphics.clear_image("float", 4, 4)}
         drawn = {0: bytearray(clear[0])}
         self.assertFalse(checks.written_nonzero(layout, clear, drawn))
         drawn[0][16:20] = FLOAT(0.5)
@@ -113,6 +152,20 @@ class Data(unittest.TestCase):
         zero = {0: bytearray(clear[0])}
         zero[0][16:32] = bytes(16)
         self.assertFalse(checks.written_nonzero(layout, clear, zero))
+
+
+class SplitLeaves(unittest.TestCase):
+    def test_components_constant_per_primitive_are_exact_and_varying_ones_are_not(self):
+        layout = graphics.attachment_layout("color0", "float", 3)
+        pixels = [(FLOAT(i * 0.001) , FLOAT(0.375), FLOAT(float(i % 2))) for i in range(40)]
+        apple = bytearray(b"".join(b"".join(p) for p in pixels))
+        exact, smooth = graphics.split_leaves(layout, apple, primitives=3)
+        self.assertEqual(([l["off"] for l in exact], [l["off"] for l in smooth]), ([4, 8], [0]))
+
+    def test_integers_are_always_exact(self):
+        layout = graphics.attachment_layout("color0", "uint", 1)
+        apple = bytearray(b"".join(struct.pack("<I", i) for i in range(40)))
+        self.assertEqual(graphics.split_leaves(layout, apple, 1), (layout["leaves"], []))
 
 
 class Tolerance(unittest.TestCase):
