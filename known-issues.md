@@ -495,3 +495,15 @@ All of these predate those fixes; counts are from generated differentials agains
   undeclared identifier (about 34 cases).
 - The library's names are visible without `#include <metal_stdlib>` (about 11 cases).
 - `namespace NB { typedef int metal; }` followed by `metal::abs` is accepted (2 cases).
+
+## A helper with a local `constexpr sampler`, reached by two entry points, is invalid SPIR-V (#167)
+
+A local `constexpr sampler L(...)` declared inside a helper (not the entry point) is reserved only
+for the entry point whose own body names it, and the helper is emitted once per stage. Two entry
+points of one stage that both call the helper share one copy, which uses the first entry's sampler
+variable: spirv-val reports "Interface variable ... is used by entry point 'g' ... but is not
+listed as an interface". Apple accepts it. Identical on master; found while reviewing #167.
+Reproduction: a helper `look(texture2d<float> t) { constexpr sampler L(filter::linear); return
+t.sample(L, float2(0.25)); }` called from two fragment entries. A fix has to reserve helper-local
+samplers per entry and mark the helper sampler-dependent (`_samplerDependent`), as for a file-scope
+sampler; the single-entry case is valid today and must stay so.
