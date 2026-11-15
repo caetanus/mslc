@@ -89,7 +89,7 @@ class Directives(unittest.TestCase):
                              "// DIFFCHECK-EXCLUDE: scratch reads uninitialised memory\nkernel void k() {}\n")
         self.assertEqual(d, {"run": {"grid": 64, "seed": 2}, "writes_zero": True,
                              "exclude": {"scratch": "reads uninitialised memory"},
-                             "range": {"which": (0, 3)}, "geometry": None, "position": None, "depth": False})
+                             "range": {"which": (0, 3)}, "unused": {}, "geometry": None, "position": None, "depth": False})
 
     def test_exclusion_without_a_reason_is_an_error(self):
         with self.assertRaises(ValueError):

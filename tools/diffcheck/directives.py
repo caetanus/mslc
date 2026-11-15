@@ -4,6 +4,8 @@
   // DIFFCHECK: writes-zero                          every output is legitimately all zero
   // DIFFCHECK-RANGE: <buffer> <lo> <hi>             integer leaves of that buffer are drawn from lo..hi,
                                                      for a buffer the kernel uses as an index
+  // DIFFCHECK-UNUSED: <texture> <reason>            the kernel legitimately ignores this texture (otherwise a
+                                                     texture the output does not depend on is a failure)
   // DIFFCHECK-EXCLUDE: <buffer> <reason>            skip a buffer's comparison; the reason
                                                      is required and is printed in the report
 
@@ -33,7 +35,7 @@ def _point(token):
 
 
 def parse(source):
-    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "geometry": None, "position": None,
+    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "unused": {}, "geometry": None, "position": None,
               "depth": False}
     for line in source.splitlines():
         m = re.match(r"\s*//\s*RUN:\s*(.*)$", line)
@@ -70,6 +72,12 @@ def parse(source):
             if lo > hi:
                 raise ValueError("DIFFCHECK-RANGE %s: %d > %d" % (m.group(1), lo, hi))
             result["range"][m.group(1)] = (lo, hi)
+            continue
+        m = re.match(r"\s*//\s*DIFFCHECK-UNUSED:\s*(\S+)\s*(.*)$", line)
+        if m:
+            if not m.group(2).strip():
+                raise ValueError("DIFFCHECK-UNUSED %s needs a reason" % m.group(1))
+            result["unused"][m.group(1)] = m.group(2).strip()
             continue
         m = re.match(r"\s*//\s*DIFFCHECK-EXCLUDE:\s*(\S+)\s*(.*)$", line)
         if m:
