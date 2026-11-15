@@ -3841,9 +3841,14 @@ void Parser::parseResourceType(Type& type) {
 			component = typeName(alias);
 		}
 	}
-	if (component != "float" && component != "half" && component != "uint") {
+	static const std::map<std::string_view, ScalarKind> elements = {
+		{ "float", ScalarKind::Float }, { "half", ScalarKind::Half }, { "int", ScalarKind::Int },
+		{ "uint", ScalarKind::UInt }, { "short", ScalarKind::Short }, { "ushort", ScalarKind::UShort },
+	};
+	const auto element = elements.find(component);
+	if (element == elements.end()) {
 		throw CompileError(name + "<" + component + "> is not lowered yet; mslc lowers the "
-			"sampled types float and half");
+			"sampled types float, half, int, uint, short and ushort");
 	}
 
 	std::string access = "sample";
@@ -3883,14 +3888,14 @@ void Parser::parseResourceType(Type& type) {
 
 	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
 	type.resource = lowered->second;
-	if (component == "uint" && access == "sample") {
-		throw CompileError(name + "<uint> is not lowered yet; mslc lowers uint only with access::read, access::write or access::read_write");
+	if (element->second != ScalarKind::Float && element->second != ScalarKind::Half && access == "sample") {
+		throw CompileError(name + "<" + component + "> is not lowered yet; mslc lowers integer elements only "
+			"with access::read, access::write or access::read_write");
 	}
 	type.textureAccess = access == "write" ? TextureAccess::Write
 		: access == "read" ? TextureAccess::Read
 		: access == "read_write" ? TextureAccess::ReadWrite : TextureAccess::Sample;
-	type.scalar = component == "uint" ? ScalarKind::UInt
-		: component == "half" ? ScalarKind::Half : ScalarKind::Float;
+	type.scalar = element->second;
 }
 
 Parameter Parser::parseParameter(const std::string& helperName) {

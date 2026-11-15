@@ -148,6 +148,10 @@ struct TemplateArgument {
 // The MSL spelling of a resource kind, such as "texture2d".
 const char* resourceKindName(ResourceKind kind);
 const char* scalarKindName(ScalarKind kind);
+
+// The sampled type of the SPIR-V image behind a texture of this element type: half is
+// a float image, short an int one and ushort a uint one, narrowed after the read.
+ScalarKind textureSampledKind(ScalarKind element);
 uint32_t scalarBitWidth(ScalarKind kind);
 
 // The type as it is written in the source: "float", "float3", or the name a

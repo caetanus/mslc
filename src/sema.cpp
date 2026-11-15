@@ -6821,8 +6821,7 @@ namespace {
 
 	Id Emitter::resourcePointee(const Type& type) {
 		if (type.textureAccess != TextureAccess::Sample) {
-			return _types.storageImage(type.resource, type.textureAccess,
-				type.scalar == ScalarKind::UInt ? ScalarKind::UInt : ScalarKind::Float);
+			return _types.storageImage(type.resource, type.textureAccess, textureSampledKind(type.scalar));
 		}
 		return type.isTexture() ? _types.image(type.resource) : _types.samplerType();
 	}
@@ -9772,14 +9771,16 @@ namespace {
 		_bindings[declaration.name] = embeddedSamplerBinding(declaration);
 	}
 
-	// A half texture is sampled as a float image and narrowed here, because the
-	// image type has a float sampled type whatever the texture's component is.
+	// A half texture is sampled as a float image, a short one as an int image and a
+	// ushort one as a uint image, and narrowed here, because the image type's sampled
+	// type has 32 bits whatever the texture's component is.
 	Id Emitter::texturePixels(const Binding& texture, Id sampled) {
-		if (texture.pointeeMsl.scalar != ScalarKind::Half) {
+		const ScalarKind element = texture.pointeeMsl.scalar;
+		if (textureSampledKind(element) == element) {
 			return sampled;
 		}
 
-		return convert(sampled, _builder.typeOf(sampled), _types.vector(ScalarKind::Half, 4));
+		return convert(sampled, _builder.typeOf(sampled), _types.vector(element, 4));
 	}
 
 	const Binding& Emitter::textureReceiver(const Expression& call) {
@@ -9801,11 +9802,10 @@ namespace {
 	static uint32_t storageCoordinateWidth(ResourceKind kind);
 
 	// write(value, coordinate [, layer]) in statement position, on an access::write or
-	// access::read_write texture. A uint texture takes a uint scalar, which is put in
-	// every channel. A float or half texture takes a vector of exactly its own element
-	// type, or any number, converted to that type and put in every channel (measured
-	// with Apple's compiler: half4 into a float texture is refused, a float scalar
-	// into a half texture is not). The coordinate is a uint or ushort vector of the
+	// access::read_write texture. The value is a vector of exactly the texture's own
+	// element type, or any number, converted to that type and put in every channel
+	// (measured with Apple's compiler: half4 into a float texture and uint4 into an int
+	// one are refused, a float scalar into a half or int texture is not). The coordinate is a uint or ushort vector of the
 	// texture's dimension; an array or a cube takes a uint2 and then the layer or
 	// face. An explicit lod is not lowered.
 	void Emitter::emitTextureWrite(const Expression& call, const Binding& texture) {
@@ -9819,10 +9819,9 @@ namespace {
 		const uint32_t width = storageCoordinateWidth(kind);
 		const std::string suffix = width == 1 ? std::string() : std::to_string(width);
 		const ScalarKind element = texture.pointeeMsl.scalar;
-		const bool integer = element == ScalarKind::UInt;
-		const std::string takes = std::string("texture write takes exactly ")
-			+ (integer ? "a uint scalar" : element == ScalarKind::Half ? "a half4 or a number" : "a float4 or a number")
-			+ " and a uint" + suffix + " or ushort" + suffix + " coordinate"
+		const ScalarKind sampled = textureSampledKind(element);
+		const std::string takes = std::string("texture write takes exactly ") + (element == ScalarKind::Int ? "an " : "a ") + scalarKindName(element)
+			+ "4 or a number and a uint" + suffix + " or ushort" + suffix + " coordinate"
 			+ (layered ? (kind == ResourceKind::TextureCube ? " and a face" : " and a layer") : "");
 		if (call.arguments.size() == (layered ? 4u : 3u)) {
 			throw CompileError("mip arguments are unsupported on access::" + std::string(textureAccessName(access))
@@ -9835,29 +9834,26 @@ namespace {
 		Id coordinate = emitExpression(*call.arguments[1]);
 		const Id coordinateType = _builder.typeOf(coordinate);
 		const Id valueType = _builder.typeOf(value);
-		const Id texelType = _types.vector(integer ? ScalarKind::UInt : ScalarKind::Float, 4);
 		const bool unsignedVector = _types.vectorWidth(coordinateType) == width && !_types.isFloat(coordinateType)
 			&& !_types.isSignedInt(coordinateType) && (_types.bitWidth(coordinateType) == 32 || _types.bitWidth(coordinateType) == 16);
 		const bool numeric = _types.vectorWidth(valueType) == 1;
 		const bool ownVector = valueType == _types.vector(element, 4);
-		if (!unsignedVector || (integer ? valueType != _uintType : !(numeric || ownVector))) {
+		if (!unsignedVector || !(numeric || ownVector)) {
 			throw CompileError(takes);
 		}
 		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, width));
 		if (layered) {
 			coordinate = appendArrayLayer(coordinate, ScalarKind::UInt, *call.arguments[2], "write");
 		}
-		// The image's sampled type is float whatever the texture's element.
+		// The image's sampled type is the 32-bit type of the element, and a number is
+		// narrowed to the element type before it is widened to it and put in every
+		// channel, so a half or short texture stores the value rounded to its own type.
+		const Id texelType = _types.vector(sampled, 4);
 		Id texel;
 		if (ownVector) {
 			texel = convert(value, valueType, texelType);
-		} else if (integer) {
-			texel = broadcast(value, texelType);
 		} else {
-			// A number is narrowed to the element type before it is widened to the
-			// image's float, so a half texture stores the value rounded to half.
-			const Id narrowed = convert(value, valueType, _types.scalar(element));
-			texel = broadcast(narrowed, texelType);
+			texel = broadcast(convert(value, valueType, _types.scalar(element)), texelType);
 		}
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		_builder.emit(spirv::OpImageWrite, { image, coordinate, texel });
@@ -10119,10 +10115,9 @@ namespace {
 		}
 
 		if (storage) {
-			const bool integer = texture.pointeeMsl.scalar == ScalarKind::UInt;
 			const Id storageImage = loadFrom(texture.id, texture.pointeeType);
 			return texturePixels(texture, _builder.emitTyped(spirv::OpImageRead,
-				_types.vector(integer ? ScalarKind::UInt : ScalarKind::Float, 4), { storageImage, coordinate }));
+				_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4), { storageImage, coordinate }));
 		}
 
 		if (texture.pointeeMsl.resource == ResourceKind::Texture1D && arguments.size() == fixed + 1) {
