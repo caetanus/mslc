@@ -1377,7 +1377,7 @@ Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sample
 	if (kind == ResourceKind::TextureCubeArray) {
 		requireCapability(spirv::Capability::ImageCubeArray);
 	}
-	if (multisampled && arrayed) {
+	if (multisampled && arrayed && sampled == 2) {
 		requireCapability(spirv::Capability::ImageMSArray);
 	}
 	return _builder.emitDecl(spirv::OpTypeImage, { scalar(sampledType),
@@ -3200,7 +3200,7 @@ namespace {
 
 		const Id widened = _builder.emitTyped(
 			fromSigned ? spirv::OpSConvert : spirv::OpUConvert,
-			_types.scalar(*temporary), { value });
+			_types.vector(*temporary, fromWidth), { value });
 		return _builder.emitTyped(spirv::OpBitcast, toType, { widened });
 	}
 
@@ -10371,6 +10371,10 @@ namespace {
 		}
 
 		const bool derivatives = bias != InvalidId || (lod == InvalidId && gradientX == InvalidId);
+		if (sampler.unnormalizedSampler && compare) {
+			throw CompileError("sample_compare through a coord::pixel sampler is not lowered: Vulkan allows no depth "
+				"comparison on an unnormalized sampler");
+		}
 		if (sampler.unnormalizedSampler && (bias != InvalidId || minLod != InvalidId || gradientX != InvalidId || offset != InvalidId)) {
 			throw CompileError("a coord::pixel sampler takes level(lod) or no option only: Vulkan fixes Lod 0 on it");
 		}
