@@ -57,8 +57,8 @@ private:
 	bool _storage8Declared = false;
 
 	spirv::Id _voidType = spirv::InvalidId;
-	std::map<std::tuple<ResourceKind, ScalarKind, bool>, spirv::Id> _images;
-	std::map<std::tuple<ResourceKind, ScalarKind, bool>, spirv::Id> _sampledImages;
+	std::map<std::tuple<ResourceKind, ScalarKind, bool, bool>, spirv::Id> _images;
+	std::map<std::tuple<ResourceKind, ScalarKind, bool, bool>, spirv::Id> _sampledImages;
 	spirv::Id _samplerType = spirv::InvalidId;
 	std::map<std::pair<ResourceKind, ScalarKind>, spirv::Id> _storageImages;
 	std::map<ScalarKind, spirv::Id> _subpassImages;
@@ -99,10 +99,10 @@ public:
 	// texture2d_array), which is what Iridium declares (indium
 	// src/iridium/air.cpp:771-785). The component type is not in the image type;
 	// a half texture's samples are narrowed after the lookup.
-	spirv::Id image(ResourceKind kind, ScalarKind sampledType, bool depth);
+	spirv::Id image(ResourceKind kind, ScalarKind sampledType, bool depth, bool multisampled);
 	// Declares a capability once, whichever image type first needs it.
 	void requireCapability(spirv::CapabilityValue capability);
-	spirv::Id imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sampled, bool depth);
+	spirv::Id imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sampled, bool depth, bool multisampled);
 	// The storage image (Sampled 2, format Unknown) a texture of any access but
 	// sample is declared as, with a uint or a float sampled type; a half texture
 	// is a float image narrowed after the read, as for a sampled one. Iridium
@@ -112,7 +112,7 @@ public:
 	// framebuffer at the fragment's own pixel.
 	spirv::Id subpassImage(ScalarKind element);
 	spirv::Id samplerType();
-	spirv::Id sampledImage(ResourceKind kind, ScalarKind sampledType, bool depth);
+	spirv::Id sampledImage(ResourceKind kind, ScalarKind sampledType, bool depth, bool multisampled);
 
 	// How a packed vector of the given type is stored in a laid-out struct or
 	// buffer: an array of its components, strided by the component's size.
