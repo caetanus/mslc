@@ -1,5 +1,5 @@
 // EXPECT: valid
-// DIFFCHECK: writes-zero
+// DIFFCHECK-RANGE: out 0 1
 // DISASM: OpSelect
 // DISASM: OpIEqual
 

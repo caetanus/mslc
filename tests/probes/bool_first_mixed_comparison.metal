@@ -1,5 +1,5 @@
 // EXPECT: valid
-// DIFFCHECK: writes-zero
+// DIFFCHECK-RANGE: in 0 1
 // DISASM: OpIEqual
 kernel void mixed(device int *out [[buffer(0)]], constant int *in [[buffer(1)]]) {
     bool a = in[0] != 0;

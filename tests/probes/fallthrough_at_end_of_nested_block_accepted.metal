@@ -1,5 +1,5 @@
 // EXPECT: valid
-// DIFFCHECK: writes-zero
+// RUN: grid=1 local=1
 // The marker ends a nested block that is followed directly by the label, as Apple accepts.
 kernel void fallthrough_at_end_of_nested_block_accepted(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {
   uint x = 0u;
