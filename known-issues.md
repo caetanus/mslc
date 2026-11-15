@@ -521,10 +521,11 @@ All of these predate those fixes; counts are from generated differentials agains
 the operand's declared type; every accepted size was compared with `xcrun metal`. A refusal stands in
 for a size mslc cannot give with certainty. Apple accepts, and mslc refuses:
 
-- `sizeof(x)` as an array length or attribute index, where `x` is a declared name: the parser folds
-  lengths before declared types are known. `sizeof(type)` works there.
-- `sizeof(p)` where `p` is a pointer parameter (Apple: 8). The binding no longer says whether a
-  name is the parameter or a local that hides it. Write `sizeof(device float *)`.
+- `sizeof(x)` as an array length or attribute index (#369) where `x` is a name the parser holds no
+  type for: an `auto` variable, a texture or sampler, a parameter of a function template instance,
+  a member (`sizeof(s.a)`), a name a struct body's own field hides, or an element of a vector or
+  matrix. `x`, `x[i]` and `*x` of a declared local, parameter or file-scope object work and are
+  sized from the innermost declaration the name finds.
 - Operands that are not a name, element, member, literal, cast or arithmetic of those: calls,
   `?:`, assignments, `i++` (never evaluated by Apple), `S{...}`, a bool operand of `+`.
 - Arithmetic with a packed vector operand (`sizeof(p + p)` is 12 in Apple; the value is a float3).
