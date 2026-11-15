@@ -2410,6 +2410,8 @@ namespace {
 		Id emitConstant(const FoldedConstant& folded);
 		std::vector<uint32_t> constantWords(const FoldedConstant& folded);
 		FoldedConstant foldScalarConstruct(const Expression& expression);
+		FoldedConstant convertScalarForConstruct(FoldedConstant folded, ScalarKind to);
+		std::vector<FoldedConstant> foldVectorConstructor(const Expression& expression);
 		FoldedConstant foldConditional(const Expression& expression);
 		bool constantLeaves(const Expression& expression, const std::string& excluded);
 		bool namesConstexprAggregate(const Expression& expression);
@@ -8111,12 +8113,17 @@ namespace {
 				"from the declarations before it, and this is not one");
 		}
 
-		FoldedConstant folded = foldExpression(*expression.arguments.front());
+		return convertScalarForConstruct(foldExpression(*expression.arguments.front()), type->scalar);
+	}
+
+	// The value of a constant converted to the scalar type a constructor names. A float does not
+	// become an integer unless it fits: a value outside the range is undefined, and mslc folds
+	// none of those.
+	FoldedConstant Emitter::convertScalarForConstruct(FoldedConstant folded, ScalarKind to) {
 		if (folded.isComposite) {
 			throw CompileError("a composite constant cannot be converted to a scalar");
 		}
 
-		const ScalarKind to = type->scalar;
 		if (to == ScalarKind::Bool) {
 			folded.boolean = folded.scalar == ScalarKind::Bool ? folded.boolean
 				: isFloatKind(folded.scalar) ? folded.number != 0.0 : folded.integer != 0;
@@ -8430,18 +8437,22 @@ namespace {
 					"braced list naming its fields, not with a single value");
 			}
 
-			// "float4(1)" and "float4(a, b, c, d)": a float or half vector built by its own
-			// constructor, each component converted as it is at run time.
-			if (type.vectorWidth > 1 && isFloatKind(type.scalar) && initializer.kind == ExpressionKind::Construct
+			// "int4(1)" and "float4(a, b, c, d)": a vector built by its own constructor, each
+			// component converted as it is at run time.
+			if (type.vectorWidth > 1 && initializer.kind == ExpressionKind::Construct
 				&& initializer.constructType && !initializer.constructType->isMatrix()) {
+				const Type& built = *initializer.constructType;
+				if (built.scalar != type.scalar || built.vectorWidth != type.vectorWidth) {
+					throw CompileError("the constructor of a " + std::string(scalarKindName(type.scalar))
+						+ std::to_string(type.vectorWidth) + " constant has to be a "
+						+ std::string(scalarKindName(type.scalar)) + std::to_string(type.vectorWidth)
+						+ " already; mslc converts no vector");
+				}
 				FoldedConstant vector;
 				vector.isComposite = true;
 				vector.type = declaredTypeOf(type);
-				for (const double component: foldColumnConstructor(initializer, type.scalar, type.vectorWidth)) {
-					FoldedConstant part;
-					part.scalar = type.scalar;
-					part.number = component;
-					vector.parts.push_back(emitConstant(part));
+				for (const FoldedConstant& component: foldVectorConstructor(initializer)) {
+					vector.parts.push_back(emitConstant(component));
 				}
 				return vector;
 			}
@@ -8449,7 +8460,7 @@ namespace {
 			if (type.vectorWidth > 1) {
 				throw CompileError("a " + std::string(scalarKindName(type.scalar))
 					+ std::to_string(type.vectorWidth) + " constant is initialised with a braced "
-					"list of its components or, for a float or half vector, a constructor of its own type "
+					"list of its components or a constructor of its own type "
 					"(not a single value, another constant or an expression)");
 			}
 
@@ -8539,6 +8550,45 @@ namespace {
 			requireNotNarrowing(folded, kind);
 		}
 		return convertConstant(folded, kind).number;
+	}
+
+	// float3(1, 2, 3), int4(1), int4(v2, 1, 2): the components of a vector constructor, each
+	// converted to the vector's own scalar as at run time. A piece may be a nested vector
+	// constructor; a count that is neither one scalar nor the width is refused.
+	std::vector<FoldedConstant> Emitter::foldVectorConstructor(const Expression& expression) {
+		const Type& type = *expression.constructType;
+		if (type.vectorWidth < 2 || type.isMatrix() || type.isPointer || type.isAtomic || type.arrayLength
+			|| !type.namedType.empty() || !type.enumName.empty()) {
+			throw CompileError("a constant's initialiser has to be a value that can be worked out "
+				"from the declarations before it, and this is not one");
+		}
+
+		std::vector<FoldedConstant> pieces;
+		for (const ExpressionPtr& argument: expression.arguments) {
+			if (argument->kind == ExpressionKind::Construct && argument->constructType
+				&& argument->constructType->vectorWidth > 1 && !argument->constructType->isMatrix()) {
+				// Apple converts a vector piece of another scalar type only when it is the whole
+				// argument list; beside other arguments it is an error, so it is refused here too.
+				if (argument->constructType->scalar != type.scalar && expression.arguments.size() != 1) {
+					throw CompileError("a vector piece of a constructor has to have the vector's own scalar "
+						"type unless it is the only argument");
+				}
+				for (const FoldedConstant& nested: foldVectorConstructor(*argument)) {
+					pieces.push_back(convertScalarForConstruct(nested, type.scalar));
+				}
+			} else {
+				pieces.push_back(convertScalarForConstruct(foldExpression(*argument), type.scalar));
+			}
+		}
+
+		if (pieces.size() == 1 && expression.arguments.size() == 1) {
+			return std::vector<FoldedConstant>(type.vectorWidth, pieces.front());
+		}
+		if (pieces.size() != type.vectorWidth) {
+			throw CompileError("a vector built from " + std::to_string(pieces.size())
+				+ " components needs " + std::to_string(type.vectorWidth));
+		}
+		return pieces;
 	}
 
 	// A column written as a vector constructor: float3(1, 2, 3), float3(0), float3(v2, 1).

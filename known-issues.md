@@ -508,6 +508,12 @@ All of these predate those fixes; counts are from generated differentials agains
   undeclared identifier (about 34 cases).
 - The library's names are visible without `#include <metal_stdlib>` (about 11 cases).
 - `namespace NB { typedef int metal; }` followed by `metal::abs` is accepted (2 cases).
+- A file-scope vector constant folds only from a braced list or a constructor of its own type
+  (#347, #363). Still refused though Apple accepts them: another constant (`constant int4 k = a;`),
+  an expression on one (`-int4(1)`), a vector that narrows to a shorter one (`int3(int4(...))`), a
+  wider scalar-from-vector mix Apple also takes, `'a'` as a component (parser limit), and a float
+  too large for the integer (`int4(2147483648.0f)`, which Apple saturates). Apple rejects, and so
+  does mslc, a vector piece of another scalar type beside other arguments (`int4(uint2(1, 2), 3, 4)`).
 
 ## sizeof: what is refused (#361)
 
