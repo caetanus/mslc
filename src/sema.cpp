@@ -4361,10 +4361,21 @@ namespace {
 			case ExpressionKind::Unary: return constantLeaves(*expression.left, excluded);
 			case ExpressionKind::Binary:
 				return constantLeaves(*expression.left, excluded) && constantLeaves(*expression.right, excluded);
-			case ExpressionKind::Conditional:
-				return constantLeaves(*expression.left, excluded) && expression.arguments.size() == 2
-					&& constantLeaves(*expression.arguments[0], excluded)
-					&& constantLeaves(*expression.arguments[1], excluded);
+			case ExpressionKind::Conditional: {
+				if (expression.arguments.size() != 2 || !constantLeaves(*expression.left, excluded)) { return false; }
+				const bool saved = _foldDomainError;
+				bool taken = false;
+				try {
+					const FoldedConstant condition = foldExpression(*expression.left);
+					taken = !condition.isComposite && (condition.scalar == ScalarKind::Bool ? condition.boolean
+						: isFloatKind(condition.scalar) ? condition.number != 0.0 : condition.integer != 0);
+				} catch (const CompileError&) {
+					_foldDomainError = saved;
+					return false;
+				}
+				_foldDomainError = saved;
+				return constantLeaves(*expression.arguments[taken ? 0 : 1], excluded);
+			}
 			case ExpressionKind::Construct:
 				for (const ExpressionPtr& argument: expression.arguments) {
 					if (!constantLeaves(*argument, excluded)) { return false; }
@@ -8058,7 +8069,8 @@ namespace {
 	}
 
 	// c ? a : b of constants. Only the chosen arm is evaluated, but the result has the
-	// type both arms meet in, so the other arm has to fold too for the type to be known.
+	// type both arms meet in, so an arm that does not fold is emitted and lifted out again
+	// for its type, which needs a function to emit into.
 	FoldedConstant Emitter::foldConditional(const Expression& expression) {
 		const FoldedConstant condition = foldExpression(*expression.left);
 		if (condition.isComposite) {
@@ -8075,10 +8087,23 @@ namespace {
 				arms[i] = foldExpression(*expression.arguments[i]);
 			} catch (const CompileError&) {
 				if (chosen) { throw; }
-				throw CompileError("the type of a conditional constant needs both of its arms to be constants");
+				// Only the chosen arm is evaluated; the other one contributes its type.
+				// declareGlobals() folds every file-scope constant before any function body, so no block yet means file scope.
+				if (_currentBlock == InvalidId) {
+					throw CompileError("the type of an unchosen arm that is not a constant is not known outside a function");
+				}
+				std::optional<ScalarKind> kind;
+				try {
+					discardLifted([&] { kind = _types.scalarKindOf(_builder.typeOf(emitExpression(*expression.arguments[i]))); });
+				} catch (const CompileError&) {
+				}
+				if (!kind) {
+					throw CompileError("the type of a conditional constant needs both of its arms to be scalars");
+				}
+				arms[i] = FoldedConstant{};
+				arms[i].scalar = *kind;
 			}
 			if (arms[i].isComposite) { throw CompileError("a composite constant cannot be a conditional arm"); }
-			if (!chosen) { _foldDomainError = false; }
 			if (chosen && _foldDomainError) {
 				throw CompileError("the chosen arm of a conditional constant is not a constant expression");
 			}

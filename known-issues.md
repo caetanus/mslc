@@ -363,22 +363,23 @@ of the #354 fix.
 
 ## Constant-expression narrowing: over-accepts and gaps (#160)
 
-Apple rejects these and mslc accepts them. All three predate the #160 change (the reviewer found
-them on master as well), so none is a regression.
+Apple rejects these and mslc accepts them. Both predate the #160 change (the reviewer found
+them on master as well), so neither is a regression.
 
 - `const int k = 3; const thread int& r = k; float x{r};` is accepted; Apple does not treat a
   reference to a const as a constant, so it rejects the narrowing.
 - Narrowing in dead code after `return;` is not checked: `return; constexpr int n = 300; char x{n};`
   is accepted, Apple rejects it.
-- `~(static_cast<half>(0.5f))` is accepted, but the module fails `spirv-val`; Apple rejects the
-  bitwise not of a half.
 
 Forms Apple accepts that the validity proof still leaves as the unsupported-proof diagnostic:
 char literals such as `'a'` in a constant (parser limit), arithmetic on a bool
-(`float x{true + 1}`), a ternary whose unchosen arm is not a constant (`float x{true ? 1 : 5 / 0}`),
-a float-to-integer cast inside a vector constructor of a constexpr list
+(`float x{true + 1}`; every arithmetic or bitwise operator on a bool is refused as "not lowered yet", so
+this is a lowering gap and not a proof gap), a float-to-integer cast inside a vector constructor of a constexpr list
 (`constexpr int3 v{int3(1.5f)}`), and a file-scope `constant` initialised with a float division by
-zero that is then narrowed to half.
+zero that is then narrowed to half. A file-scope `constant int g = true ? 1 : 5 / 0;` (an unchosen arm that
+does not fold, outside a function) is refused with "not known outside a function"; Apple accepts it.
+A condition that is a constant but not provable (`constant float c = 1.0f / 0.0f; char z{c ? 1 : 300};`) is
+refused as an unsupported proof; Apple accepts it.
 
 ## Nested field designators are rejected by the parser (#163)
 
