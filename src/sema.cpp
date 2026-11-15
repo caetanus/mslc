@@ -4541,6 +4541,12 @@ namespace {
 				return _types.zero(toType);
 			}
 			std::vector<std::optional<Id>> values(list.elements.size());
+			// S s{S{1,2}} copies the temporary; a bare {1,2} there would initialise the first member.
+			const Expression* only = list.elements.size() == 1 ? list.elements.front().value.get() : nullptr;
+			if (only && list.elements.front().fieldName.empty() && only->kind == ExpressionKind::InitList
+				&& only->constructType && only->constructType->namedType == target.namedType) {
+				return convertImplicit(emitExpression(*only), toType);
+			}
 			if (list.elements.size() == 1 && list.elements.front().fieldName.empty()
 				&& list.elements.front().value->kind != ExpressionKind::InitList) {
 				values[0] = emitExpression(*list.elements.front().value);
