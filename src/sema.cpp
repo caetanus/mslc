@@ -1444,6 +1444,10 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 			throw CompileError("the array member \"" + field.name + "\" of \"" + decl->name
 				+ "\" is an array of pointers, which mslc does not lower");
 		}
+		if (field.type.isPointer) {
+			throw CompileError("a pointer member (\"" + field.name + "\" of \"" + decl->name
+				+ "\") is not lowered yet; Apple accepts it, mslc does not lower a pointer inside a struct");
+		}
 
 		const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
 		const VectorLayout layout = memberLayout(field.type);
