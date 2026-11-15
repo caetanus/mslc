@@ -304,6 +304,32 @@ set_tests_properties(harness/failed_disasm_capture PROPERTIES
 set_tests_properties(harness/empty_disasm_capture_group PROPERTIES
 	PASS_REGULAR_EXPRESSION "an optional group cannot be")
 
+# DISASM-ENTRY-STORES-PER-RETURN against hand-assembled SPIR-V, so the directive
+# is shown to fail: a fake compiler assembles the .spvasm beside each fixture.
+# stores_valid must pass; the other three must fail with the directive's message
+# (CMake wraps it, hence the [ \n]+).
+find_program(SPIRV_AS spirv-as)
+if(SPIRV_AS)
+	foreach(case IN ITEMS stores_valid stores_duplicated stores_missing stores_nonreturn)
+		add_test(NAME harness/${case} COMMAND ${CMAKE_COMMAND}
+			-DMSLC=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/assemble_sibling.sh
+			-DSPIRV_VAL=${SPIRV_VAL}
+			-DSPIRV_DIS=${SPIRV_DIS}
+			-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/${case}.metal
+			-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/harness
+			-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
+		set_tests_properties(harness/${case} PROPERTIES ENVIRONMENT "SPIRV_AS=${SPIRV_AS}")
+	endforeach()
+	set_tests_properties(harness/stores_duplicated PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpReturn[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+2[ \n]+times,[ \n]+expected[ \n]+1")
+	set_tests_properties(harness/stores_missing PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpReturn[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+0[ \n]+times,[ \n]+expected[ \n]+1")
+	set_tests_properties(harness/stores_nonreturn PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpUnreachable[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+1[ \n]+times,[ \n]+expected[ \n]+0")
+else()
+	message(WARNING "spirv-as not found: the DISASM-ENTRY-STORES-PER-RETURN self-tests are not registered")
+endif()
+
 # $10 must survive the replacement of $1; this one is expected to pass.
 add_test(NAME harness/capture_reference_ten COMMAND ${CMAKE_COMMAND}
 	-DMSLC=$<TARGET_FILE:mslc-cli>
