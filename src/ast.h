@@ -54,6 +54,8 @@ enum class ResourceKind {
 	TextureCube,
 	Texture3D,
 	Texture2DArray,
+	Texture1DArray,
+	TextureCubeArray,
 	Sampler,
 };
 
@@ -131,7 +133,8 @@ struct Type {
 	bool isMatrix() const { return matrixColumns > 0; }
 	bool isTexture() const {
 		return resource == ResourceKind::Texture1D || resource == ResourceKind::Texture2D
-			|| resource == ResourceKind::TextureCube || resource == ResourceKind::Texture3D || resource == ResourceKind::Texture2DArray;
+			|| resource == ResourceKind::TextureCube || resource == ResourceKind::Texture3D || resource == ResourceKind::Texture2DArray
+			|| resource == ResourceKind::Texture1DArray || resource == ResourceKind::TextureCubeArray;
 	}
 };
 

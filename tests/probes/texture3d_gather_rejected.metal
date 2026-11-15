@@ -1,4 +1,4 @@
-// EXPECT: error gather is defined on texture2d, texture2d_array and texturecube
+// EXPECT: error gather is defined on texture2d
 // Apple has no texture3d::gather either; this pins that mslc does not accept it.
 #include <metal_stdlib>
 using namespace metal;

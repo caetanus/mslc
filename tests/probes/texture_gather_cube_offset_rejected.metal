@@ -1,4 +1,4 @@
-// EXPECT: error a texturecube has no offset
+// EXPECT: error a cube has no offset
 // Apple: no matching member function for gather(sampler, float3, int2).
 #include <metal_stdlib>
 using namespace metal;
