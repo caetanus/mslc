@@ -154,12 +154,17 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
 
 ## Reading a mismatch: what is not an mslc bug
 
-Triage of the first corpus sweeps (1,295 probe kernels at grid 1, 1,086 compared, 986 matched):
+Triage of the corpus sweeps (2,754 probe kernels at the default 64 threads: 1,187 compared, 1,071
+matched; the 45 that write only zeros now say `// DIFFCHECK: writes-zero`). Most probes were designed
+as single-thread kernels that all store to element 0, so at 64 threads most of the 71 that differ at 64 threads differ
+because the last writer differs between backends (not all were triaged); those are not in `tests/probe-run.txt` and need a
+RUN line with `grid=1` or a rewrite to index by thread. Another 15 time out or crash a host.
 
 - Inputs that are UB for the kernel. A float input converted to an array index, a `uchar` lane
   index, a loop bound or a store index drawn from the full 32-bit range reads or writes out of
   bounds or never terminates. Use `// DIFFCHECK-RANGE`, `--range`, or `--profiles moderate`
-  (probes are single-thread designs: run them with `--grid 1 --local 1`).
+  (many probes are single-thread designs that store to element 0: run those with `--grid 1 --local 1`,
+  which hides lane-order and stride errors, or rewrite them to index by thread).
 - Uninitialised reads (a struct local with no initialiser, a threadgroup array read before any
   write): Apple returns garbage, mslc zero. Exclude the buffer with a reason.
 - Integer division or remainder by zero, `INT_MIN / -1`, and out-of-range float to int
@@ -170,21 +175,33 @@ Triage of the first corpus sweeps (1,295 probe kernels at grid 1, 1,086 compared
   `newLibraryWithSource` pre-includes `<metal_stdlib>`; that is the unverified reading of the
   other `pp_metal_*` probe.
 - Lavapipe rejects some valid modules (an empty struct: `vkCreateComputePipelines` -13).
-- **Not a harness artifact, #368:** lavapipe folds `float(half(x))` to `x`, `float(int(x))` to
-  `trunc(x)`, `x * 0` to `0`, and re-associates `(x + 1) - 1`, so a half or a negative fraction held
-  in a register, a signed zero, or a cancellation differs from Apple. NIR does that to every
-  float instruction that is not `exact`; mslc's SPIR-V has no `NoContraction` and no
-  `SignedZeroInfNanPreserve`, so RADV, ANV and the other NIR drivers behave the same. Until #368
-  is fixed these mismatches are mslc results; compare through a buffer store or exclude with a
-  reason that names #368.
+- **Not a harness artifact, #368 (open; origin/master emits neither decoration):** lavapipe folds
+  `float(half(x))` to `x`, `float(int(x))` to `trunc(x)`, `x * 0` to `0`, and re-associates
+  `(x + 1) - 1`, so a half or a negative fraction held in a register, a signed zero, or a cancellation
+  differs from Apple. NIR does that to every float instruction that is not `exact`; mslc's SPIR-V has no
+  `NoContraction` and no `SignedZeroInfNanPreserve`, so RADV, ANV and the other NIR drivers behave the
+  same. These mismatches are mslc results, not harness noise.
+
+Whether to compare through a buffer store by default: not yet. A store forces the rounding only for the
+value that is stored, so it hides exactly the register-held cases above (the reason to look at them),
+and it does not help the other two limits (the `<metal_stdlib>` pre-include and uninitialised reads
+are Apple-side, not folded values). Until #368 lands, keep comparing as written: where a probe's
+mismatch is the #368 fold, exclude the buffer with a reason that names #368. Re-measure when #368 is
+on master (run the corpus and see whether the 5 known fold mismatches disappear); if they do, nothing
+more is needed and no buffer-store mode should be added.
 
 ## Tests and CI
 
 `-DMSLC_DIFFCHECK=ON` registers `diffcheck/*` tests; the default build and `ctest` are
 unchanged. The pure-Python tests (`compare`, `inputs`, `checks`) run anywhere; the tests that
 need a Metal device or lavapipe exit 77, which ctest reports as skipped. The Apple half needs
-a macOS runner, and lavapipe needs Mesa installed, so this is a local and opt-in check; CI jobs
-that have both can enable the option.
+a Metal device, and lavapipe needs Mesa installed, so this is a local and opt-in check.
+`.github/workflows/diffcheck.yml` is an advisory macOS job (`continue-on-error`): its first step,
+`tools/diffcheck/ci-probe-metal.sh`, logs whether the runner has a Metal device and skips the rest
+when it does not. Unproven on a real runner: read that step's log on the first run (a device named
+under `devices:` and `default: present` means the job runs; `devices: 0` means a self-hosted runner is
+the only way). `tests/probe-run.txt` lists the kernel probes that match at the default grid; the job
+requires 1,050 compared.
 
 A probe in `tests/probes/` opts in with a `// RUN:` line; with the option on it becomes the
 ctest test `diffcheck/probe/<name>` and kills a mutant the disassembly regexes cannot.
