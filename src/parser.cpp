@@ -4309,9 +4309,86 @@ void Parser::parseAutoInitializer(VariableDeclaration& declaration) {
 	}
 }
 
+// True when the parenthesised list ahead reads as the parameters of a function
+// declaration: every comma group is a type, then "(", an optional name and ")"
+// ("float(a)"), as C++ resolves "float3 v(float(a));". Empty parentheses are
+// not matched here. The position is restored.
+bool Parser::parensDeclareFunction() {
+	const size_t start = _position;
+	advance();
+	bool declares = true;
+	do {
+		if (atKeyword("const")) {
+			advance();
+		}
+		size_t typeTokens = 0;
+		Type probe;
+		const bool named = kind() == TokenKind::Identifier || at(TokenKind::ColonColon);
+		const std::string name = named ? peekResolved(typeTokens) : std::string();
+		const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
+			&& isLocal(name);
+		if (!named || objectHidesTag(name)
+			|| !(resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct))
+			|| lookahead(typeTokens).kind != TokenKind::LParen) {
+			declares = false;
+			break;
+		}
+		for (size_t i = 0; i <= typeTokens; ++i) {
+			advance();
+		}
+		while (at(TokenKind::Star) || at(TokenKind::Ampersand)) {
+			advance();
+		}
+		size_t nested = 0;
+		while (at(TokenKind::LParen)) {
+			++nested;
+			advance();
+		}
+		if (kind() == TokenKind::Identifier) {
+			advance();
+		}
+		while (at(TokenKind::LBracket) || (nested > 0 && at(TokenKind::RParen))) {
+			if (at(TokenKind::RParen)) {
+				--nested;
+				advance();
+				continue;
+			}
+			int depth = 0;
+			do {
+				depth += at(TokenKind::LBracket) ? 1 : at(TokenKind::RBracket) ? -1 : 0;
+				advance();
+			} while (depth > 0 && !at(TokenKind::EndOfFile));
+		}
+		const bool closed = at(TokenKind::RParen);
+		if (closed) {
+			advance();
+		}
+		if (!closed || !(at(TokenKind::Comma) || at(TokenKind::RParen))) {
+			declares = false;
+			break;
+		}
+	} while (match(TokenKind::Comma));
+	_position = start;
+	return declares;
+}
+
+void Parser::rejectParameterListInitializer(const VariableDeclaration& declaration) {
+	if (!at(TokenKind::LParen) || !parensDeclareFunction()) {
+		return;
+	}
+	Type plain = declaration.type;
+	plain.isConst = false;
+	throw CompileError("\"" + declaration.name + "\" is followed by a parameter list, so C++ and "
+		"xcrun metal declare a function here, not a variable (the most vexing parse), and mslc does not "
+		"lower block-scope function declarations; write braces, \"" + declaration.name + "{...}\", or "
+		"\"= " + (plain.isAuto ? std::string("value") : typeName(plain) + "(...)") + "\" to construct the variable");
+}
+
 // The initialiser a local may have after its name: "= value", a braced list,
 // or constructor arguments. A const local has to have one.
 void Parser::parseLocalInitializer(VariableDeclaration& declaration) {
+	rejectParameterListInitializer(declaration);
+
 	if (declaration.type.isAuto) {
 		parseAutoInitializer(declaration);
 		return;
@@ -4984,6 +5061,7 @@ StatementPtr Parser::parseForStatement() {
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
 			if (declaration.type.isAuto) {
+				rejectParameterListInitializer(declaration);
 				parseAutoInitializer(declaration);
 			} else if (match(TokenKind::Assign)) {
 				declaration.initializer = parseInitializer();

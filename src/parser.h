@@ -386,6 +386,8 @@ private:
 	bool parseQualifier(Type& type, bool afterPointer);
 	VariableDeclaration parseNextLocalDeclarator(const Type& base);
 	void parseSamplerLocal(VariableDeclaration& declaration);
+	bool parensDeclareFunction();
+	void rejectParameterListInitializer(const VariableDeclaration& declaration);
 	void parseLocalInitializer(VariableDeclaration& declaration);
 	void parseAutoInitializer(VariableDeclaration& declaration);
 	void appendStatement(std::vector<StatementPtr>& out);
