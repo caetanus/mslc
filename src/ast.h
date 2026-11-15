@@ -57,7 +57,10 @@ enum class ResourceKind {
 	Sampler,
 };
 
-enum class TextureAccess { Sample, Write, Read };
+enum class TextureAccess { Sample, Write, Read, ReadWrite };
+
+// The MSL spelling of an access qualifier, such as "read_write".
+const char* textureAccessName(TextureAccess access);
 
 struct Type {
 	// Scalar base. For a named type, a pointer, or an array, the base is the

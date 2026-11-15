@@ -1374,19 +1374,28 @@ Id TypeTable::image(ResourceKind kind) {
 	return cached;
 }
 
-Id TypeTable::storageImage(TextureAccess access, ScalarKind element) {
-	const bool read = access == TextureAccess::Read;
-	bool& declared = read ? _storageReadDeclared : _storageWriteDeclared;
-	if (!declared) {
-		declared = true;
-		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(read
-			? spirv::Capability::StorageImageReadWithoutFormat
-			: spirv::Capability::StorageImageWriteWithoutFormat) });
+Id TypeTable::storageImage(ResourceKind kind, TextureAccess access, ScalarKind element) {
+	if (access != TextureAccess::Write && !_storageReadDeclared) {
+		_storageReadDeclared = true;
+		_builder.emit(spirv::OpCapability,
+			{ static_cast<uint32_t>(spirv::Capability::StorageImageReadWithoutFormat) });
 	}
-	Id& cached = _storageImages[element];
+	if (access != TextureAccess::Read && !_storageWriteDeclared) {
+		_storageWriteDeclared = true;
+		_builder.emit(spirv::OpCapability,
+			{ static_cast<uint32_t>(spirv::Capability::StorageImageWriteWithoutFormat) });
+	}
+	Id& cached = _storageImages[{ kind, element }];
 	if (cached == InvalidId) {
+		const uint32_t dimension = kind == ResourceKind::Texture3D ? spirv::Dim::Dim3D
+			: kind == ResourceKind::TextureCube ? spirv::Dim::Cube
+			: kind == ResourceKind::Texture1D ? spirv::Dim::Dim1D : spirv::Dim::Dim2D;
+		if (kind == ResourceKind::Texture1D && !_image1DDeclared) {
+			_image1DDeclared = true;
+			_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Image1D) });
+		}
 		cached = _builder.emitDecl(spirv::OpTypeImage, { scalar(element),
-			spirv::Dim::Dim2D, 0u, 0u, 0u, 2u,
+			dimension, 0u, kind == ResourceKind::Texture2DArray ? 1u : 0u, 0u, 2u,
 			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 	}
 	return cached;
@@ -6812,7 +6821,7 @@ namespace {
 
 	Id Emitter::resourcePointee(const Type& type) {
 		if (type.textureAccess != TextureAccess::Sample) {
-			return _types.storageImage(type.textureAccess,
+			return _types.storageImage(type.resource, type.textureAccess,
 				type.scalar == ScalarKind::UInt ? ScalarKind::UInt : ScalarKind::Float);
 		}
 		return type.isTexture() ? _types.image(type.resource) : _types.samplerType();
@@ -9509,7 +9518,8 @@ namespace {
 				+ ", \"descriptor\": " + descriptorJson(binding)
 				+ ", \"texture_access\": \""
 				+ (entry.parameter->type.textureAccess == TextureAccess::Write ? "Write"
-					: entry.parameter->type.textureAccess == TextureAccess::Read ? "Read" : "Sample") + "\""
+					: entry.parameter->type.textureAccess == TextureAccess::Read ? "Read"
+					: entry.parameter->type.textureAccess == TextureAccess::ReadWrite ? "ReadWrite" : "Sample") + "\""
 				+ ", \"param_index\": " + std::to_string(entry.index)
 				+ ", \"name\": \"" + entry.parameter->name + "\" }");
 		}
@@ -9769,22 +9779,38 @@ namespace {
 		return it->second;
 	}
 
-	// write(value, uint2 coordinate) in statement position. A uint texture takes a
-	// uint scalar, which is put in every channel. A float or half texture takes a
-	// vector of exactly its own element type, or any number, converted to that type
-	// and put in every channel (measured with Apple's compiler: half4 into a float
-	// texture is refused, a float scalar into a half texture is not). The
-	// coordinate is a uint2 or a ushort2; an explicit lod is not lowered.
+	static bool storageLayered(ResourceKind kind);
+	static uint32_t storageCoordinateWidth(ResourceKind kind);
+
+	// write(value, coordinate [, layer]) in statement position, on an access::write or
+	// access::read_write texture. A uint texture takes a uint scalar, which is put in
+	// every channel. A float or half texture takes a vector of exactly its own element
+	// type, or any number, converted to that type and put in every channel (measured
+	// with Apple's compiler: half4 into a float texture is refused, a float scalar
+	// into a half texture is not). The coordinate is a uint or ushort vector of the
+	// texture's dimension; an array or a cube takes a uint2 and then the layer or
+	// face. An explicit lod is not lowered.
 	void Emitter::emitTextureWrite(const Expression& call, const Binding& texture) {
-		if (texture.pointeeMsl.textureAccess != TextureAccess::Write) {
-			throw CompileError("the texture method \"write\" is not lowered yet on textures that are not access::write");
+		const TextureAccess access = texture.pointeeMsl.textureAccess;
+		if (access != TextureAccess::Write && access != TextureAccess::ReadWrite) {
+			throw CompileError("the texture method \"write\" is not lowered yet on textures that are not "
+				"access::write or access::read_write");
 		}
+		const ResourceKind kind = texture.pointeeMsl.resource;
+		const bool layered = storageLayered(kind);
+		const uint32_t width = storageCoordinateWidth(kind);
+		const std::string suffix = width == 1 ? std::string() : std::to_string(width);
 		const ScalarKind element = texture.pointeeMsl.scalar;
 		const bool integer = element == ScalarKind::UInt;
 		const std::string takes = std::string("texture write takes exactly ")
 			+ (integer ? "a uint scalar" : element == ScalarKind::Half ? "a half4 or a number" : "a float4 or a number")
-			+ " and a uint2 or ushort2 coordinate";
-		if (call.arguments.size() != 2) {
+			+ " and a uint" + suffix + " or ushort" + suffix + " coordinate"
+			+ (layered ? (kind == ResourceKind::TextureCube ? " and a face" : " and a layer") : "");
+		if (call.arguments.size() == (layered ? 4u : 3u)) {
+			throw CompileError("mip arguments are unsupported on access::" + std::string(textureAccessName(access))
+				+ " textures; write takes only a value, a coordinate and a layer where the texture has one");
+		}
+		if (call.arguments.size() != (layered ? 3u : 2u)) {
 			throw CompileError(takes);
 		}
 		const Id value = emitExpression(*call.arguments[0]);
@@ -9792,14 +9818,17 @@ namespace {
 		const Id coordinateType = _builder.typeOf(coordinate);
 		const Id valueType = _builder.typeOf(value);
 		const Id texelType = _types.vector(integer ? ScalarKind::UInt : ScalarKind::Float, 4);
-		const bool unsignedPair = _types.vectorWidth(coordinateType) == 2 && !_types.isFloat(coordinateType)
+		const bool unsignedVector = _types.vectorWidth(coordinateType) == width && !_types.isFloat(coordinateType)
 			&& !_types.isSignedInt(coordinateType) && (_types.bitWidth(coordinateType) == 32 || _types.bitWidth(coordinateType) == 16);
 		const bool numeric = _types.vectorWidth(valueType) == 1;
 		const bool ownVector = valueType == _types.vector(element, 4);
-		if (!unsignedPair || (integer ? valueType != _uintType : !(numeric || ownVector))) {
+		if (!unsignedVector || (integer ? valueType != _uintType : !(numeric || ownVector))) {
 			throw CompileError(takes);
 		}
-		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, 2));
+		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, width));
+		if (layered) {
+			coordinate = appendArrayLayer(coordinate, ScalarKind::UInt, *call.arguments[2], "write");
+		}
 		// The image's sampled type is float whatever the texture's element.
 		Id texel;
 		if (ownVector) {
@@ -9819,45 +9848,44 @@ namespace {
 	Id Emitter::emitTextureCall(const Expression& call) {
 		const Binding& texture = textureReceiver(call);
 		const std::string& method = call.left->memberName;
+		const ResourceKind kind = texture.pointeeMsl.resource;
+		const TextureAccess access = texture.pointeeMsl.textureAccess;
 		if (method == "write") {
 			throw CompileError("texture write returns void and has no value");
 		}
-		if (texture.pointeeMsl.textureAccess == TextureAccess::Write) {
-			if (method != "get_width" || !call.arguments.empty()) {
-				throw CompileError("write-only textures lower only get_width() and statement write(value, coordinate)");
-			}
-			return emitTextureSize(call, texture, SizeComponent::Width);
+		const bool sized = method == "get_width" || method == "get_height"
+			|| (method == "get_depth" && kind == ResourceKind::Texture3D)
+			|| (method == "get_array_size" && kind == ResourceKind::Texture2DArray);
+		if (access == TextureAccess::Write && !sized) {
+			throw CompileError("write-only textures lower only the size queries and statement "
+				"write(value, coordinate); \"" + method + "\" is not lowered yet");
 		}
-		if (texture.pointeeMsl.textureAccess == TextureAccess::Read) {
-			if (method == "read") return emitTextureRead(call, texture);
-			if (method == "get_width" || method == "get_height") {
-				return emitTextureSize(call, texture,
-					method == "get_width" ? SizeComponent::Width : SizeComponent::Height);
-			}
-			throw CompileError("access::read textures lower only read(), get_width() and get_height(); \""
+		if (access != TextureAccess::Sample && access != TextureAccess::Write && method != "read" && !sized) {
+			throw CompileError(std::string("access::") + textureAccessName(access) + " textures lower only read(), "
+				+ (access == TextureAccess::ReadWrite ? "statement write() and " : "") + "the size queries; \""
 				+ method + "\" is not lowered yet");
 		}
-		if (method == "sample") {
+		if (method == "sample" && access == TextureAccess::Sample) {
 			return emitTextureSample(call, texture);
 		}
-		if (method == "get_height" && texture.pointeeMsl.resource == ResourceKind::Texture1D) {
+		if (method == "get_height" && kind == ResourceKind::Texture1D) {
 			throw CompileError("a texture1d has no get_height; it is one texel high");
 		}
 		if (method == "get_width" || method == "get_height") {
 			return emitTextureSize(call, texture,
 				method == "get_width" ? SizeComponent::Width : SizeComponent::Height);
 		}
-		if (texture.pointeeMsl.resource == ResourceKind::TextureCube) {
+		if (method == "read" && (access != TextureAccess::Sample || kind != ResourceKind::TextureCube)) {
+			return emitTextureRead(call, texture);
+		}
+		if (kind == ResourceKind::TextureCube) {
 			throw CompileError("the texturecube method \"" + method + "\" is not lowered yet; mslc "
 				"lowers sample, get_width and get_height on a texturecube");
 		}
-		if (method == "read") {
-			return emitTextureRead(call, texture);
-		}
-		if (method == "get_depth" && texture.pointeeMsl.resource == ResourceKind::Texture3D) {
+		if (method == "get_depth" && kind == ResourceKind::Texture3D) {
 			return emitTextureSize(call, texture, SizeComponent::Depth);
 		}
-		if (method == "get_array_size" && texture.pointeeMsl.resource == ResourceKind::Texture2DArray) {
+		if (method == "get_array_size" && kind == ResourceKind::Texture2DArray) {
 			if (!call.arguments.empty()) {
 				throw CompileError("get_array_size takes no arguments; the layer count has no mip level");
 			}
@@ -9893,6 +9921,16 @@ namespace {
 			throw CompileError("the lod of " + callName + " on a texture1d has to be the literal 0: "
 				"a texture1d has one level");
 		}
+	}
+
+	// A cube storage image keeps the cube view type, but is read and written by texel
+	// and face: a uint2 and a face in Metal, a three-component coordinate in SPIR-V.
+	static bool storageLayered(ResourceKind kind) {
+		return kind == ResourceKind::Texture2DArray || kind == ResourceKind::TextureCube;
+	}
+
+	static uint32_t storageCoordinateWidth(ResourceKind kind) {
+		return kind == ResourceKind::TextureCube ? 2 : textureCoordinateWidth(kind);
 	}
 
 	static uint32_t textureSizeWidth(ResourceKind kind) {
@@ -10033,11 +10071,13 @@ namespace {
 	// takes uint and ushort vectors and rejects int and float ones.
 	Id Emitter::emitTextureRead(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
-		const bool arrayed = texture.pointeeMsl.resource == ResourceKind::Texture2DArray;
+		const ResourceKind kind = texture.pointeeMsl.resource;
+		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample;
+		const bool arrayed = storage ? storageLayered(kind) : kind == ResourceKind::Texture2DArray;
 		const size_t fixed = arrayed ? 2 : 1;
-		const bool storage = texture.pointeeMsl.textureAccess == TextureAccess::Read;
 		if (storage && arguments.size() == fixed + 1) {
-			throw CompileError("mip arguments are unsupported on access::read textures; read takes only a coordinate");
+			throw CompileError(std::string("mip arguments are unsupported on access::")
+				+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures; read takes only a coordinate");
 		}
 		if (arguments.size() < fixed || arguments.size() > fixed + 1) {
 			throw CompileError(std::string("read takes a coordinate")
@@ -10045,7 +10085,7 @@ namespace {
 				+ std::to_string(arguments.size()));
 		}
 
-		const uint32_t width = textureCoordinateWidth(texture.pointeeMsl.resource);
+		const uint32_t width = storage ? storageCoordinateWidth(kind) : textureCoordinateWidth(kind);
 		Id coordinate = emitExpression(*arguments[0]);
 		const Id coordinateType = _builder.typeOf(coordinate);
 		const bool unsignedVector = _types.vectorWidth(coordinateType) == width
@@ -10083,9 +10123,10 @@ namespace {
 	// 1 and 2 of the size), of level 0 or of the lod given.
 	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component) {
 		const std::string& name = call.left->memberName;
-		const bool readOnly = texture.pointeeMsl.textureAccess == TextureAccess::Read;
-		if (readOnly && !call.arguments.empty()) {
-			throw CompileError("mip arguments are unsupported on access::read textures; " + name + " takes no arguments");
+		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample;
+		if (storage && !call.arguments.empty()) {
+			throw CompileError(std::string("mip arguments are unsupported on access::")
+				+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures; " + name + " takes no arguments");
 		}
 		if (call.arguments.size() > 1) {
 			throw CompileError(name + " takes an optional lod; this call passes "
@@ -10096,7 +10137,6 @@ namespace {
 		if (oneLevel && !call.arguments.empty()) {
 			requireTexture1DLevelZero(*call.arguments[0], name);
 		}
-		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample;
 		const Id lod = storage ? InvalidId
 			: call.arguments.empty() || oneLevel ? constantU32(0) : emitLod(*call.arguments[0], name);
 
