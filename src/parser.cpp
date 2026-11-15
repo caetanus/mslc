@@ -1095,6 +1095,7 @@ void Parser::parseGlobalDeclaration() {
 	declareName(declaration.name, "variable");
 
 	_unit.globals.push_back(parseGlobalDeclarator(std::move(declaration)));
+	recordConstant(_unit.globals.back(), false);
 
 	// "constant float a = 1, b = a;" : the stars and brackets of the first name
 	// stay with it, and each further name starts from the shared type.
@@ -1108,6 +1109,7 @@ void Parser::parseGlobalDeclaration() {
 		another.name = qualify(std::string(advance().text));
 		declareName(another.name, "variable");
 		_unit.globals.push_back(parseGlobalDeclarator(std::move(another)));
+		recordConstant(_unit.globals.back(), false);
 	}
 
 	expect(TokenKind::Semicolon, "after a file-scope declaration");
@@ -2834,7 +2836,7 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 // widens. A `u` literal is only accepted as the whole expression, since mixing it
 // with a signed operand changes the arithmetic to unsigned, which this does not
 // model.
-int64_t Parser::evaluateConstant(const Expression& expression, bool nested) const {
+int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool attribute) const {
 	const auto fit = [](int64_t value) {
 		if (value > INT_MAX || value < -INT_MAX) {
 			throw CompileError("an integer constant expression overflows an int");
@@ -2852,8 +2854,16 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested) cons
 				throw CompileError("an integer constant is too large");
 			}
 			return static_cast<int64_t>(expression.intValue);
+		case ExpressionKind::BoolLiteral:
+			// Apple takes a bool where an array length or an enumerator is, and not in an attribute.
+			if (attribute) {
+				throw CompileError("a bool is not an index; use an int or a uint");
+			}
+			return expression.boolValue ? 1 : 0;
+		case ExpressionKind::Identifier:
+			return namedConstantValue(expression, nested, attribute);
 		case ExpressionKind::Unary: {
-			const int64_t operand = evaluateConstant(*expression.left, true);
+			const int64_t operand = evaluateConstant(*expression.left, true, attribute);
 			switch (expression.unaryOperator) {
 				case UnaryOperator::Negate: return fit(-operand);
 				case UnaryOperator::Plus: return operand;
@@ -2864,7 +2874,7 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested) cons
 			break;
 		}
 		case ExpressionKind::Binary: {
-			const int64_t left = evaluateConstant(*expression.left, true);
+			const int64_t left = evaluateConstant(*expression.left, true, attribute);
 
 			// The right operand is evaluated only when the left does not decide
 			// the result, so `0 && 1 / 0` is a constant and not a division by zero.
@@ -2875,7 +2885,7 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested) cons
 				return 1;
 			}
 
-			const int64_t right = evaluateConstant(*expression.right, true);
+			const int64_t right = evaluateConstant(*expression.right, true, attribute);
 			switch (expression.binaryOperator) {
 				case BinaryOperator::Add: return fit(left + right);
 				case BinaryOperator::Subtract: return fit(left - right);
@@ -2914,6 +2924,111 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested) cons
 	throw CompileError("not an integer constant expression");
 }
 
+// A name in a constant expression: an enumerator the parser already replaced with its value, or an
+// integer declared const or constexpr with an initialiser that folded. The innermost block that
+// declares the name decides, so a local that hides a constant is not one. Only an int-sized type
+// takes part in arithmetic: an unsigned or wider one would need unsigned arithmetic, which
+// evaluateConstant does not model, so it is accepted as the whole expression and nothing else.
+int64_t Parser::namedConstantValue(const Expression& identifier, bool nested, bool attribute) const {
+	const std::string& name = identifier.name;
+	const ConstantInt* found = nullptr;
+	std::string global = name;
+	if (!identifier.fileScope) {
+		for (auto scope = _blocks.rbegin(); scope != _blocks.rend(); ++scope) {
+			const auto entry = scope->names.find(name);
+			if (entry == scope->names.end()) {
+				continue;
+			}
+			if (!entry->second.empty()) {
+				global = entry->second;
+				break;
+			}
+			const auto constant = scope->constants.find(name);
+			if (constant == scope->constants.end()) {
+				throw CompileError("\"" + name + "\" is a variable, not a constant: only a const or constexpr "
+					"integer with a constant initialiser is");
+			}
+			found = &constant->second;
+			break;
+		}
+	}
+	if (!found) {
+		const auto constant = _constantInts.find(global);
+		if (constant == _constantInts.end()) {
+			throw CompileError("\"" + name + "\" is not an integer constant this source declares before this "
+				"one (a const or constexpr integer with a constant initialiser is)");
+		}
+		found = &constant->second;
+	}
+
+	if (found->kind == ScalarKind::Bool && attribute) {
+		throw CompileError("a bool is not an index; use an int or a uint");
+	}
+	const bool intSized = found->kind != ScalarKind::UInt && found->kind != ScalarKind::Long
+		&& found->kind != ScalarKind::ULong;
+	if (nested && !intSized) {
+		throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
+	}
+	return found->value;
+}
+
+// An integer declared const or constexpr (a file-scope one is a constant by its address space) and
+// initialised by a constant expression is one a later array length may name. A value its own type
+// cannot hold is not recorded, because Apple would convert it and evaluateConstant would not.
+void Parser::recordConstant(const VariableDeclaration& declaration, bool local) {
+	const Type& type = declaration.type;
+	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer || type.arrayLength || type.isAuto
+		|| type.isAtomic || type.isPacked || type.vectorWidth != 0 || type.matrixColumns != 0
+		|| !type.namedType.empty() || type.resource != ResourceKind::None || !declaration.initializer
+		|| declaration.isReference) {
+		return;
+	}
+	int64_t low = 0;
+	int64_t high = 0;
+	switch (type.scalar) {
+		case ScalarKind::Bool: low = 0; high = 1; break;
+		case ScalarKind::Char: low = INT8_MIN; high = INT8_MAX; break;
+		case ScalarKind::UChar: high = UINT8_MAX; break;
+		case ScalarKind::Short: low = INT16_MIN; high = INT16_MAX; break;
+		case ScalarKind::UShort: high = UINT16_MAX; break;
+		case ScalarKind::Int: low = INT32_MIN; high = INT32_MAX; break;
+		case ScalarKind::UInt: high = UINT32_MAX; break;
+		case ScalarKind::Long: low = INT64_MIN; high = INT64_MAX; break;
+		case ScalarKind::ULong: high = INT64_MAX; break;
+		default: return;
+	}
+
+	// "= 3", "{3}" and "(3)" initialise the same way.
+	const Expression* initializer = declaration.initializer.get();
+	if (initializer->kind == ExpressionKind::InitList && initializer->elements.size() == 1
+		&& initializer->elements.front().fieldName.empty()) {
+		initializer = initializer->elements.front().value.get();
+	}
+	if (initializer->kind == ExpressionKind::Construct && initializer->arguments.size() == 1
+		&& initializer->constructType && initializer->constructType->scalar == type.scalar
+		&& initializer->constructType->isScalar() && !initializer->constructType->isPointer) {
+		initializer = initializer->arguments.front().get();
+	}
+	int64_t value = 0;
+	try {
+		value = evaluateConstant(*initializer, false);
+	} catch (const CompileError&) {
+		return;
+	}
+	if (type.scalar == ScalarKind::Bool && value != 0) {
+		value = 1;
+	}
+	if (value < low || value > high) {
+		return;
+	}
+
+	if (local) {
+		_blocks.back().constants[declaration.name] = {value, type.scalar};
+	} else {
+		_constantInts[declaration.name] = {value, type.scalar};
+	}
+}
+
 // Whether a constant expression has a long or ulong in it, which makes its
 // type one. A shift has the type of its left operand alone.
 static bool isSixtyFourBit(const Expression& expression) {
@@ -2942,7 +3057,7 @@ int64_t Parser::parseConstantIndex(const std::string& context, bool isAttribute)
 		if (isAttribute && isSixtyFourBit(*expression)) {
 			throw CompileError("a long is not an index; use an int or a uint");
 		}
-		value = evaluateConstant(*expression, false);
+		value = evaluateConstant(*expression, false, isAttribute);
 	} catch (const CompileError& error) {
 		throw CompileError(context + " needs a constant integer argument (" + error.what() + ")");
 	}
@@ -4040,6 +4155,7 @@ StatementPtr Parser::parseStatement() {
 			if (deduceLength) {
 				deduceArrayLength(declaration);
 			}
+			recordConstant(declaration, true);
 
 			// "T a, b = 1, c;" declares each name from the type before the first
 			// declarator's stars and brackets, which bind to that name alone.
@@ -4095,6 +4211,7 @@ VariableDeclaration Parser::parseNextLocalDeclarator(const Type& base) {
 	if (deduceLength) {
 		deduceArrayLength(another);
 	}
+	recordConstant(another, true);
 	return another;
 }
 
