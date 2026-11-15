@@ -3,6 +3,7 @@ control's perturbation, and the "something was actually written" test."""
 
 import compare
 import json
+import struct
 
 
 def cross_check(mslc_buffers, apple):
@@ -21,27 +22,36 @@ def cross_check(mslc_buffers, apple):
     return findings
 
 
-def perturb(layouts, outputs):
+def perturb(layouts, outputs, reference=None):
     """A copy of `outputs` with one leaf made different, for the negative control.
-    Returns (copy, buffer, offset), or None when no buffer has a leaf to change."""
+    The new value is never equal to `reference`'s leaf either (when given), so the control
+    cannot pass by turning mslc's value into Apple's: an infinity with one bit flipped is a
+    NaN, which equals an Apple NaN. Returns (copy, buffer, offset), or None when no buffer
+    has a leaf to change."""
     for index, layout in sorted(layouts.items()):
         if layout["access"] == "read" or not layout["leaves"] or not outputs[index]:
             continue
         leaf = layout["leaves"][0]
         size = compare.SCALARS[leaf["scalar"]][0]
+        scalar = leaf["scalar"]
         raw = bytes(outputs[index][leaf["off"]:leaf["off"] + size])
-        if compare.SCALARS[leaf["scalar"]][1] == "float" and compare.is_nan(raw, leaf["scalar"]):
-            new = struct_one(leaf["scalar"])
-        else:
-            new = bytes([raw[0] ^ 1]) + raw[1:]
+        ref = bytes(reference[index][leaf["off"]:leaf["off"] + size]) if reference else None
+        for n in range(1, 64):
+            new = (int.from_bytes(raw, "little") ^ n).to_bytes(size, "little")
+            if compare.SCALARS[scalar][1] == "float":
+                # Three finite values, so one is neither the original nor Apple's.
+                new = struct_float(scalar, n)
+            if not compare.leaf_equal(new, raw, scalar, 0) and (ref is None or not compare.leaf_equal(new, ref, scalar, 0)):
+                break
         copy = {i: bytearray(o) for i, o in outputs.items()}
         copy[index][leaf["off"]:leaf["off"] + size] = new
         return copy, layout["name"], leaf["off"]
     return None
 
 
-def struct_one(scalar):
-    return bytes.fromhex("0000803f") if scalar == "float" else bytes.fromhex("003c")
+def struct_float(scalar, n):
+    """The n-th of a few distinct finite values (1.0, 2.0, 3.0, ...) as float or half bytes."""
+    return struct.pack("<f" if scalar == "float" else "<e", float(n))
 
 
 def written_nonzero(layouts, before, after):
