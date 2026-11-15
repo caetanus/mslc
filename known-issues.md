@@ -432,3 +432,16 @@ measured with `xcrun metal` and `mslc` on the same source.
   argument") and accepts the first; mslc refuses the first, as a member of a conditional.
 - `one(ds[0].a)` for a `device` buffer `ds` (x14): Apple says "no matching function" (cannot bind a reference
   in address space 'device'); mslc says the argument is not a variable of this function.
+
+## Library namespace lookup: leftovers found while fixing #344, #345 and #357
+
+All of these predate those fixes; counts are from generated differentials against Apple.
+
+- A user namespace `precise` or `fast` (at file scope, or inside `A` with `using namespace A;`) beside
+  `using namespace metal;` is silently bound, where Apple reports the name ambiguous with
+  `metal::precise` or `metal::fast`. This is the mechanism #345 fixed for `metal` itself, not yet applied
+  to the library's sub-namespaces (about 29 cases).
+- Unqualified `abs` or `sqrt` with no directive for `metal` in scope is accepted, where Apple reports an
+  undeclared identifier (about 34 cases).
+- The library's names are visible without `#include <metal_stdlib>` (about 11 cases).
+- `namespace NB { typedef int metal; }` followed by `metal::abs` is accepted (2 cases).
