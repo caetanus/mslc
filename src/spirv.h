@@ -121,6 +121,10 @@ public:
 	size_t functionsMark() const;
 	std::vector<Instruction> takeFunctionsFrom(size_t mark);
 	void appendFunctions(std::vector<Instruction> instructions);
+	// Locals of the current function declared after a mark, for dropping the ones a discarded
+	// emission left behind.
+	size_t localsMark() const;
+	void truncateLocals(size_t mark);
 
 	// The recorded type of a value, or InvalidId when the id is unknown.
 	Id typeOf(Id value) const;

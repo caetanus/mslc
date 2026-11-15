@@ -211,6 +211,16 @@ std::vector<Instruction> Builder::takeFunctionsFrom(size_t mark) {
 	return taken;
 }
 
+size_t Builder::localsMark() const {
+	const auto found = _functionLocals.find(_currentFunction);
+	return found == _functionLocals.end() ? 0 : found->second.size();
+}
+
+void Builder::truncateLocals(size_t mark) {
+	const auto found = _functionLocals.find(_currentFunction);
+	if (found != _functionLocals.end()) { found->second.resize(mark); }
+}
+
 void Builder::appendFunctions(std::vector<Instruction> instructions) {
 	std::vector<Instruction>& body = _sections[Section::Functions];
 	body.insert(body.end(), std::make_move_iterator(instructions.begin()),

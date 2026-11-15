@@ -286,3 +286,10 @@ Forms Apple accepts that the validity proof still leaves as the unsupported-proo
 a float-to-integer cast inside a vector constructor of a constexpr list
 (`constexpr int3 v{int3(1.5f)}`), and a file-scope `constant` initialised with a float division by
 zero that is then narrowed to half.
+
+## Nested field designators are rejected by the parser (#163)
+
+Apple accepts `O o{.p.a = 1.0f, .c = 2.0f};` (a designator that names a member of a
+member). mslc stops in the parser with "expected = after a field name". This is a
+separate parser limit; the duplicate and reordered single-level designators of #163 are
+supported. Dropped or type-probed initialisers no longer leave dead function locals.
