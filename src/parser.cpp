@@ -2298,9 +2298,10 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 			throw CompileError("reference to \"" + parts[0] + "\" is ambiguous: it names " + *tier.found.begin()
 				+ " and " + *std::next(tier.found.begin()));
 		}
-		// A struct, enum or typedef is not a namespace: the lookup goes on outward.
-		if (!tier.found.empty() && _namespaces.count(*tier.found.begin())) {
-			return rest(*tier.found.begin());
+		// [basic.lookup.qual]/1: a struct, enum or typedef found nearer than an outer namespace
+		// hides it; the caller then treats the qualifier as the type (an enum's enumerators).
+		if (!tier.found.empty()) {
+			return _namespaces.count(*tier.found.begin()) ? rest(*tier.found.begin()) : std::string();
 		}
 	}
 	return "";
