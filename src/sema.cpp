@@ -6692,6 +6692,20 @@ namespace {
 		}
 	}
 
+	// A member or element of a value that is computed (S{...}, a call): it is a
+	// prvalue, so nothing can be stored to it or bound to a reference. Other roots keep
+	// their own diagnostics.
+	static bool isTemporaryPart(const Expression& target) {
+		if (target.kind != ExpressionKind::Member && target.kind != ExpressionKind::Index) {
+			return false;
+		}
+		const Expression* root = &target;
+		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
+			root = root->left.get();
+		}
+		return root->kind == ExpressionKind::Call || root->kind == ExpressionKind::InitList;
+	}
+
 	// The variable a non-const reference parameter names: the caller's own, so a
 	// store in the helper is a store to it. Only a place in the thread's own
 	// storage can be passed, since the parameter is a pointer into it.
@@ -6702,6 +6716,10 @@ namespace {
 			&& argument.kind != ExpressionKind::Member) {
 			throw CompileError(what + " has to be a variable, an element or a member: parameter \""
 				+ parameter.name + "\" is a reference to it");
+		}
+		if (isTemporaryPart(argument)) {
+			throw CompileError("no matching function for call to \"" + function + "\": " + what
+				+ " is a temporary, which parameter \"" + parameter.name + "\" cannot bind as a reference");
 		}
 		if (isVectorComponent(argument)) {
 			throw CompileError(what + " is a component of a vector, which a reference parameter cannot "
@@ -11353,6 +11371,9 @@ namespace {
 		if (root.kind == ExpressionKind::IntLiteral || root.kind == ExpressionKind::FloatLiteral
 			|| root.kind == ExpressionKind::BoolLiteral) {
 			throw CompileError("cannot assign to a literal or an enumerator constant");
+		}
+		if (isTemporaryPart(target)) {
+			throw CompileError("expression is not assignable");
 		}
 		if (root.kind == ExpressionKind::Identifier && _bindings.find(root.name) == _bindings.end()
 			&& _constants.count(root.name)) {

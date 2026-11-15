@@ -3939,7 +3939,10 @@ StatementPtr Parser::parseStatement() {
 		// local, but "A::S" or "::S" still names the struct (j1).
 		const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
 			&& isLocal(name);
-		const bool looksLikeType =
+		// "S{1,2}.a = 3;" starts an expression: a declaration names a variable after the type.
+		const bool bracedTemporary = kind() == TokenKind::Identifier && lookahead().kind == TokenKind::LBrace
+			&& _unit.findStruct(name) != nullptr;
+		const bool looksLikeType = !bracedTemporary &&
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
 				|| (_unit.findStruct(name) != nullptr && !localHidesStruct)))
