@@ -1,3 +1,4 @@
+#include <cmath>
 #include <limits>
 #include "parser.h"
 
@@ -3771,7 +3772,8 @@ void Parser::parseResourceType(Type& type) {
 	}
 	if (type.isDepth && (element->second != ScalarKind::Float || access != "sample")) {
 		throw CompileError(name + "<" + component + (access == "sample" ? "" : ", access::" + access)
-			+ "> is not lowered yet; mslc lowers depth textures of float with access::sample (Apple has no depth half)");
+			+ "> is not lowered yet; mslc lowers depth textures of float with access::sample"
+			+ (access == "sample" ? " (Apple has no depth half)" : ""));
 	}
 	// A multisampled texture is a sampled image whichever way read is spelled.
 	type.textureAccess = isMultisampled ? TextureAccess::Sample : access == "write" ? TextureAccess::Write
@@ -4614,6 +4616,9 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 				const double value = kind() == TokenKind::IntegerLiteral ? static_cast<double>(current().integerValue)
 					: current().floatValue;
 				advance();
+				if (!std::isfinite(value) || std::fabs(value) > std::numeric_limits<float>::max()) {
+					throw CompileError("\"" + family + "\" takes a finite float");
+				}
 				return negative ? -value : value;
 			};
 			if (family == "max_anisotropy") {
@@ -4639,6 +4644,9 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 			expect(TokenKind::RParen, ("to close \"" + family + "\"").c_str());
 			if (!match(TokenKind::Comma)) {
 				break;
+			}
+			if (at(closing)) {
+				throw CompileError("expected a sampler option after ',' in a sampler's option list");
 			}
 			continue;
 		}
@@ -4744,6 +4752,10 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 		const auto clamps = [](SamplerAddress mode) {
 			return mode == SamplerAddress::ClampToZero || mode == SamplerAddress::ClampToEdge;
 		};
+		if (assigned.count("anisotropy") || assigned.count("lod")) {
+			throw CompileError("invalid values combination in sampler initialization: with coord::pixel, Vulkan "
+				"needs anisotropy off and no lod range, so max_anisotropy and lod_clamp are refused");
+		}
 		if (state.magFilter != state.minFilter || state.mipFilter != SamplerMipFilter::None
 			|| !clamps(state.sAddress) || !clamps(state.tAddress) || !clamps(state.rAddress)) {
 			throw CompileError("invalid values combination in sampler initialization: with "
