@@ -62,6 +62,10 @@ with tempfile.TemporaryDirectory() as work:
     assert lines[0].startswith("metallib "), lines
     assert apple_result(work, lines) == 0.0
 
+    # __has_include("...") has the same problem and takes the same route.
+    open(src, "w").write('#if __has_include("h.h")\nkernel void k(device float* o [[buffer(0)]]) { o[0] = 1.0f; }\n#endif\n')
+    assert hosts.apple_source_lines(src, work, [inc], None)[0].startswith("metallib ")
+
     # Apple rejecting the source is a HostError carrying Apple's message.
     open(src, "w").write("kernel void k() { nope; }\n")
     try:

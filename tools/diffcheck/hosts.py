@@ -105,11 +105,11 @@ def apple_source_lines(source, work, includes, std, contract=False):
     off: Metal contracts a * b + c into one fma even in safe math mode, mslc emits a
     separate multiply and add, and the two differ by a ULP or more under cancellation,
     which is a permitted difference and not a miscompile. `contract` keeps it on.
-    A quoted #include cannot be resolved from an in-memory source, so such a file is built
+    A quoted #include or __has_include("...") cannot be resolved from an in-memory source, so such a file is built
     with `xcrun metal` (same compiler, same flags) into a metallib instead.
     """
     text = hostenv.read_text(source)
-    if not re.search(r'^\s*#\s*include\s*"', text, re.M):
+    if not re.search(r'^\s*#\s*include\s*"|__has_include\s*\(\s*"', text, re.M):
         return ["source " + source, "contract " + ("on" if contract else "off")] + (["std " + std] if std else [])
     air, lib = os.path.join(work, "apple.air"), os.path.join(work, "apple.metallib")
     cmd = ["xcrun", "metal", "-c", "-fmetal-math-mode=safe", "-ffp-contract=" + ("on" if contract else "off"),

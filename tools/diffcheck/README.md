@@ -49,7 +49,7 @@ In `--corpus` mode skips do not fail the run.
    `// DIFFCHECK: writes-zero`.
 
 Grid and local size are in x only. `--grid` is the total thread count and must be a multiple
-of `--local`. Buffers get `--elems` elements (default four per thread). The Vulkan side sets
+of `--local`. Buffers get `--elems` elements (default `max(64, 4 * grid)`). The Vulkan side sets
 the local size through spec constants 0, 1 and 2, which is what indium does.
 
 ## Comparison rules (`compare.py`)
@@ -73,9 +73,12 @@ the local size through spec constants 0, 1 and 2, which is what indium does.
 - `// RUN: grid=64 local=8 seed=1 cases=3 elems=256` sets the run parameters for the file
   (command-line flags win).
 - Fused multiply-add: Metal contracts `a * b + c` into an fma even in safe math mode, mslc emits
-  a separate multiply and add, and the results differ by a ULP or more under cancellation. That
-  is a permitted difference, so the Apple side compiles with `#pragma clang fp contract(off)`.
-  `--apple-contract` restores what an app's build does.
+  a separate multiply and add, and the results differ by a ULP or more under cancellation. Fusing
+  inside one expression is permitted, so the Apple side compiles with `#pragma clang fp contract(off)`
+  to give a deterministic reference; `--apple-contract` restores what an app's build does.
+  That does not make the module safe on every driver: mslc emits no `NoContraction` and no
+  `SignedZeroInfNanPreserve`, so a NIR driver may fuse, re-associate or drop -0, inf and NaN
+  (#368, a real divergence, see below).
 - Not supported yet, skipped with the reason: textures, samplers, threadgroup memory, argument
   buffers, atomics, graphics stages.
 
@@ -89,16 +92,21 @@ Triage of the first corpus sweeps (1,295 probe kernels at grid 1, 1,086 compared
   (probes are single-thread designs: run them with `--grid 1 --local 1`).
 - Uninitialised reads (a struct local with no initialiser, a threadgroup array read before any
   write): Apple returns garbage, mslc zero. Exclude the buffer with a reason.
-- lavapipe folds `float(half(x))` to `x` and `float(int(x))` to `trunc(x)`, so a half or a
-  negative fraction held in a register differs from Apple (`-0.0` against `0.0`). The SPIR-V has
-  the OpFConvert and OpConvertFToS; storing the half to a buffer first (as a real kernel does)
-  matches. Compare through a buffer store, or exclude.
-- `newLibraryWithSource` pre-includes `<metal_stdlib>`, so a source that tests a macro before its
-  include sees it defined; the offline compiler does not. A quoted `#include` takes the offline
-  route and matches.
+- Integer division or remainder by zero, `INT_MIN / -1`, and out-of-range float to int
+  conversions are undefined: random inputs reach them, and the backends legitimately differ.
+- A quoted `#include` or `__has_include("...")` cannot be resolved from an in-memory source, so
+  those files take the offline `xcrun metal` route (and a relative `__has_include` path must be
+  reachable from `-I`). `pp_metal_stdlib_adds_macros` matched through that route, which suggests
+  `newLibraryWithSource` pre-includes `<metal_stdlib>`; that is the unverified reading of the
+  other `pp_metal_*` probe.
 - Lavapipe rejects some valid modules (an empty struct: `vkCreateComputePipelines` -13).
-- Apple may re-associate `(x + 1) - 1` (`out[i]++; --out[i].y`): a last-bits difference on
-  cancellation, reported as a mismatch until a ULP bound or exclusion is given.
+- **Not a harness artifact, #368:** lavapipe folds `float(half(x))` to `x`, `float(int(x))` to
+  `trunc(x)`, `x * 0` to `0`, and re-associates `(x + 1) - 1`, so a half or a negative fraction held
+  in a register, a signed zero, or a cancellation differs from Apple. NIR does that to every
+  float instruction that is not `exact`; mslc's SPIR-V has no `NoContraction` and no
+  `SignedZeroInfNanPreserve`, so RADV, ANV and the other NIR drivers behave the same. Until #368
+  is fixed these mismatches are mslc results; compare through a buffer store or exclude with a
+  reason that names #368.
 
 ## Tests and CI
 
