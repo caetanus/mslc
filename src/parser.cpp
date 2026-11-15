@@ -1092,7 +1092,7 @@ ExpressionPtr Parser::parseInitializer() {
 		return parseInitializerList();
 	}
 
-	return parseExpression();
+	return parseAssignment();
 }
 
 ExpressionPtr Parser::parseInitializerList() {
@@ -1424,7 +1424,7 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 			if (!match(TokenKind::LParen)) {
 				throw CompileError("only \"member(value)\" is lowered in the initialiser list of " + quoted);
 			}
-			ExpressionPtr value = parseExpression();
+			ExpressionPtr value = parseAssignment();
 			expect(TokenKind::RParen, "to close a member initialiser");
 			initialisers.emplace_back(field, std::move(value));
 		} while (match(TokenKind::Comma));
@@ -3747,7 +3747,7 @@ StatementPtr Parser::parseStatement() {
 				if (!match(TokenKind::Assign)) {
 					throw CompileError("the reference \"" + declaration.name + "\" needs an initialiser");
 				}
-				declaration.initializer = parseExpression();
+				declaration.initializer = parseAssignment();
 				statement->declaration = std::move(declaration);
 				expect(TokenKind::Semicolon, "after a reference declaration");
 				return statement;
@@ -4230,7 +4230,18 @@ StatementPtr Parser::parseReturnStatement() {
 }
 
 ExpressionPtr Parser::parseExpression() {
-	return parseAssignment();
+	auto left = parseAssignment();
+	while (at(TokenKind::Comma)) {
+		advance();
+		auto expression = std::make_unique<Expression>();
+		expression->kind = ExpressionKind::Comma;
+		expression->line = left->line;
+		expression->left = std::move(left);
+		expression->right = parseAssignment();
+		measure(*expression);
+		left = std::move(expression);
+	}
+	return left;
 }
 
 ExpressionPtr Parser::parseAssignment() {
@@ -4652,7 +4663,7 @@ std::vector<ExpressionPtr> Parser::parseArgumentList(const char* closing) {
 	std::vector<ExpressionPtr> arguments;
 
 	while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
-		arguments.push_back(parseExpression());
+		arguments.push_back(parseAssignment());
 
 		if (!match(TokenKind::Comma)) {
 			break;

@@ -4468,6 +4468,8 @@ namespace {
 					&& expression.binaryOperator != BinaryOperator::LogicalAnd
 					&& expression.binaryOperator != BinaryOperator::LogicalOr
 					&& safe(expression.left) && safe(expression.right);
+			case ExpressionKind::Comma:
+				return safe(expression.left) && safe(expression.right);
 			case ExpressionKind::Construct:
 			case ExpressionKind::Conditional: {
 				if (!safe(expression.left)) {
@@ -7071,6 +7073,9 @@ namespace {
 			case ExpressionKind::Call: return emitCall(expression);
 			case ExpressionKind::Construct: return emitConstruct(expression);
 			case ExpressionKind::Conditional: return emitConditional(expression);
+			case ExpressionKind::Comma:
+				emitExpressionStatement(*expression.left);
+				return emitExpression(*expression.right);
 			case ExpressionKind::InitList:
 				// S{...} names its struct; a bare list does not and is only an initialiser.
 				if (expression.constructType) {
@@ -9327,6 +9332,7 @@ namespace {
 				return type.isPointer || type.arrayLength ? std::nullopt
 					: std::optional<std::string>(type.enumName);
 			}
+			case ExpressionKind::Comma: return enumOf(*expression.right);
 			case ExpressionKind::Construct:
 				return expression.constructType ? std::optional<std::string>(expression.constructType->enumName)
 					: std::nullopt;
@@ -9986,6 +9992,12 @@ namespace {
 				return;
 			}
 			emitExpressionStatement(operand);
+			return;
+		}
+
+		if (expression.kind == ExpressionKind::Comma) {
+			emitExpressionStatement(*expression.left);
+			emitExpressionStatement(*expression.right);
 			return;
 		}
 

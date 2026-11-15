@@ -217,6 +217,8 @@ enum class ExpressionKind {
 	Construct,
 	InitList,
 	Conditional,
+	// left, right: left is evaluated and dropped, the value is right's.
+	Comma,
 };
 
 enum class BinaryOperator {
