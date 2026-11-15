@@ -3940,8 +3940,10 @@ StatementPtr Parser::parseStatement() {
 		const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
 			&& isLocal(name);
 		// "S{1,2}.a = 3;" starts an expression: a declaration names a variable after the type.
+		Type typedefOf;
 		const bool bracedTemporary = kind() == TokenKind::Identifier && lookahead().kind == TokenKind::LBrace
-			&& _unit.findStruct(name) != nullptr;
+			&& (_unit.findStruct(name) != nullptr
+				|| (resolveTypeName(name, typedefOf) && _unit.findStruct(typedefOf.namedType) != nullptr));
 		const bool looksLikeType = !bracedTemporary &&
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
@@ -5299,8 +5301,8 @@ ExpressionPtr Parser::parsePrimary() {
 		// S{.field = a}. It is spelled in a return, an argument or an initialiser.
 		// A typedef of a struct names the same struct: T{a, b} after "typedef S T;".
 		std::string braced = resolved;
-		if (Type aliased; resolveTypeName(text, aliased) && !aliased.namedType.empty() && !aliased.isPointer
-			&& !aliased.arrayLength && _unit.findStruct(aliased.namedType)) {
+		if (Type aliased; resolveTypeName(text, aliased) && !aliased.namedType.empty()
+			&& _unit.findStruct(aliased.namedType)) {
 			braced = aliased.namedType;
 		}
 		if ((fileScoped || !isLocal(resolved)) && _unit.findStruct(braced) && lookahead(spelledTokens).kind == TokenKind::LBrace) {
