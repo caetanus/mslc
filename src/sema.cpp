@@ -6692,16 +6692,17 @@ namespace {
 		}
 	}
 
-	// A struct value that is computed rather than named: S{...}, a call, or a conditional whose
-	// arms all are. A conditional with a named arm may yield a place, so it is not one.
+	// A struct value that is computed rather than named: S{...}, a call, or a conditional with
+	// such an arm. A conditional of named arms may yield a place, so it is not one.
 	static bool isComputedValue(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::Identifier: return false;
 			case ExpressionKind::Member:
 			case ExpressionKind::Index: return isComputedValue(*expression.left);
 			case ExpressionKind::Comma: return isComputedValue(*expression.right);
+			// One prvalue arm makes the whole conditional a prvalue.
 			case ExpressionKind::Conditional:
-				return isComputedValue(*expression.arguments[0]) && isComputedValue(*expression.arguments[1]);
+				return isComputedValue(*expression.arguments[0]) || isComputedValue(*expression.arguments[1]);
 			case ExpressionKind::Call:
 			case ExpressionKind::InitList: return true;
 			default: return false;
@@ -6715,6 +6716,26 @@ namespace {
 			&& isComputedValue(target);
 	}
 
+	// The messages for a place that is a member of a conditional or comma whose arms are
+	// named: Apple takes them, mslc does not lower them.
+	static void rejectPlaceThroughConditional(const Expression& target, const char* what) {
+		if (target.kind != ExpressionKind::Member && target.kind != ExpressionKind::Index) {
+			return;
+		}
+		const Expression* root = &target;
+		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
+			root = root->left.get();
+		}
+		if (root->kind == ExpressionKind::Conditional) {
+			throw CompileError(std::string(what) + " a member or element of a conditional expression is not "
+				"supported; use the variable in an if instead");
+		}
+		if (root->kind == ExpressionKind::Comma) {
+			throw CompileError(std::string(what) + " a member or element of a comma expression is not "
+				"lowered yet; use its right operand on its own");
+		}
+	}
+
 	// The variable a non-const reference parameter names: the caller's own, so a
 	// store in the helper is a store to it. Only a place in the thread's own
 	// storage can be passed, since the parameter is a pointer into it.
@@ -6726,6 +6747,7 @@ namespace {
 			throw CompileError(what + " has to be a variable, an element or a member: parameter \""
 				+ parameter.name + "\" is a reference to it");
 		}
+		rejectPlaceThroughConditional(argument, "passing by reference");
 		if (isTemporaryPart(argument)) {
 			throw CompileError("no matching function for call to \"" + function + "\": " + what
 				+ " is a temporary, which parameter \"" + parameter.name + "\" cannot bind as a reference");
@@ -10373,6 +10395,7 @@ namespace {
 			bindLocal(declaration.name, variable, _builder.typeOf(value), referenced);
 			return;
 		}
+		rejectPlaceThroughConditional(place, "binding a reference to");
 
 		const Expression& root = storeRoot(place);
 		if (root.kind != ExpressionKind::Identifier) {
@@ -11384,6 +11407,7 @@ namespace {
 		if (isTemporaryPart(target)) {
 			throw CompileError("expression is not assignable");
 		}
+		rejectPlaceThroughConditional(target, "assigning to");
 		if (root.kind == ExpressionKind::Identifier && _bindings.find(root.name) == _bindings.end()
 			&& _constants.count(root.name)) {
 			throw CompileError("cannot store to \"" + root.name + "\", a constant declared at file scope");
