@@ -345,6 +345,7 @@ private:
 	// Resolves a scalar, vector, matrix or typedef name to its type.
 	bool resolveTypeName(std::string_view text, Type& out) const;
 	bool objectHidesTag(const std::string& name) const;
+	bool memberHidesName(const std::string& name) const;
 
 	// A constant integer expression: literals, enum constants and the operators
 	// on them. Anything that is not a constant is a CompileError.

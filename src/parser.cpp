@@ -2140,6 +2140,13 @@ std::vector<std::string_view> Parser::kindsOf(const std::string& name) const {
 
 // A function or a variable of a name hides a struct or enum tag of that name, so
 // "S(...)" and "S{...}" name the object and not the type ([basic.scope.hiding]).
+// A field or member function of the struct whose function body is being read hides a type of its
+// name, through the implicit this (the whole struct is in scope there, whatever order it is written in).
+bool Parser::memberHidesName(const std::string& name) const {
+	return _memberFields && isLocal("this")
+		&& (_memberFields->count(name) || _memberFunctions.count(name));
+}
+
 bool Parser::objectHidesTag(const std::string& name) const {
 	for (const std::string_view kindName : kindsOf(name)) {
 		if (kindName == "function" || kindName == "variable") {
@@ -5639,6 +5646,7 @@ ExpressionPtr Parser::parseSizeof() {
 		const bool inOwnBody = _structBody && name == _structBody->name;
 		const bool startsType = inOwnBody || (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text))
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name)
+				&& !(kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon && memberHidesName(name))
 				&& (resolveTypeName(name, probe) || isTypeQualifier(name) || isResourceTypeName(name)
 					|| (_unit.findStruct(name) != nullptr && !localHidesStruct)))
 			|| atKeyword("device") || atKeyword("constant") || atKeyword("threadgroup") || atKeyword("thread");
@@ -5851,7 +5859,9 @@ ExpressionPtr Parser::parseCast() {
 			Type probe;
 			const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
 				&& isLocal(spelled) && !resolveTypeName(spelled, probe);
-			if (objectHidesTag(spelled) || localHidesStruct) {
+			const bool memberHides = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
+				&& memberHidesName(spelled);
+			if (objectHidesTag(spelled) || memberHides || localHidesStruct) {
 				type.reset();
 			}
 		}
