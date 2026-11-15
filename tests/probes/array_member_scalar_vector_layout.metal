@@ -1,5 +1,5 @@
 // EXPECT: valid
-// RUN: grid=1 local=1 cases=3
+// RUN: grid=5 local=5 cases=3
 // DISASM-MATCH: OpMemberDecorate %_struct_[0-9]+ 1 Offset 4
 // DISASM-MATCH: OpMemberDecorate %_struct_[0-9]+ 2 Offset 32
 // DISASM-MATCH: OpMemberDecorate %_struct_[0-9]+ 3 Offset 64
@@ -22,5 +22,5 @@ struct Params
 kernel void array_member_scalar_vector_layout(device float *out [[buffer(0)]],
     constant Params &p [[buffer(1)]], uint i [[thread_position_in_grid]])
 {
-    out[0] = p.scale + p.lights[i] + p.positions[1].y + p.tail;
+    out[i] = p.scale + p.lights[i] + p.positions[1].y + p.tail;
 }

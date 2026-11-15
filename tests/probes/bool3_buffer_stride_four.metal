@@ -1,5 +1,5 @@
 // EXPECT: valid
-// RUN: grid=1 local=1 cases=3
+// RUN: grid=64 local=8 cases=3
 // DISASM-MATCH: OpDecorate %_runtimearr__arr_uchar_uint_3 ArrayStride 4
 // DISASM-MATCH: Aligned 4
 // DISASM-MATCH: OpCompositeExtract %uchar %[0-9]+ 2
