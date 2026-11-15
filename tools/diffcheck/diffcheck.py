@@ -42,7 +42,7 @@ def run_mslc(mslc, source, work, includes):
     return spv, json.load(open(refl)), None
 
 
-def check_entry(opts, source, spv, reflection, entry, params, work):
+def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     """Compare one kernel; returns a result dict."""
     result = {"entry": entry, "status": None, "cases": [], "reason": None}
     text = open(source, encoding="utf-8", errors="replace").read()
@@ -60,7 +60,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work):
 
     std = params.get("std")
     try:
-        lines = hosts.apple_source_lines(source, work, opts.includes, std, opts.apple_source)
+        lines = hosts.apple_source_lines(source, work, includes, std, opts.apple_source)
         apple = hosts.apple_reflection(opts.metal, lines, entry, work)
     except hosts.HostError as e:
         result.update(status="skipped", reason=str(e))
@@ -94,7 +94,8 @@ def check_entry(opts, source, spv, reflection, entry, params, work):
     result["ulp_bound"] = ulp
     for case, (profile, sentinel) in enumerate(profiles):
         rng = random.Random(params["seed"] * 1000 + case)
-        data = {i: inputs.fill_buffer(l, elements, rng, "wide" if sentinel else profile, sentinel, opts.poison_padding)
+        data = {i: inputs.fill_buffer(l, elements, rng, "wide" if sentinel else profile, sentinel, opts.poison_padding,
+                                  params["range"].get(l["name"]))
                 for i, l in sorted(layouts.items())}
         outs = {}
         for backend, runner in (("apple", hosts.run_metal), ("mslc", hosts.run_vulkan)):
@@ -158,13 +159,15 @@ def check_entry(opts, source, spv, reflection, entry, params, work):
     return result
 
 
-def check_file(opts, path):
+def check_file(opts, path, std=None):
     """Results for every kernel in `path` (or the one named by --entry)."""
+    here = os.path.dirname(os.path.abspath(path))
+    includes = opts.includes + [here, os.path.dirname(here)]
     text = open(path, encoding="utf-8", errors="replace").read()
     d = directives.parse(text)
     work = tempfile.mkdtemp(prefix="diffcheck-", dir=os.environ.get("TMPDIR"))
     try:
-        spv, refl, error = run_mslc(opts.mslc, path, work, opts.includes)
+        spv, refl, error = run_mslc(opts.mslc, path, work, includes)
         if error:
             return [{"entry": opts.entry or "*", "status": "skipped", "reason": error, "cases": []}]
         entries = [e for e in refl["entry_points"] if e["stage"] == "compute"]
@@ -179,11 +182,11 @@ def check_file(opts, path):
                 "grid": opts.grid or run.get("grid", 64), "local": opts.local or run.get("local", 8),
                 "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
                 "cases": opts.cases or run.get("cases", 3), "elems": opts.elems or run.get("elems"),
-                "std": opts.std, "exclude": d["exclude"], "writes_zero": d["writes_zero"],
+                "std": std or opts.std, "exclude": d["exclude"], "range": d["range"], "writes_zero": d["writes_zero"],
             }
             sub = os.path.join(work, e["name"])
             os.makedirs(sub)
-            results.append(check_entry(opts, path, spv, e, e["name"], params, sub))
+            results.append(check_entry(opts, path, spv, e, e["name"], params, sub, includes))
         return results
     finally:
         if not opts.keep:
@@ -192,9 +195,45 @@ def check_file(opts, path):
             print("kept " + work, file=sys.stderr)
 
 
+def corpus_files(listing, root):
+    """(path, std) for each line of a corpus list: `path [std=3.1]`, # comments, relative to root."""
+    files = []
+    for line in open(listing):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = line.split()
+        std = next((f[4:] for f in fields[1:] if f.startswith("std=")), None)
+        files.append((os.path.join(root, fields[0]), std))
+    return files
+
+
+def run_files(opts, files):
+    """Check every file; a harness failure on one file is that file's result, not the run's."""
+    results = []
+    for path, std in files:
+        try:
+            for r in check_file(opts, path, std):
+                results.append(dict(r, file=path))
+        except (hosts.HostError, subprocess.TimeoutExpired, OSError, ValueError) as e:
+            results.append({"file": path, "entry": "*", "status": "error", "reason": str(e), "cases": []})
+    return results
+
+
+def summary(results):
+    counts = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    compared = sum(n for st, n in counts.items() if st not in ("skipped", "error"))
+    line = "%d kernels: %d compared" % (len(results), compared)
+    return line + "".join(", %d %s" % (n, st) for st, n in sorted(counts.items()))
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("file")
+    p.add_argument("file", nargs="?")
+    p.add_argument("--corpus", metavar="LIST", help="check every file in a list (path [std=3.1] per line)")
+    p.add_argument("--root", help="directory the corpus list's paths are relative to (default: the list's own)")
     p.add_argument("--entry", help="kernel to check (default: every kernel in the file)")
     p.add_argument("--grid", type=int, help="total threads in x (default 64)")
     p.add_argument("--local", type=int, help="threads per threadgroup in x (default 8)")
@@ -219,28 +258,37 @@ def parser():
 
 def main(argv=None):
     opts = parser().parse_args(argv)
+    if bool(opts.file) == bool(opts.corpus):
+        print("diffcheck: give a file or --corpus list", file=sys.stderr)
+        return ERROR
     try:
         opts.metal, opts.vk = hosts.metalhost(opts.metalhost), hosts.vkhost(opts.vkhost)
         if hostenv.find_lavapipe_icd() is None:
             raise hosts.Unavailable("no lavapipe ICD")
-        results = check_file(opts, opts.file)
+        if opts.corpus:
+            root = opts.root or os.path.dirname(os.path.abspath(opts.corpus))
+            results = run_files(opts, corpus_files(opts.corpus, root))
+        else:
+            results = run_files(opts, [(opts.file, None)])
     except hosts.Unavailable as e:
         print("SKIPPED: %s" % e)
         return hostenv.SKIP
     except hosts.HostError as e:
         print("diffcheck: %s" % e, file=sys.stderr)
         return ERROR
-    report = {"file": opts.file, "results": results}
     if opts.report:
-        json.dump(report, open(opts.report, "w"), indent=1)
+        json.dump({"results": results}, open(opts.report, "w"), indent=1)
     for r in results:
-        print("%-14s %s  %s" % (r["status"], r["entry"], r.get("reason") or ""))
+        print("%-17s %s::%s  %s" % (r["status"], r["file"], r["entry"], (r.get("reason") or "")[:160]))
+    print(summary(results))
     statuses = {r["status"] for r in results}
+    if "error" in statuses:
+        return ERROR
     if statuses <= {"matched"}:
         return OK
     if statuses <= {"skipped"}:
         return SKIPPED
-    return MISMATCH
+    return OK if statuses <= {"matched", "skipped"} and opts.corpus else MISMATCH
 
 
 if __name__ == "__main__":
