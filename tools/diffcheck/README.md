@@ -52,6 +52,76 @@ Grid and local size are in x only. `--grid` is the total thread count and must b
 of `--local`. Buffers get `--elems` elements (default `max(64, 4 * grid)`). The Vulkan side sets
 the local size through spec constants 0, 1 and 2, which is what indium does.
 
+## Graphics mode
+
+A file whose `// RUN:` line names a vertex and a fragment function (or `--vertex` and `--fragment`)
+is drawn instead of dispatched:
+
+```
+// RUN: vertex=vs fragment=fs width=32 height=32 instances=2 cases=2
+// DIFFCHECK-POSITION: pos          the stage_in field that carries the position, or `none`
+// DIFFCHECK-GEOMETRY: 2,3 22,3 22,13 ...   triangle list, pixels, `x,y` or `x,y,z` (optional)
+// DIFFCHECK: depth                 read a depth target back (implied by [[depth(any)]])
+```
+
+mslc compiles each stage separately (`--stage vertex|fragment`, spirv-val must pass). The draw is
+one triangle list (default: a 20x10 and an 18x13 rectangle and a thin triangle in a 32x32 target;
+no edge passes through a pixel centre) times `instances`, into colour targets chosen from the
+fragment's outputs (float: 32F, int: 32I, uint: 32U, half: 16F; R, RG or RGBA to match the
+component count), cleared to values no plausible output equals, and an optional D32 depth target (always-pass depth test).
+The set of colour targets, their types and the depth output are read from the Metal source
+(`[[color(n)]]`, `[[depth]]`, or the plain return type), never from mslc's module: an output mslc
+drops, retypes or moves is reported as a `reflection-mismatch`, not left out of the comparison.
+A return type the harness cannot read from the file (a typedef, a struct from an `#include`, a
+3-component output, which no pixel format holds) is skipped with the reason.
+Everything must stay inside the target: lavapipe returns NaN for `noperspective` varyings on a
+guard-band-clipped triangle, and the backends clip differently. The Vulkan viewport has a negative
+height so row 0 is the top, as in Metal.
+
+Vertex positions must sit on the 1/256 pixel grid and the target be a power of two (so a pixel
+coordinate converts to clip space exactly): the backends snap an off-grid vertex differently and
+interpolated values drift apart by about 1e-3. `DIFFCHECK-GEOMETRY` is checked; a vertex shader
+that moves positions (instance offsets) must keep them on the grid when the output is smooth.
+
+Inputs: the `DIFFCHECK-POSITION` field is filled from the geometry (w = 1); every other stage_in
+field is seeded per vertex, one tightly packed vertex buffer per attribute (Metal slot
+`30 - location`, so a `[[buffer(n)]]` argument must not use those); `[[buffer]]` arguments are
+seeded like kernel buffers, in both stages; a 2D float texture is 4x4 RGBA32F and a runtime
+sampler is nearest, clamp-to-edge, normalised, no mips. Probes should sample at a texel centre.
+Graphics defaults to the `moderate` profile and two cases: `wide` values interpolate to magnitudes
+where any tolerance is meaningless.
+
+Compared per attachment (named `color0`, `color1`, ... and `depth`, which `DIFFCHECK-EXCLUDE`
+accepts) and per component: integers are bit-exact; a float component is bit-exact when Apple's
+image gives it no more distinct values than there are primitives (plus the clear value), which
+covers constants and flat varyings, and otherwise counts as interpolated and is compared within
+32 ULP or 2e-5 absolute (measured worst case on the probes: 6e-6; depth within 1e-6); inexact
+builtins add their `ULP_BOUNDS`. The decision reads Apple's output, so a miscompile cannot loosen
+its own check. Limits: a smooth component can hide an error of up to the tolerance (a constant
+added to an interpolated value, a one-ULP slip in the interpolation maths), and an interpolated
+value that passes through a rounding step (`half4(in.col)` into a float target) can differ by one
+half ULP between the backends.
+Same vacuity guards as kernels: the negative control, the zero-output rule (a pixel must change
+from the clear colour to a non-zero value on some backend; excluded attachments do not count),
+a crash or a timeout of either host is an `error`, never a skip.
+
+The Vulkan host reads back each image behind an attachment-write to transfer-read barrier and
+the audited transfer-write to host-read barrier of PR #148. Vertex-stage values cannot be read
+back (there is no transfer-feedback path), so a vertex miscompile shows only through what it
+puts in the attachments.
+
+Skipped with the reason (follow-up work): a writable `[[buffer]]` in either stage, vertex-stage
+textures, non-2D or non-float textures, embedded samplers, framebuffer fetch, a scalar half vertex
+attribute, colour outputs that are not 0..n-1 in the source. Not covered: indexed draws, blending,
+stencil, multisampling, `noperspective`/`centroid` inputs, tessellation.
+
+Graphics probes live in `tests/diffcheck/graphics` and, like the kernel probes, become ctest tests
+(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants eleven
+miscompiles in the SPIR-V of the real output (`tests/diffcheck_mutate_mslc.py`, which takes
+`MSLC_REAL`, `MUT` and `MUT_STAGE`) and requires each to be reported as a mismatch.
+
+Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tracked in #372).
+
 ## Comparison rules (`compare.py`)
 
 | Type | Rule |
@@ -79,8 +149,8 @@ the local size through spec constants 0, 1 and 2, which is what indium does.
   That does not make the module safe on every driver: mslc emits no `NoContraction` and no
   `SignedZeroInfNanPreserve`, so a NIR driver may fuse, re-associate or drop -0, inf and NaN
   (#368, a real divergence, see below).
-- Not supported yet, skipped with the reason: textures, samplers, threadgroup memory, argument
-  buffers, atomics, graphics stages.
+- Not supported yet in kernel mode, skipped with the reason: textures, samplers, threadgroup memory,
+  argument buffers, atomics. Graphics pairs have their own mode, below.
 
 ## Reading a mismatch: what is not an mslc bug
 
