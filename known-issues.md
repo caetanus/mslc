@@ -179,6 +179,19 @@ or not (`N::f(c ? la : lb)`, `::f(...)` included). With one candidate it is acce
 `struct S { float a; float b; float m(thread float &x) const { x = 7.0f; return a; } };` and `s.m(s.a)` return 7
 in Apple and 1 in mslc: the receiver is passed by value, so it is not the object the reference names.
 
+## Helper parameters in the constant address space: what is taken, what is not (#232 f)
+
+A `constant T &c` or `const constant T &c` helper parameter is read-only memory, so it is passed as the
+value. Its argument has to be a place in constant memory (a constant buffer parameter or an element or member
+of one, a file-scope constant, a constant reference parameter of the caller) of exactly T, with no
+conversion; anything else is a diagnostic (Apple refuses a thread or device argument, a literal and a
+converted value too). Not lowered, each a loud refusal: a conditional of two constant lvalues as the argument
+(`c ? a : b`; Apple takes it as an lvalue), `constant T *` or `constant T *&` parameters, a `device T &`
+parameter (still "does not take yet"), a `constant T &&`, and taking `&c` of the parameter. Overload ranking
+treats it as an exact match that binds only a constant-space place; the same call with a by-value overload is
+ambiguous, as in Apple. The argument is read once at the call, not bound, so a value read through two
+aliasing constant references is the same value (nothing can write constant memory).
+
 ## Overload sets, using declarations and argument-dependent lookup: what is not followed (#266)
 
 - A using declaration names the overloads declared above it, and a later one is not found

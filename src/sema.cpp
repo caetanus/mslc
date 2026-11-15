@@ -2627,6 +2627,11 @@ namespace {
 		std::vector<HelperFunction*> helpersNamed(const std::string& name);
 		std::vector<std::string> namesOfCall(const Expression& call);
 		const StructDecl* adlStructOf(const Expression& argument);
+		bool inConstantSpace(const Expression& place) const;
+		bool isVectorPlace(const Expression& place);
+		bool isVectorComponent(const Expression& place);
+		Id constantReferenceArgument(const Expression& argument, const Parameter& parameter,
+			const std::string& function, size_t position, Id prepared);
 		HelperFunction* definedHelper(HelperFunction* entry);
 		// What a call can denote before its arguments are known: every function of every name the
 		// parser found for it (not the ones argument-dependent lookup adds).
@@ -2659,6 +2664,9 @@ namespace {
 			bool changeable = false;
 			// A variable of this function's own storage: a reference to thread memory binds only to it.
 			bool inThread = false;
+			// A place in the constant address space (a constant buffer, a file-scope constant, or a
+			// constant reference parameter of this function): the only thing a constant reference binds.
+			bool inConstant = false;
 			// Names a pointer or a buffer that is not a local array: not lowered as an argument.
 			bool pointerLike = false;
 		};
@@ -6102,8 +6110,7 @@ namespace {
 				}
 				argument.binding = binding;
 				argument.pointerLike = argument.kind == OverloadArgument::Kind::Variable
-					&& (binding->pointeeMsl.isPointer || binding->pointeeMsl.arrayLength || binding->isBuffer
-						|| binding->bufferPointeeType != InvalidId);
+					&& (binding->pointeeMsl.isPointer || binding->pointeeMsl.arrayLength || binding->isBuffer);
 			}
 		} else if (expression.kind == ExpressionKind::Unary && expression.unaryOperator == UnaryOperator::AddressOf) {
 			argument.pointerLike = true;
@@ -6111,8 +6118,9 @@ namespace {
 		if (argument.kind == OverloadArgument::Kind::Variable) {
 			const Expression& root = storeRoot(expression);
 			const Binding* local = root.kind == ExpressionKind::Identifier ? findResourceBinding(root.name) : nullptr;
+			argument.inConstant = inConstantSpace(expression);
 			argument.inThread = local && !local->isBuffer && local->bufferPointeeType == InvalidId
-				&& local->storageClass == spirv::StorageClass::Function;
+				&& local->storageClass == spirv::StorageClass::Function && !argument.inConstant;
 			argument.changeable = argument.inThread && !local->readOnly;
 		}
 		return argument;
@@ -6158,6 +6166,19 @@ namespace {
 		const Id to = declaredTypeOf(type);
 		const Id from = _builder.typeOf(argument.value);
 		const bool enumArgument = argument.tag && !argument.tag->empty();
+		if (parameter.isReference && type.addressSpace == AddressSpace::Constant) {
+			// It binds a constant-space place of exactly its type, and nothing else (no conversion
+			// makes a temporary in another address space).
+			if (argument.kind == OverloadArgument::Kind::Variable && argument.inConstant
+				&& isVectorComponent(*argument.expression)) {
+				// Apple finds the candidate viable and then errors if it wins; dropping it here could
+				// silently pick another overload.
+				throw CompileError("an argument that is a component of a constant vector chooses among overloads "
+					"one of which takes a constant reference; Apple binds it and errors, which is not modelled");
+			}
+			return argument.kind == OverloadArgument::Kind::Variable && argument.inConstant && from == to
+				&& type.enumName == (argument.tag ? *argument.tag : std::string()) ? exact(1) : none;
+		}
 		if (enumArgument && from != _intType) {
 			throw CompileError("an enum whose underlying type is not int chooses among overloads, which is not "
 				"lowered yet (it promotes to its own type)");
@@ -6387,6 +6408,16 @@ namespace {
 				continue;
 			}
 
+			if (parameter.isReference && parameter.type.addressSpace == AddressSpace::Constant) {
+				const Id value = constantReferenceArgument(*call.arguments[i], parameter, definition.name, i + 1,
+					prepared.empty() ? InvalidId : prepared[i]);
+				if (parameter.type.enumName.empty()) {
+					argumentOperands[i] = stdlibArgumentOperand(_builder.typeOf(value));
+				}
+				operands.push_back(convertImplicit(value, helper.parameterTypes[first + i]));
+				continue;
+			}
+
 			if (parameter.isMutableReference()) {
 				operands.push_back(referenceArgument(*call.arguments[i], parameter, definition.name, i + 1, copyOuts));
 				// An enum-typed parameter is an exact match for an enum argument, which beats the
@@ -6600,6 +6631,93 @@ namespace {
 		_builder.emit(spirv::OpStore, { temporary, loadFrom(address, type) });
 		copyOuts.emplace_back(address, temporary);
 		return temporary;
+	}
+
+	// Whether a name, an element or a member lives in the constant address space: a constant buffer, a
+	// file-scope constant, or a constant reference parameter of the function being emitted.
+	bool Emitter::inConstantSpace(const Expression& place) const {
+		const Expression& root = storeRoot(place);
+		if (root.kind != ExpressionKind::Identifier) {
+			return false;
+		}
+		const auto binding = _bindings.find(root.name);
+		if (binding != _bindings.end()) {
+			return binding->second.pointeeMsl.addressSpace == AddressSpace::Constant;
+		}
+		return _constants.count(root.name) > 0;
+	}
+
+	// A place whose value is a whole vector: a vector variable, an element of a buffer or an array of
+	// vectors, or a vector member.
+	bool Emitter::isVectorPlace(const Expression& place) {
+		const auto vector = [](const Type& type) { return type.vectorWidth > 1 && !type.isMatrix(); };
+		switch (place.kind) {
+			case ExpressionKind::Identifier: {
+				const auto binding = _bindings.find(place.name);
+				return binding != _bindings.end() && !binding->second.isBuffer
+					&& !binding->second.pointeeMsl.arrayLength && vector(binding->second.pointeeMsl);
+			}
+			case ExpressionKind::Index: {
+				if (place.left->kind != ExpressionKind::Identifier) {
+					return false;
+				}
+				const auto binding = _bindings.find(place.left->name);
+				return binding != _bindings.end() && vector(binding->second.pointeeMsl)
+					&& (binding->second.isBuffer || (binding->second.pointeeMsl.arrayLength
+						&& binding->second.pointeeMsl.arrayRank() == 1));
+			}
+			case ExpressionKind::Member: {
+				const StructDecl* decl = structOf(*place.left);
+				if (!decl) {
+					return false;
+				}
+				std::string name;
+				const size_t field = fieldIndexOf(*decl, place.memberName, name);
+				return field != decl->fields.size() && !decl->fields[field].type.arrayLength
+					&& vector(decl->fields[field].type);
+			}
+			default: return false;
+		}
+	}
+
+	// A component of a vector (v.x, v[1]), which no reference binds (Apple refuses it too).
+	bool Emitter::isVectorComponent(const Expression& place) {
+		if (place.kind == ExpressionKind::Member) {
+			return !structOf(*place.left);
+		}
+		return place.kind == ExpressionKind::Index && isVectorPlace(*place.left);
+	}
+
+	// A reference into constant memory is passed as the value it names: the memory cannot change under
+	// the callee. Its argument has to be a place of that space and of exactly the parameter's type.
+	Id Emitter::constantReferenceArgument(const Expression& argument, const Parameter& parameter,
+		const std::string& function, size_t position, Id prepared) {
+		const std::string what = "argument " + std::to_string(position) + " of the call to \"" + function + "\"";
+		const std::string reason = ", and parameter \"" + parameter.name + "\" is a reference to constant memory";
+		if (argument.kind != ExpressionKind::Identifier && argument.kind != ExpressionKind::Index
+			&& argument.kind != ExpressionKind::Member) {
+			throw CompileError(what + " has to be a variable, an element or a member of constant memory" + reason);
+		}
+		if (isVectorComponent(argument)) {
+			throw CompileError(what + " is a component of a vector, which a reference parameter cannot name" + reason);
+		}
+		if (!inConstantSpace(argument)) {
+			throw CompileError(what + " is not in the constant address space" + reason
+				+ "; Apple does not bind it to a value of another address space");
+		}
+		const auto tag = enumOf(argument);
+		if (!parameter.type.enumName.empty()) {
+			requireEnumValue(parameter.type.enumName, argument, what);
+		}
+		const Id value = prepared != InvalidId ? prepared : emitExpression(argument);
+		// A struct read out of a buffer has the buffer's layout, which the by-value conversion maps.
+		const bool structValue = !parameter.type.namedType.empty() && !parameter.type.isPointer;
+		if ((!structValue && _builder.typeOf(value) != declaredTypeOf(parameter.type))
+			|| (tag && *tag != parameter.type.enumName)) {
+			throw CompileError(what + " is not the type of parameter \"" + parameter.name + "\", "
+				+ typeName(parameter.type) + "; a conversion would make a temporary in another address space");
+		}
+		return value;
 	}
 
 	// A parameter is a value the body may assign to, as in C++, and the caller's

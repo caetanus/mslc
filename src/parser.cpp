@@ -3407,7 +3407,14 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 		}
 		// A reference to a thread variable may spell its space out; any other
 		// parameter has none to name.
-		if (param.type.addressSpace != AddressSpace::None
+		// A reference into constant memory cannot change what it names, so it is const whether or not
+		// the source says so; the emitter passes it by value and checks the argument is in that space.
+		const bool constantReference = param.isReference && param.type.addressSpace == AddressSpace::Constant
+			&& !param.type.isAtomic;
+		if (constantReference) {
+			param.type.isConst = true;
+		}
+		if (param.type.addressSpace != AddressSpace::None && !constantReference
 			&& !((param.isReference || threadPointer) && param.type.addressSpace == AddressSpace::Thread)) {
 			throw CompileError(what + "is in the " + addressSpaceName(param.type.addressSpace)
 				+ " address space, which a helper function does not take yet");
