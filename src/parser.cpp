@@ -3543,6 +3543,68 @@ void Parser::recordConstant(const VariableDeclaration& declaration, bool local) 
 	}
 }
 
+// A local or a parameter keeps its type for sizeof once the declarator is complete. An auto, a
+// resource or an array with no length yet is left out, so a sizeof of it is not folded here.
+void Parser::recordObjectType(const std::string& name, const Type& type) {
+	if (name.empty() || type.isAuto || type.resource != ResourceKind::None
+		|| (type.arrayLength && *type.arrayLength == 0) || _blocks.empty()) {
+		return;
+	}
+	_blocks.back().objectTypes[name] = type;
+}
+
+// The declared type of a name or of an element of one, as the innermost declaration that the name
+// finds says. Nothing else is typed here (a member, a call, a vector component), and a name whose
+// innermost declaration has no recorded type is not looked up further out, which would size a
+// variable that hides it wrongly.
+std::optional<Type> Parser::declaredObjectType(const Expression& operand) const {
+	if (operand.kind == ExpressionKind::Index) {
+		std::optional<Type> base = declaredObjectType(*operand.left);
+		if (!base || (base->isPointer && base->arrayLength)) {
+			return std::nullopt;
+		}
+		if (base->arrayLength) {
+			base->dropOuterDimension();
+		} else if (base->isPointer) {
+			// A decayed "float m[2][3]" points at arrays of 3, whose lengths stay in the type.
+			base->isPointer = false;
+			base->dropOuterDimension();
+		} else {
+			return std::nullopt;
+		}
+		return base;
+	}
+	if (operand.kind != ExpressionKind::Identifier || operand.templateDependent) {
+		return std::nullopt;
+	}
+	if (_structBody) {
+		for (const StructField& field: _structBody->fields) {
+			if (field.name == operand.name) {
+				return std::nullopt;
+			}
+		}
+	}
+	if (!operand.fileScope) {
+		for (auto scope = _blocks.rbegin(); scope != _blocks.rend(); ++scope) {
+			if (!scope->names.count(operand.name)) {
+				continue;
+			}
+			const auto type = scope->objectTypes.find(operand.name);
+			return type == scope->objectTypes.end() ? std::nullopt : std::optional<Type>(type->second);
+		}
+	}
+	for (const VariableDeclaration& global: _unit.globals) {
+		if (global.name == operand.name) {
+			const Type& type = global.type;
+			if (type.isAuto || type.resource != ResourceKind::None || (type.arrayLength && *type.arrayLength == 0)) {
+				return std::nullopt;
+			}
+			return type;
+		}
+	}
+	return std::nullopt;
+}
+
 // Whether a constant expression has a long or ulong in it, which makes its
 // type one. A shift has the type of its left operand alone.
 static bool isSixtyFourBit(const Expression& expression) {
@@ -4104,6 +4166,7 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 		if (at(TokenKind::LBracket)) {
 			throw CompileError(what + "has an attribute, which only an entry point's parameter can have");
 		}
+		recordObjectType(param.name, param.type);
 		return param;
 	}
 
@@ -4118,7 +4181,8 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 	// "float values[4]" is an array suffix, "[[buffer(0)]]" is an attribute
 	// list, and both start with a bracket, so the second one has to be
 	// checked before the first is consumed.
-	if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
+	const bool arraySuffix = at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket;
+	if (arraySuffix) {
 		advance();
 		expect(TokenKind::RBracket, "to close an array parameter");
 	}
@@ -4127,6 +4191,9 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 		param.attributes = parseParameterAttributes();
 	}
 
+	if (!arraySuffix) {
+		recordObjectType(param.name, param.type);
+	}
 	return param;
 }
 
@@ -4773,6 +4840,7 @@ StatementPtr Parser::parseStatement() {
 					throw CompileError("the reference \"" + declaration.name + "\" needs an initialiser");
 				}
 				declaration.initializer = parseAssignment();
+				recordObjectType(declaration.name, declaration.type);
 				statement->declaration = std::move(declaration);
 				expect(TokenKind::Semicolon, "after a reference declaration");
 				return statement;
@@ -4789,6 +4857,7 @@ StatementPtr Parser::parseStatement() {
 				deduceArrayLength(declaration);
 			}
 			recordConstant(declaration, true);
+			recordObjectType(declaration.name, declaration.type);
 
 			// "T a, b = 1, c;" declares each name from the type before the first
 			// declarator's stars and brackets, which bind to that name alone.
@@ -4845,6 +4914,7 @@ VariableDeclaration Parser::parseNextLocalDeclarator(const Type& base) {
 		deduceArrayLength(another);
 	}
 	recordConstant(another, true);
+	recordObjectType(another.name, another.type);
 	return another;
 }
 
@@ -5168,6 +5238,7 @@ StatementPtr Parser::parseForStatement() {
 			} else if (at(TokenKind::LBrace)) {
 				declaration.initializer = parseInitializerList();
 			}
+			recordObjectType(declaration.name, declaration.type);
 			statement->forInitializer = std::move(declaration);
 
 			// "for (int i = 0, j = 1; ...)" : the further declarators are declared
@@ -5685,6 +5756,15 @@ ExpressionPtr Parser::parseSizeof() {
 	expression->line = startLine;
 	const NestingScope scope(*this);
 	expression->left = parseUnary();
+	// A declared name is sized here, where the scope that decides which declaration it finds is open.
+	if (const std::optional<Type> declared = declaredObjectType(*expression->left)) {
+		expression->kind = ExpressionKind::IntLiteral;
+		expression->intKind = ScalarKind::ULong;
+		expression->isSizeof = true;
+		expression->intValue = sizeofType(*declared, _unit);
+		expression->left.reset();
+		return expression;
+	}
 	measure(*expression);
 	return expression;
 }
