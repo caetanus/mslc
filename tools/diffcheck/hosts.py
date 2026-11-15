@@ -1,0 +1,136 @@
+"""Building and running the two hosts, and compiling the Apple side.
+
+Both hosts read a text manifest and exchange raw buffer files, so everything that needs
+judgement (types, inputs, comparison) stays in Python, in one place.
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+import hostenv
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TIMEOUT = 120
+
+
+class Unavailable(Exception):
+    """A host cannot run here (no Metal device, no lavapipe). Not a finding."""
+
+
+class HostError(Exception):
+    """A host failed for a reason that is not a result (bad manifest, Vulkan error)."""
+
+
+def _built(source, name, compile_cmd):
+    digest = hashlib.sha256(open(source, "rb").read()).hexdigest()[:12]
+    out_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "diffcheck-hosts")
+    os.makedirs(out_dir, exist_ok=True)
+    binary = os.path.join(out_dir, "%s-%s" % (name, digest))
+    if not os.path.exists(binary):
+        subprocess.run(compile_cmd(binary), check=True)
+    return binary
+
+
+def vkhost(explicit=None):
+    if explicit:
+        return explicit
+    include = next((p for p in ("/opt/homebrew/include", "/usr/local/include", "/usr/include")
+                    if os.path.exists(os.path.join(p, "vulkan/vulkan.h"))), None)
+    lib = next((p for p in ("/opt/homebrew/lib", "/usr/local/lib", "/usr/lib", "/usr/lib/x86_64-linux-gnu",
+                            "/usr/lib/aarch64-linux-gnu") if any(f.startswith("libvulkan.") for f in _ls(p))), None)
+    if include is None or lib is None:
+        raise Unavailable("no Vulkan headers or loader")
+    source = os.path.join(HERE, "vkhost.c")
+    return _built(source, "vkhost", lambda out: [
+        "cc", "-O1", "-I" + include, source, "-L" + lib, "-lvulkan", "-Wl,-rpath," + lib, "-o", out])
+
+
+def metalhost(explicit=None):
+    if explicit:
+        return explicit
+    if sys.platform != "darwin":
+        raise Unavailable("Metal needs macOS")
+    source = os.path.join(HERE, "metalhost.mm")
+    return _built(source, "metalhost", lambda out: [
+        "clang++", "-std=c++17", "-fobjc-arc", source, "-framework", "Metal", "-framework", "Foundation", "-o", out])
+
+
+def _ls(path):
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
+def _run(cmd, env=None):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        raise HostError("%s timed out after %ds (GPU hang?)" % (os.path.basename(cmd[0]), TIMEOUT))
+
+
+def run_metal(binary, manifest_path):
+    r = _run([binary, manifest_path])
+    if r.returncode != 0:
+        if "no Metal device" in r.stderr:
+            raise Unavailable("no Metal device")
+        if "Apple compile failed" in r.stderr or "pipeline failed" in r.stderr:
+            raise HostError("apple: " + r.stderr.strip().splitlines()[0])
+        raise HostError(r.stderr.strip() or "metalhost exit %d" % r.returncode)
+    return r.stdout
+
+
+def run_vulkan(binary, manifest_path):
+    env = hostenv.vulkan_env()
+    if env is None:
+        raise Unavailable("no lavapipe ICD")
+    r = _run([binary, manifest_path], env=env)
+    if r.returncode != 0:
+        if "no Vulkan device" in r.stderr:
+            raise Unavailable("no Vulkan device")
+        raise HostError("vkhost: " + (r.stderr.strip() or "exit %d" % r.returncode))
+    if "llvmpipe" not in r.stdout:
+        raise HostError("vkhost ran on %r, not lavapipe" % r.stdout.strip())
+    return r.stdout
+
+
+def apple_source_lines(source, work, includes, std, in_memory=False):
+    """Manifest lines that make the Apple side compile `source`.
+
+    By default `xcrun metal -fmetal-math-mode=safe -ffp-contract=off`: Metal contracts
+    a * b + c into one fma even in safe math mode (newLibraryWithSource offers no way to
+    stop it), mslc emits the multiply and the add separately, and the two differ in the
+    last bits or more under cancellation. That is a permitted difference, not a miscompile,
+    so the reference disables it. A quoted #include also needs this route, since an
+    in-memory source cannot resolve it. `in_memory` (--apple-source) uses
+    newLibraryWithSource with MTLMathModeSafe, which is what an app gets, contraction included.
+    """
+    text = open(source, encoding="utf-8", errors="replace").read()
+    quoted_include = re.search(r'^\s*#\s*include\s*"', text, re.M)
+    if in_memory and not quoted_include:
+        lines = ["source " + source]
+        return lines + (["std " + std] if std else [])
+    air, lib = os.path.join(work, "apple.air"), os.path.join(work, "apple.metallib")
+    cmd = ["xcrun", "metal", "-c", "-fmetal-math-mode=safe", "-ffp-contract=off", "-o", air, source]
+    cmd += ["-I" + i for i in includes] + (["-std=metal" + std] if std else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
+        if r.returncode == 0:
+            r = subprocess.run(["xcrun", "metallib", air, "-o", lib], capture_output=True, text=True, timeout=TIMEOUT)
+    except FileNotFoundError:
+        raise Unavailable("xcrun metal not found (use --apple-source for newLibraryWithSource)")
+    if r.returncode != 0:
+        raise HostError("apple: " + (r.stderr.strip().splitlines() or ["xcrun metal failed"])[0])
+    return ["metallib " + lib]
+
+
+def apple_reflection(binary, source_lines, entry, work):
+    out = os.path.join(work, "apple-reflection.json")
+    path = os.path.join(work, "apple-reflect.txt")
+    open(path, "w").write("\n".join(["mode reflect"] + source_lines + ["entry " + entry, "reflection " + out]) + "\n")
+    run_metal(binary, path)
+    return json.load(open(out))

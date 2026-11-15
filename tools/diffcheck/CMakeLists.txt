@@ -30,6 +30,9 @@ if(APPLE)
 		$<TARGET_FILE:diffcheck-metalhost> ${DIFFCHECK_TESTS}/diffcheck/fma_kernel.metal
 		${DIFFCHECK_TESTS}/diffcheck/struct_kernel.metal)
 	set_tests_properties(diffcheck/metalhost PROPERTIES SKIP_RETURN_CODE 77)
+	add_test(NAME diffcheck/hosts COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_hosts_test.py
+		$<TARGET_FILE:diffcheck-metalhost>)
+	set_tests_properties(diffcheck/hosts PROPERTIES SKIP_RETURN_CODE 77)
 else()
 	message(STATUS "diffcheck: not macOS, the Metal host is not built")
 endif()
