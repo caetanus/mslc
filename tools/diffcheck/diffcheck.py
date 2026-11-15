@@ -137,7 +137,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         # must differ from Apple's, or the comparison above could not have told a miscompile from
         # a match. Excluded buffers are not candidates: perturbing one would test nothing.
         compared = {i: l for i, l in layouts.items() if l["name"] not in excluded}
-        control = checks.perturb(compared, outs["mslc"])
+        control = checks.perturb(compared, outs["mslc"], outs["apple"])
         control_ok = False
         if control is not None:
             copy, name, _ = control

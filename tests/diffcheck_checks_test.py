@@ -23,6 +23,16 @@ class Perturb(unittest.TestCase):
             self.assertEqual((name, offset), ("o", 0))
             self.assertTrue(compare.compare({"name": "o", "stride": 4, "leaves": LEAF}, bytearray(raw), copy[0], 0), pattern)
 
+    def test_the_perturbed_value_is_not_apples_either(self):
+        # mslc has +inf where Apple has a NaN: flipping inf's low bit would make a NaN and
+        # the control would pass by accident.
+        inf, nan = bytes.fromhex("0000807f") * 4, bytes.fromhex("0000c07f") * 4
+        copy, _, _ = checks.perturb({0: LAYOUT}, {0: bytearray(inf)}, {0: bytearray(nan)})
+        self.assertTrue(compare.compare({"name": "o", "stride": 4, "leaves": LEAF}, bytearray(nan), copy[0], 0))
+        one = bytes.fromhex("0000803f") * 4
+        copy, _, _ = checks.perturb({0: LAYOUT}, {0: bytearray(nan)}, {0: bytearray(one)})
+        self.assertTrue(compare.compare({"name": "o", "stride": 4, "leaves": LEAF}, bytearray(one), copy[0], 0))
+
     def test_integer_and_bool_leaves(self):
         for scalar in ("uint", "bool", "half"):
             layout = {"name": "o", "access": "write", "stride": 4, "leaves": [{"off": 0, "scalar": scalar}]}
