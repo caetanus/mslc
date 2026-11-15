@@ -8,6 +8,7 @@ set(DIFFCHECK_TESTS ${CMAKE_SOURCE_DIR}/tests)
 
 add_test(NAME diffcheck/compare COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_compare_test.py)
 add_test(NAME diffcheck/inputs COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_inputs_test.py)
+add_test(NAME diffcheck/checks COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_checks_test.py)
 
 if(DIFFCHECK_VULKAN_LIB AND DIFFCHECK_VULKAN_INCLUDE)
 	add_executable(diffcheck-vkhost ${DIFFCHECK_SRC}/vkhost.c)
