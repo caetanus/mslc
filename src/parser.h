@@ -102,6 +102,9 @@ class Parser {
 		std::map<std::string, std::string> names;
 		std::map<std::string, std::string> aliases;
 		std::map<std::string, ConstantInt> constants;
+		// The declared type of each object whose type is final and sizeof can use; a name this block
+		// declares without an entry here is one whose type is not known (auto, a resource).
+		std::map<std::string, Type> objectTypes;
 		std::vector<std::string> directives;
 		// Set on the outermost block of a function body or a for body, whose names share a C++
 		// scope with the enclosing parameters or init declaration.
@@ -355,6 +358,8 @@ private:
 	// Remembers a const or constexpr integer declaration whose initialiser folds; local is the
 	// current block's, otherwise the file's.
 	void recordConstant(const VariableDeclaration& declaration, bool local);
+	void recordObjectType(const std::string& name, const Type& type);
+	std::optional<Type> declaredObjectType(const Expression& operand) const;
 	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	// A file-scope function that is not an entry point. False, with the position
