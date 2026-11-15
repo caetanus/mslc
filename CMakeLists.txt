@@ -367,3 +367,11 @@ add_test(NAME library/empty COMMAND ${CMAKE_COMMAND}
 	-DSPIRV_DIS=${SPIRV_DIS}
 	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/library
 	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_library.cmake)
+
+# Differential harness: runs a kernel on the Apple GPU and mslc's SPIR-V on lavapipe
+# and compares the outputs. Opt-in, and not part of the default test run: it needs
+# Metal and a Vulkan loader with lavapipe, which a plain build does not.
+option(MSLC_DIFFCHECK "Build tools/diffcheck and register its self-tests" OFF)
+if(MSLC_DIFFCHECK)
+	add_subdirectory(tools/diffcheck)
+endif()
