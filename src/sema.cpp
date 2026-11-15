@@ -2517,7 +2517,8 @@ namespace {
 		Id emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
 			const std::string& spelled);
 		Id emitInitListValue(const Type& target, const Expression& list);
-		Id emitListScalarValue(const Type& target, const Expression& expression);
+		Id emitListScalarValue(const Type& target, const Expression& expression, bool dropExcess = false);
+		void checkAndDiscard(const Expression& expression);
 		Id convertListScalar(Id value, const Type& target, const Expression& expression);
 		bool canFoldExpression(const Expression& expression, const std::string& excluded = {});
 		const StructDecl* structOf(const Expression& expression);
@@ -4084,18 +4085,41 @@ namespace {
 		return convertImplicit(value, _types.scalar(to));
 	}
 
-	Id Emitter::emitListScalarValue(const Type& target, const Expression& expression) {
+	// Apple type-checks an ignored initializer element but never evaluates it, so
+	// it is emitted for its diagnostics and the instructions are lifted out again.
+	void Emitter::checkAndDiscard(const Expression& expression) {
+		if (expression.kind == ExpressionKind::InitList) {
+			for (const InitializerElement& element: expression.elements) { checkAndDiscard(*element.value); }
+			return;
+		}
+		const size_t mark = _builder.functionsMark();
+		const Id block = _currentBlock;
+		const bool terminated = _terminated;
+		const uint32_t depth = _controlDepth;
+		const size_t targets = _jumpTargets.size();
+		emitExpression(expression);
+		_builder.takeFunctionsFrom(mark);
+		// A short-circuit or ?: inside the element moved these to a label that the lift removed.
+		_currentBlock = block;
+		_terminated = terminated;
+		_controlDepth = depth;
+		_jumpTargets.resize(targets);
+	}
+
+	Id Emitter::emitListScalarValue(const Type& target, const Expression& expression, bool dropExcess) {
 		if (expression.kind != ExpressionKind::InitList) {
 			return convertListScalar(emitExpression(expression), target, expression);
 		}
 		if (expression.elements.empty()) { return _types.zero(declaredTypeOf(target)); }
-		if (expression.elements.size() != 1) {
+		if (expression.elements.size() != 1 && !dropExcess) {
 			throw CompileError("nested scalar initialization with excess elements is not lowered yet");
 		}
 		if (!expression.elements.front().fieldName.empty()) {
 			throw CompileError("a field designator requires a struct initializer");
 		}
-		return emitListScalarValue(target, *expression.elements.front().value);
+		Id first = emitListScalarValue(target, *expression.elements.front().value, dropExcess);
+		for (size_t i = 1; i < expression.elements.size(); ++i) { checkAndDiscard(*expression.elements[i].value); }
+		return first;
 	}
 
 	Id Emitter::emitInitListValue(const Type& target, const Expression& list) {
@@ -4208,7 +4232,7 @@ namespace {
 		component.enumName = target.enumName;
 		if (target.isScalar()) {
 			if (list.elements.size() != 1) { throw CompileError("excess elements in a scalar initializer list"); }
-			return emitListScalarValue(component, *list.elements.front().value);
+			return emitListScalarValue(component, *list.elements.front().value, true);
 		}
 		std::vector<uint32_t> pieces;
 		uint32_t width = 0;

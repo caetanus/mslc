@@ -109,3 +109,22 @@ undefined-behaviour rules to host- and pass-dependent values (`(Mode)9e18f` is
 -1, `(Mode)-2.7f` is 0), not a language rule mslc could match. Truncations that
 fit (`1.5f`, `-0.5f`, `1e-40f`) fold as Apple does. Pinned by the
 `file_scope_constant_enum_cast_float_*` probes.
+
+## An ignored nested scalar initializer element is emitted, then discarded (open)
+
+**Status:** open, found 2026-11-15 while fixing #164. Nothing regressed: master
+rejected every excess form.
+
+`float x{{a, b}}` keeps `a` and Apple never evaluates `b`, but it does type-check
+it. mslc type-checks it by emitting it and lifting the instructions out, so:
+
+- An element mslc cannot lower as a value is rejected where Apple accepts it:
+  `i++`/`i--`, `i += 1`, an assignment such as `out[1] = 5.0f` ("cannot be used
+  as a value"), a void call `g()`, a bare buffer name `in`, `discard_fragment()`.
+  `int x{{in[1], i++}}` leaves `i` unchanged in Apple. Pinned by
+  `tests/probes/brace_local_scalar_nested_excess_increment_not_lowered.metal`.
+- The lift leaves unused OpConstant and OpType declarations, a GLSL.std450
+  import, and one unused OpVariable in the call case. A half operation in an
+  ignored element adds OpCapability Float16 to a module that does not otherwise
+  need it. A helper called only from an ignored element is still emitted as an
+  uncalled OpFunction.
