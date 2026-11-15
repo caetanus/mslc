@@ -11,6 +11,7 @@ See tools/diffcheck/README.md.
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import random
@@ -60,7 +61,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
 
     std = params.get("std")
     try:
-        lines = hosts.apple_source_lines(source, work, includes, std, opts.apple_source)
+        lines = hosts.apple_source_lines(source, work, includes, std, opts.apple_contract)
         apple = hosts.apple_reflection(opts.metal, lines, entry, work)
     except hosts.HostError as e:
         result.update(status="skipped", reason=str(e))
@@ -208,16 +209,17 @@ def corpus_files(listing, root):
     return files
 
 
+def check_one(opts, path, std):
+    try:
+        return [dict(r, file=path) for r in check_file(opts, path, std)]
+    except (hosts.HostError, subprocess.TimeoutExpired, OSError, ValueError) as e:
+        return [{"file": path, "entry": "*", "status": "error", "reason": str(e), "cases": []}]
+
+
 def run_files(opts, files):
     """Check every file; a harness failure on one file is that file's result, not the run's."""
-    results = []
-    for path, std in files:
-        try:
-            for r in check_file(opts, path, std):
-                results.append(dict(r, file=path))
-        except (hosts.HostError, subprocess.TimeoutExpired, OSError, ValueError) as e:
-            results.append({"file": path, "entry": "*", "status": "error", "reason": str(e), "cases": []})
-    return results
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(opts.jobs, 1)) as pool:
+        return [r for rs in pool.map(lambda f: check_one(opts, *f), files) for r in rs]
 
 
 def summary(results):
@@ -243,12 +245,14 @@ def parser():
     p.add_argument("--sentinel", action="store_true", help="add a case whose buffers are all 0x7f bytes")
     p.add_argument("--poison-padding", action="store_true", help="fill struct padding with 0xA5")
     p.add_argument("--std", help="Metal language version for Apple's compiler (2.4, 3.0, 3.1, 3.2)")
-    p.add_argument("--apple-source", action="store_true",
-                   help="compile with newLibraryWithSource (fp contraction on) instead of xcrun metal -ffp-contract=off")
+    p.add_argument("--apple-contract", action="store_true",
+                   help="let Apple's compiler fuse a * b + c into an fma, as an app's build does (default: off, "
+                        "because mslc emits a separate multiply and add)")
     p.add_argument("-I", dest="includes", action="append", default=[])
     p.add_argument("--mslc", default=os.environ.get("MSLC", "mslc"))
     p.add_argument("--metalhost", default=os.environ.get("DIFFCHECK_METALHOST"))
     p.add_argument("--vkhost", default=os.environ.get("DIFFCHECK_VKHOST"))
+    p.add_argument("--jobs", type=int, default=1, help="files checked in parallel in --corpus mode")
     p.add_argument("--report", help="write the JSON report here")
     p.add_argument("--keep", action="store_true", help="keep the scratch directory")
     p.add_argument("--corrupt-mslc", metavar="BUFFER:BYTE",

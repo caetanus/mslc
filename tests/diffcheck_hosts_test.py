@@ -39,28 +39,33 @@ with tempfile.TemporaryDirectory() as work:
     open(src, "w").write(KERNEL)
     try:
         lines = hosts.apple_source_lines(src, work, [], None)
-        assert lines[0].startswith("metallib "), lines
+        assert lines == ["source " + src, "contract off"], lines
         # The default reference does not contract a * b + c, so it matches mslc's separate multiply and add.
         got = apple_result(work, lines)
     except hosts.Unavailable as e:
         print("SKIPPED: %s" % e)
         sys.exit(77)
     assert got == 0.0, got
-    assert hosts.apple_source_lines(src, work, [], None, in_memory=True) == ["source " + src]
-    assert hosts.apple_source_lines(src, work, [], "3.1", in_memory=True)[1:] == ["std 3.1"]
+    # Why the default exists: with contraction left on, Apple fuses it (the result is 2^-24).
+    on = apple_result(work, hosts.apple_source_lines(src, work, [], None, contract=True))
+    assert on != 0.0, "Apple no longer contracts in safe math mode: the contract knob can go"
+    assert hosts.apple_source_lines(src, work, [], "3.1", contract=True) == [
+        "source " + src, "contract on", "std 3.1"]
 
-    # A quoted #include cannot be resolved by an in-memory source, so it takes the xcrun route.
+    # A quoted #include cannot be resolved by an in-memory source, so it takes the xcrun route,
+    # which must not contract either.
     inc = os.path.join(work, "inc")
     os.makedirs(inc)
-    open(os.path.join(inc, "h.h"), "w").write("constant float kOne = 1.0f;\n")
-    open(src, "w").write('#include <metal_stdlib>\nusing namespace metal;\n#include "h.h"\n'
-                         "kernel void k(device float* o [[buffer(0)]]) { o[0] = kOne; }\n")
-    assert hosts.apple_source_lines(src, work, [inc], None, in_memory=True)[0].startswith("metallib ")
+    open(os.path.join(inc, "h.h"), "w").write(KERNEL.split("using namespace metal;\n")[1])
+    open(src, "w").write('#include <metal_stdlib>\nusing namespace metal;\n#include "h.h"\n')
+    lines = hosts.apple_source_lines(src, work, [inc], None)
+    assert lines[0].startswith("metallib "), lines
+    assert apple_result(work, lines) == 0.0
 
     # Apple rejecting the source is a HostError carrying Apple's message.
     open(src, "w").write("kernel void k() { nope; }\n")
     try:
-        hosts.apple_source_lines(src, work, [], None)
+        hosts.apple_reflection(metalhost, hosts.apple_source_lines(src, work, [], None), "k", work)
     except hosts.HostError as e:
         assert str(e).startswith("apple: "), e
     else:

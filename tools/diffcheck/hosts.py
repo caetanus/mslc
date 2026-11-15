@@ -98,31 +98,28 @@ def run_vulkan(binary, manifest_path):
     return r.stdout
 
 
-def apple_source_lines(source, work, includes, std, in_memory=False):
+def apple_source_lines(source, work, includes, std, contract=False):
     """Manifest lines that make the Apple side compile `source`.
 
-    By default `xcrun metal -fmetal-math-mode=safe -ffp-contract=off`: Metal contracts
-    a * b + c into one fma even in safe math mode (newLibraryWithSource offers no way to
-    stop it), mslc emits the multiply and the add separately, and the two differ in the
-    last bits or more under cancellation. That is a permitted difference, not a miscompile,
-    so the reference disables it. A quoted #include also needs this route, since an
-    in-memory source cannot resolve it. `in_memory` (--apple-source) uses
-    newLibraryWithSource with MTLMathModeSafe, which is what an app gets, contraction included.
+    newLibraryWithSource with MTLMathModeSafe, the way an app compiles, with fp contraction
+    off: Metal contracts a * b + c into one fma even in safe math mode, mslc emits a
+    separate multiply and add, and the two differ by a ULP or more under cancellation,
+    which is a permitted difference and not a miscompile. `contract` keeps it on.
+    A quoted #include cannot be resolved from an in-memory source, so such a file is built
+    with `xcrun metal` (same compiler, same flags) into a metallib instead.
     """
     text = open(source, encoding="utf-8", errors="replace").read()
-    quoted_include = re.search(r'^\s*#\s*include\s*"', text, re.M)
-    if in_memory and not quoted_include:
-        lines = ["source " + source]
-        return lines + (["std " + std] if std else [])
+    if not re.search(r'^\s*#\s*include\s*"', text, re.M):
+        return ["source " + source, "contract " + ("on" if contract else "off")] + (["std " + std] if std else [])
     air, lib = os.path.join(work, "apple.air"), os.path.join(work, "apple.metallib")
-    cmd = ["xcrun", "metal", "-c", "-fmetal-math-mode=safe", "-ffp-contract=off", "-o", air, source]
-    cmd += ["-I" + i for i in includes] + (["-std=metal" + std] if std else [])
+    cmd = ["xcrun", "metal", "-c", "-fmetal-math-mode=safe", "-ffp-contract=" + ("on" if contract else "off"),
+           "-o", air, source] + ["-I" + i for i in includes] + (["-std=metal" + std] if std else [])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
         if r.returncode == 0:
             r = subprocess.run(["xcrun", "metallib", air, "-o", lib], capture_output=True, text=True, timeout=TIMEOUT)
     except FileNotFoundError:
-        raise Unavailable("xcrun metal not found (use --apple-source for newLibraryWithSource)")
+        raise Unavailable("xcrun metal not found (needed for a quoted #include)")
     if r.returncode != 0:
         raise HostError("apple: " + (r.stderr.strip().splitlines() or ["xcrun metal failed"])[0])
     return ["metallib " + lib]

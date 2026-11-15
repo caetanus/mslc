@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory() as d:
     open(os.path.join(d, "missing.metal"), "w").write("kernel void k() { nope(); }\n")
     report = os.path.join(d, "r.json")
     base = [sys.executable, DRIVER, "--corpus", listing, "--mslc", mslc, "--metalhost", metalhost,
-            "--vkhost", vkhost, "--report", report]
+            "--vkhost", vkhost, "--report", report, "--jobs", "3"]
     r = subprocess.run(base, capture_output=True, text=True)
     assert r.returncode == 0, r
     assert "5 kernels: 3 compared, 3 matched, 2 skipped" in r.stdout, r.stdout

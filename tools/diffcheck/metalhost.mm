@@ -4,9 +4,13 @@
 // Manifest, one directive per line (same shape as vkhost's):
 //   mode reflect|run          source <file.metal> | metallib <file>     entry <name>
 //   std <2.4|3.0|3.1|3.2>     local X Y Z       groups X Y Z       reflection <out.json>
+//   contract on|off           (source mode; default off, see below)
 //   buffer <metal index> <bytes> <input file> <output file>          (run mode)
 // The source is compiled with newLibraryWithSource and MTLMathModeSafe, the way Blender
-// and Darling's callers do; a metallib (built by `xcrun metal`) is for sources that
+// and Darling's callers do, plus `#pragma clang fp contract(off)`: Metal contracts
+// a * b + c into an fma even in safe math mode, mslc emits a separate multiply and
+// add, and the two differ by a ULP or more, which is a permitted difference and not a
+// miscompile (`contract on` keeps the app's behaviour). A metallib (built by `xcrun metal`) is for sources that
 // #include a local header, which an in-memory source cannot resolve.
 //
 // The reflection lists, per buffer: index, name, access, whether it is a pointer, the
@@ -99,6 +103,7 @@ int main(int argc, char **argv) {
             MTLCompileOptions *opts = [MTLCompileOptions new];
             opts.mathMode = MTLMathModeSafe;
             NSString *std = m[@"std"][0];
+            if (m[@"contract"] && ![m[@"contract"][0] isEqual:@"on"] && ![m[@"contract"][0] isEqual:@"off"]) die(@"contract is on or off");
             if (std) {
                 if ([std isEqual:@"2.4"]) opts.languageVersion = MTLLanguageVersion2_4;
                 else if ([std isEqual:@"3.0"]) opts.languageVersion = MTLLanguageVersion3_0;
@@ -106,6 +111,8 @@ int main(int argc, char **argv) {
                 else if ([std isEqual:@"3.2"]) opts.languageVersion = MTLLanguageVersion3_2;
                 else die(@"unknown std");
             }
+            if (![m[@"contract"][0] isEqual:@"on"])
+                src = [@"#pragma clang fp contract(off)\n#line 1\n" stringByAppendingString:src];
             lib = [device newLibraryWithSource:src options:opts error:&err];
         }
         if (!lib) die([@"Apple compile failed: " stringByAppendingString:err.localizedDescription ?: @"?"]);
