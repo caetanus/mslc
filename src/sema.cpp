@@ -2486,6 +2486,7 @@ namespace {
 		ArithmeticConversion usualArithmeticConversion(Id leftType, Id rightType);
 		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
+		Id emitUnaryOperation(UnaryOperator op, Id operand, Id type);
 		void emitReferenceDeclaration(const VariableDeclaration& declaration);
 		void emitLocalArray(const VariableDeclaration& declaration, const Type& type, bool storageOnly);
 		void declareThreadgroupLocal(const VariableDeclaration& declaration, const Type& type, Id typeId);
@@ -2541,6 +2542,7 @@ namespace {
 			const std::vector<Id>& prepared);
 		std::vector<HelperFunction*> helpersNamed(const std::string& name);
 		std::vector<std::string> namesOfCall(const Expression& call);
+		HelperFunction* definedHelper(HelperFunction* entry);
 		// What a call can denote before its arguments are known: every function of every name the
 		// parser found for it (not the ones argument-dependent lookup adds).
 		std::vector<HelperFunction*> helpersCalled(const Expression& call);
@@ -4381,7 +4383,19 @@ namespace {
 				"convert the bool to an int first");
 		}
 
-		switch (expression.unaryOperator) {
+		// The integer promotion: + - ~ on a scalar narrower than int give an int (! gives a bool; a
+		// vector keeps its type, as Apple does), so an overload sees an int however the value is used.
+		const bool promotes = expression.unaryOperator != UnaryOperator::Not && !_types.isFloat(type)
+			&& _types.vectorWidth(type) == 1 && _types.bitWidth(type) < 32;
+		if (promotes) {
+			const Id promoted = promotedTo(1);
+			return emitUnaryOperation(expression.unaryOperator, convert(operand, type, promoted), promoted);
+		}
+		return emitUnaryOperation(expression.unaryOperator, operand, type);
+	}
+
+	Id Emitter::emitUnaryOperation(UnaryOperator op, Id operand, Id type) {
+		switch (op) {
 			case UnaryOperator::Plus: return operand;
 			case UnaryOperator::Negate:
 				return _types.isFloat(type)
@@ -5494,7 +5508,23 @@ namespace {
 		if (set.size() > 1) {
 			return resolveOverload(call, set, prepared);
 		}
-		return set.empty() ? nullptr : set.front();
+		// One function found among several names (argument-dependent lookup found the only one) is
+		// still checked as a chosen one; a name found alone was checked by validateHelpers.
+		return set.empty() ? nullptr : names.size() > 1 ? definedHelper(set.front()) : set.front();
+	}
+
+	// A function a call selects has to have a body here, or be one the unit imports.
+	Emitter::HelperFunction* Emitter::definedHelper(HelperFunction* entry) {
+		if (!entry->definition->body && !_options.linkageObject) {
+			throw CompileError("\"" + entry->definition->name + "(" + parameterSignature(*entry->definition)
+				+ ")\" is declared but never defined");
+		}
+		// The scan for imports does not know the functions argument-dependent lookup adds.
+		if (!entry->definition->body && entry->ids.empty()) {
+			throw CompileError("\"" + entry->definition->name + "\" is declared but defined elsewhere, and "
+				"this call finds it by argument-dependent lookup, which importing does not follow yet");
+		}
+		return entry;
 	}
 
 	// The names a call can denote: the one the parser resolved, the others it found at the same
@@ -5533,7 +5563,8 @@ namespace {
 			}) || _unit.functionTemplates.count(associated);
 			if (visible && std::find(names.begin(), names.end(), associated) == names.end()) {
 				// The library's own overloads compete with it, which mslc does not model here.
-				if (isMSLBuiltinName(last) || findMathBuiltin(last)) {
+				// (A struct argument matches no library overload, so there is nothing to compete with.)
+				if (!decl && (isMSLBuiltinName(last) || findMathBuiltin(last))) {
 					throw CompileError("argument-dependent lookup finds \"" + associated + "\", which competes with the "
 						"standard library's \"" + last + "\"; Apple resolves the two by overload, which mslc "
 						"does not model");
@@ -5607,18 +5638,7 @@ namespace {
 			}
 			return list;
 		};
-		const auto chosen = [&](HelperFunction* entry) {
-			if (!entry->definition->body && !_options.linkageObject) {
-				throw CompileError("\"" + entry->definition->name + "(" + parameterSignature(*entry->definition)
-					+ ")\" is declared but never defined");
-			}
-			// The scan for imports does not know the functions argument-dependent lookup adds.
-			if (!entry->definition->body && entry->ids.empty()) {
-				throw CompileError("\"" + entry->definition->name + "\" is declared but defined elsewhere, and "
-					"this call finds it by argument-dependent lookup, which importing does not follow yet");
-			}
-			return entry;
-		};
+		const auto chosen = [&](HelperFunction* entry) { return definedHelper(entry); };
 		std::vector<HelperFunction*> visible;
 		std::vector<HelperFunction*> candidates;
 		for (HelperFunction* entry: set) {
@@ -5676,23 +5696,14 @@ namespace {
 					+ "\" is not known to be a particular enum, and an overload takes an enum; that is not "
 					"lowered yet");
 			}
-			if (bound && argument.kind == OverloadArgument::Kind::Variable && !isWholeVariable(*argument.expression)) {
+			// (A device or constant lvalue never binds a thread reference: that candidate just drops out.)
+			if (bound && argument.kind == OverloadArgument::Kind::Variable && argument.inThread
+				&& !isWholeVariable(*argument.expression)) {
 				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \"" + name
 					+ "\" is an element or member that a mutable reference could bind, which is not lowered "
 					"when choosing among overloads (a vector component cannot be bound); name a local instead");
 			}
 			argument.value = emitExpression(*argument.expression);
-			// Unary - + ~ on a type narrower than int give an int, which mslc does not widen.
-			const std::optional<ScalarKind> narrow = _types.scalarKindOf(_builder.typeOf(argument.value));
-			if (narrow && argument.expression->kind == ExpressionKind::Unary
-				&& (argument.expression->unaryOperator == UnaryOperator::Negate
-					|| argument.expression->unaryOperator == UnaryOperator::Plus
-					|| argument.expression->unaryOperator == UnaryOperator::BitNot)
-				&& scalarBitWidth(*narrow) < 32 && *narrow != ScalarKind::Half && *narrow != ScalarKind::Bool) {
-				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \"" + name
-					+ "\" applies a unary operator to a type narrower than int, whose result Apple promotes to "
-					"int and mslc does not; that is not lowered when choosing among overloads");
-			}
 			prepared.push_back(argument.value);
 		}
 		// Positions that are not evaluated keep their place, so prepared[i] is argument i.

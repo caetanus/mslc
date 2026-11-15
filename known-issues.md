@@ -181,8 +181,9 @@ for every function, which mslc does not follow.
   named by a function only it reaches is not counted against its entry point.
 - A helper no entry point reaches is not checked for a call to an overloaded name (arity, no
   matching function, declared above); resolution happens where the call is emitted.
-- Beside other overloads, an element or member argument that a mutable reference parameter could
+- Beside other overloads, an element or member of a local that a mutable reference parameter could
   bind is refused unless it is a local name or an element of a local array of scalars (a vector
-  component cannot be bound, and Apple errors on it after choosing the reference).
+  component cannot be bound, and Apple errors on it after choosing the reference). A device or
+  constant lvalue is classified (it never binds a thread reference).
 - An import of an overloaded name is refused, but the plain Linkage name of a function with one
   signature does not tell `f(E)` from `f(int)`: an import of one links to an export of the other.
