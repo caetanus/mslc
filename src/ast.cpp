@@ -232,7 +232,8 @@ bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b) {
 		if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
 			|| x.isPacked != y.isPacked || x.namedType != y.namedType || x.enumName != y.enumName
 			|| x.isAtomic != y.isAtomic
-			|| x.resource != y.resource || x.textureAccess != y.textureAccess) {
+			|| x.resource != y.resource || x.textureAccess != y.textureAccess
+			|| x.isDepth != y.isDepth || x.isMultisampled != y.isMultisampled) {
 			return false;
 		}
 	}

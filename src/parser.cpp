@@ -3767,7 +3767,7 @@ void Parser::parseResourceType(Type& type) {
 	type.resource = isMultisampled ? ms->second.kind : depth != depthTextures.end() ? depth->second : color->second;
 	type.isDepth = isDepth;
 	type.isMultisampled = isMultisampled;
-	if (isMultisampled && access != "sample" && access != "read") {
+	if (isMultisampled && access != "read") {
 		throw CompileError(name + " access::" + access + " is not lowered yet; a multisampled texture is read-only");
 	}
 	if (type.isDepth && (element->second != ScalarKind::Float || access != "sample")) {
@@ -4574,6 +4574,9 @@ void Parser::parseSamplerLocal(VariableDeclaration& declaration) {
 SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 	SamplerState state;
 	std::set<std::string> assigned;
+	// An axis spelled clamp_to_zero (clamp_to_border is the same mode here): Apple refuses it beside a
+	// border color other than transparent black, which indium would apply to it.
+	bool zeroSpelled = false;
 
 	while (!at(closing) && !at(TokenKind::EndOfFile)) {
 		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
@@ -4698,6 +4701,7 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 				[&](const char* attribute) {
 					(attribute[0] == 's' ? state.sAddress : attribute[0] == 't' ? state.tAddress
 						: state.rAddress) = mode;
+					zeroSpelled = zeroSpelled || value == "clamp_to_zero";
 				});
 		} else if (family == "filter" || family == "mag_filter" || family == "min_filter") {
 			const SamplerFilter chosen = filter();
@@ -4748,7 +4752,15 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 
 	expect(closing, "to close a sampler's option list");
 
+	if (zeroSpelled && state.border != SamplerBorder::TransparentBlack) {
+		throw CompileError("invalid values combination in sampler initialization: clamp_to_zero takes no "
+			"border_color other than transparent_black");
+	}
 	if (!state.normalizedCoordinates) {
+		if (state.compare != SamplerCompare::Never) {
+			throw CompileError("invalid values combination in sampler initialization: with coord::pixel the "
+				"compare_func has to be never");
+		}
 		const auto clamps = [](SamplerAddress mode) {
 			return mode == SamplerAddress::ClampToZero || mode == SamplerAddress::ClampToEdge;
 		};

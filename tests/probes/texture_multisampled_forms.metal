@@ -1,6 +1,6 @@
 // EXPECT: valid
-// A multisampled texture is a sampled image with MS=1 (ImageMSArray when arrayed): read takes a coordinate, the array index where there is one, and a sample index (OpImageFetch with the Sample operand), get_num_samples is OpImageQuerySamples, the size queries use OpImageQuerySize.
-// DISASM: OpCapability ImageMSArray
+// A multisampled texture is a sampled image with MS=1 (a sampled one needs no ImageMSArray, which is for storage images): read takes a coordinate, the array index where there is one, and a sample index (OpImageFetch with the Sample operand), get_num_samples is OpImageQuerySamples, the size queries use OpImageQuerySize.
+// DISASM-NOT: OpCapability ImageMSArray
 // DISASM-MATCH: OpTypeImage %float 2D 2 0 1 1 Unknown
 // DISASM-MATCH: OpTypeImage %float 2D 2 1 1 1 Unknown
 // DISASM-MATCH: OpTypeImage %float 2D 1 0 1 1 Unknown
