@@ -4588,19 +4588,59 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 
 		const std::string family(advance().text);
 		static const std::set<std::string> unlowered = {
-			"max_anisotropy", "lod_clamp", "border_color", "reduction",
+			"reduction",
 		};
 		static const std::set<std::string> known = {
 			"coord", "address", "s_address", "t_address", "r_address", "filter",
-			"mag_filter", "min_filter", "mip_filter", "compare_func",
+			"mag_filter", "min_filter", "mip_filter", "compare_func", "max_anisotropy", "lod_clamp", "border_color",
 		};
 		if (unlowered.count(family)) {
 			throw CompileError("the sampler option \"" + family + "\" is not lowered yet; mslc lowers "
 				"coord, address, s_address, t_address, r_address, filter, mag_filter, min_filter, "
-				"mip_filter and compare_func");
+				"mip_filter, compare_func, max_anisotropy, lod_clamp and border_color");
 		}
 		if (!known.count(family)) {
 			throw CompileError("\"" + family + "\" is not a sampler option");
+		}
+
+		if (family == "max_anisotropy" || family == "lod_clamp") {
+			// A call-like option: a number, or for lod_clamp the lower and upper bound.
+			expect(TokenKind::LParen, ("after \"" + family + "\"").c_str());
+			const auto number = [&]() {
+				const bool negative = match(TokenKind::Minus);
+				if (kind() != TokenKind::IntegerLiteral && kind() != TokenKind::FloatLiteral) {
+					throw CompileError("\"" + family + "\" takes number literals");
+				}
+				const double value = kind() == TokenKind::IntegerLiteral ? static_cast<double>(current().integerValue)
+					: current().floatValue;
+				advance();
+				return negative ? -value : value;
+			};
+			if (family == "max_anisotropy") {
+				const double value = number();
+				if (value < 1 || value > 16 || value != static_cast<uint32_t>(value)) {
+					throw CompileError("max_anisotropy takes an integer from 1 to 16");
+				}
+				if (assigned.insert("anisotropy").second) {
+					state.anisotropy = static_cast<uint32_t>(value);
+				}
+			} else {
+				const double low = number();
+				expect(TokenKind::Comma, "between the bounds of lod_clamp");
+				const double high = number();
+				if (low < 0 || high < low) {
+					throw CompileError("lod_clamp takes a lower bound of at least 0 and an upper bound not below it");
+				}
+				if (assigned.insert("lod").second) {
+					state.lodMin = static_cast<float>(low);
+					state.lodMax = static_cast<float>(high);
+				}
+			}
+			expect(TokenKind::RParen, ("to close \"" + family + "\"").c_str());
+			if (!match(TokenKind::Comma)) {
+				break;
+			}
+			continue;
 		}
 
 		expect(TokenKind::ColonColon, "after a sampler option name");
@@ -4659,6 +4699,16 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 				[&](const char* attribute) {
 					(attribute[1] == 'a' ? state.magFilter : state.minFilter) = chosen;
 				});
+		} else if (family == "border_color") {
+			static const std::map<std::string_view, SamplerBorder> borders = {
+				{ "transparent_black", SamplerBorder::TransparentBlack },
+				{ "opaque_black", SamplerBorder::OpaqueBlack }, { "opaque_white", SamplerBorder::OpaqueWhite },
+			};
+			const auto chosen = borders.find(value);
+			if (chosen == borders.end()) {
+				throw CompileError("\"" + spelled + "\" is not a border color");
+			}
+			fill({ "border" }, [&](const char*) { state.border = chosen->second; });
 		} else if (family == "compare_func") {
 			static const std::map<std::string_view, SamplerCompare> compares = {
 				{ "never", SamplerCompare::Never }, { "less", SamplerCompare::Less },

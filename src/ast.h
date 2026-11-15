@@ -376,6 +376,7 @@ struct SwitchCase {
 enum class SamplerAddress { ClampToZero, ClampToEdge, Repeat, MirroredRepeat };
 enum class SamplerFilter { Nearest, Linear };
 enum class SamplerMipFilter { None, Nearest, Linear };
+enum class SamplerBorder { TransparentBlack, OpaqueBlack, OpaqueWhite };
 enum class SamplerCompare { Never, Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual, Always };
 
 // The state of a sampler declared in the shader, with the defaults of a
@@ -389,12 +390,18 @@ struct SamplerState {
 	SamplerFilter minFilter = SamplerFilter::Nearest;
 	SamplerMipFilter mipFilter = SamplerMipFilter::None;
 	SamplerCompare compare = SamplerCompare::Never;
+	SamplerBorder border = SamplerBorder::TransparentBlack;
+	uint32_t anisotropy = 1;
+	// The lod_clamp range, with the largest half as the upper bound of a sampler that sets none.
+	float lodMin = 0.0f;
+	float lodMax = 65504.0f;
 	bool normalizedCoordinates = true;
 
 	bool operator==(const SamplerState& other) const {
 		return sAddress == other.sAddress && tAddress == other.tAddress && rAddress == other.rAddress
 			&& magFilter == other.magFilter && minFilter == other.minFilter
-			&& mipFilter == other.mipFilter && compare == other.compare && normalizedCoordinates == other.normalizedCoordinates;
+			&& mipFilter == other.mipFilter && compare == other.compare && border == other.border
+			&& anisotropy == other.anisotropy && lodMin == other.lodMin && lodMax == other.lodMax && normalizedCoordinates == other.normalizedCoordinates;
 	}
 };
 
@@ -402,6 +409,7 @@ const char* samplerAddressName(SamplerAddress mode);
 const char* samplerFilterName(SamplerFilter filter);
 const char* samplerMipFilterName(SamplerMipFilter filter);
 const char* samplerCompareName(SamplerCompare compare);
+const char* samplerBorderName(SamplerBorder border);
 
 struct VariableDeclaration {
 	Type type;

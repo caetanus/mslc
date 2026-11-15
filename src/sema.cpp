@@ -9453,6 +9453,13 @@ namespace {
 		_reflection += "\t\t\t\t" + entry + "\n";
 	}
 
+	// A lod_clamp bound as a JSON number: the shortest decimal form of the float.
+	static std::string lodNumber(float value) {
+		char text[32];
+		std::snprintf(text, sizeof text, "%g", static_cast<double>(value));
+		return text;
+	}
+
 	std::string Emitter::descriptorJson(uint32_t binding) const {
 		return "{ \"set\": " + std::to_string(descriptorSet()) + ", \"binding\": "
 			+ std::to_string(binding) + " }";
@@ -13378,8 +13385,9 @@ namespace {
 					+ "\", \"min_filter\": \"" + samplerFilterName(state.minFilter)
 					+ "\", \"mip_filter\": \"" + samplerMipFilterName(state.mipFilter)
 					+ "\", \"normalized_coordinates\": " + (state.normalizedCoordinates ? "true" : "false")
-					+ ", \"compare_function\": \"" + samplerCompareName(state.compare) + "\", \"anisotropy\": 1"
-					+ ", \"border_color\": \"TransparentBlack\", \"lod_min\": 0, \"lod_max\": 65504"
+					+ ", \"compare_function\": \"" + samplerCompareName(state.compare) + "\", \"anisotropy\": "
+					+ std::to_string(state.anisotropy) + ", \"border_color\": \"" + samplerBorderName(state.border)
+					+ "\", \"lod_min\": " + lodNumber(state.lodMin) + ", \"lod_max\": " + lodNumber(state.lodMax)
 					+ " }";
 			}
 			document += _embeddedSamplers.empty() ? "]\n" : "\n\t\t\t]\n";
