@@ -268,10 +268,15 @@ candidate: Apple finds the candidate viable and errors if it wins, mslc refuses 
   nothing valid is lost today), and a friend function defined in a struct (not parsed). The
   enclosing namespace of an inline one, and the inline members of a namespace, are followed. A
   struct the emitter cannot name before evaluating adds nothing.
-  The passes that run before emission (the import scan, file-scope sampler ownership) read a
+  The passes that run before emission (the import scan, the reservation of file-scope samplers) read a
   call's names from the source and do not see what lookup adds: a function declared and defined
   elsewhere that only argument-dependent lookup reaches is refused, and a file-scope sampler
   named by a function only it reaches is not counted against its entry point.
+  A file-scope sampler a function names, or one it reaches through a call, makes that function
+  emitted once per entry point that reaches it (#167); the call from an instance member is
+  followed by name, since the receiver's struct is known only when the call is emitted, so a
+  same-named member of another struct that names a sampler reserves it too: listed, unused.
+  A function that reaches one of those only through argument-dependent lookup is refused.
 - A helper no entry point reaches is not checked for a call to an overloaded name (arity, no
   matching function, declared above); resolution happens where the call is emitted.
 - Beside other overloads, an element or member of a local that a mutable reference parameter could

@@ -1,4 +1,6 @@
-// EXPECT: error member helper "Lookup::look" names a file-scope sampler, pass the sampler to it as an argument
+// EXPECT: valid
+// A member that calls free helpers, the last of which names the sampler.
+// REFLECT: "embedded_sampler": 0, "name": "S"
 #include <metal_stdlib>
 using namespace metal;
 constexpr sampler S(filter::linear);

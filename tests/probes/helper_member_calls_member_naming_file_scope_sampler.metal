@@ -1,4 +1,6 @@
-// EXPECT: error member helper "Lookup::inner" names a file-scope sampler, pass the sampler to it as an argument
+// EXPECT: valid
+// The sampler is named two members down, by an implicit-this call.
+// REFLECT: "embedded_sampler": 0, "name": "S"
 #include <metal_stdlib>
 using namespace metal;
 constexpr sampler S(filter::linear);
