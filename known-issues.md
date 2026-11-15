@@ -388,3 +388,23 @@ Apple accepts the first four, which are refused loudly. It also rejects the last
   says `&` is not supported.
 - `S{1,2} += S{1,2}`: Apple rejects it too and names the operator ("no viable overloaded '+='");
   mslc says "no viable overloaded compound assignment" for a S temporary.
+
+## A function or variable named like a struct or enum: forms still refused or not hidden (#348)
+
+A function or variable of the same name now hides the struct or enum tag before `(` and `{`, and
+in a declaration, as in Apple, so the silent wrong-callee cases are gone. Still different:
+
+- A function template named like a struct (`#348` says "or function template, see #341"): rejected
+  loudly by the #341 diagnostic ("the function template S shares its name with a type"); it is
+  tracked under #341.
+- A local or block-scope struct beside an outer function of the same name (`struct S{..}; S s;`),
+  `struct n::S s(..)` beside a variable `n::S`, `struct S s(..)` inside a namespace, `sizeof(struct
+  S)` beside a function `S`, and a typedef'd struct construction `typedef struct S T; T(1.0f)`:
+  Apple accepts them, mslc refuses them loudly (identical on master).
+- `(S)x`, a C-style cast to an enum `S` that a function or variable hides: mslc accepts it where
+  Apple rejects it; it picks no wrong callee.
+- Wording: where Apple says "must use 'struct' tag to refer to type 'S'", mslc says "expected ;
+  after an expression statement, found identifier s"; for a variable it says "S is not a builtin
+  mslc recognises" where Apple says "called object type float is not a function".
+- No probe pins that a function declared AFTER a use leaves the struct visible at the use (the
+  behaviour is correct; the guard against hiding by a later declaration is untested).
