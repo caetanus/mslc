@@ -1,4 +1,7 @@
-// EXPECT: error member helper "Lookup::look" names a file-scope sampler, pass the sampler to it as an argument
+// EXPECT: valid
+// An instance member that names a file-scope sampler reserves it for the entry point that calls it.
+// REFLECT: { "kind": "Sampler", "descriptor": { "set": 1, "binding": 1 }, "embedded_sampler": 0, "name": "S" }
+// DISASM: OpImageSampleImplicitLod
 #include <metal_stdlib>
 using namespace metal;
 constexpr sampler S(filter::linear);
