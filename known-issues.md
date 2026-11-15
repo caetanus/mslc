@@ -469,3 +469,10 @@ Each of these is a diagnostic, not a silent pick, except where it says "approxim
 - Older gap, refused and not miscompiled: `f(sa, 1)` where `::f` takes one argument and `A::f(SA, int)` is found
   through the struct argument's namespace is refused by validateHelpers' by-name arity check before lookup
   runs ("call to f passes 2 arguments, and it takes 1"); Apple calls `A::f`.
+- A float literal is parsed to a double and then rounded to float, so a literal just above a float
+  neighbour double-rounds: `1.0000000596046448` gives mslc 1.0 where Apple gives 0x3F800001. Seen in
+  braced, scalar and function-body positions, and the same on master. Parsing the literal text
+  directly to float (as `strtof`) would fix it.
+- `const volatile int N = 3; float a[N];` as a local: Apple refuses it ("array size is not a
+  constant expression"); mslc accepts it, because the parser does not record `volatile` on a type.
+  The length it takes is the right one, so this accepts invalid source and miscompiles nothing.

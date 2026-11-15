@@ -8356,10 +8356,27 @@ namespace {
 					"braced list naming its fields, not with a single value");
 			}
 
+			// "float4(1)" and "float4(a, b, c, d)": a float or half vector built by its own
+			// constructor, each component converted as it is at run time.
+			if (type.vectorWidth > 1 && isFloatKind(type.scalar) && initializer.kind == ExpressionKind::Construct
+				&& initializer.constructType && !initializer.constructType->isMatrix()) {
+				FoldedConstant vector;
+				vector.isComposite = true;
+				vector.type = declaredTypeOf(type);
+				for (const double component: foldColumnConstructor(initializer, type.scalar, type.vectorWidth)) {
+					FoldedConstant part;
+					part.scalar = type.scalar;
+					part.number = component;
+					vector.parts.push_back(emitConstant(part));
+				}
+				return vector;
+			}
+
 			if (type.vectorWidth > 1) {
 				throw CompileError("a " + std::string(scalarKindName(type.scalar))
 					+ std::to_string(type.vectorWidth) + " constant is initialised with a braced "
-					"list of its components, not with a single value");
+					"list of its components or, for a float or half vector, a constructor of its own type "
+					"(not a single value, another constant or an expression)");
 			}
 
 			FoldedConstant folded = foldExpression(initializer);
@@ -8441,7 +8458,8 @@ namespace {
 
 		const FoldedConstant folded = foldExpression(expression);
 		if (folded.isComposite || folded.scalar == ScalarKind::Bool) {
-			throw CompileError("a matrix element is a float or half value, not a bool or a composite");
+			throw CompileError("a matrix or vector constant element has to be a float or half value; a bool or "
+				"a composite is not folded into one");
 		}
 		if (braced) {
 			requireNotNarrowing(folded, kind);
