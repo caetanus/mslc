@@ -2425,7 +2425,8 @@ namespace {
 		// [[position]]/[[frag_coord]] parameter.
 		bool _hasFragCoordInput = false;
 
-		// A helper's body is emitted once per stage that reaches it.
+		// A helper's body is emitted once per stage that reaches it, or once per entry point when it
+		// names a file-scope sampler (helperScope).
 		struct HelperFunction {
 			const FunctionDecl* definition = nullptr;
 			std::map<std::pair<Stage, const FunctionDecl*>, Id> ids;
@@ -2531,11 +2532,20 @@ namespace {
 		void reserveThreadgroupLocal(const VariableDeclaration& declaration);
 		void reserveSampler(const VariableDeclaration& declaration);
 		// The entry point's own name first, then a file-scope sampler it names.
+		// A helper the pre-emission scan did not mark would share one body between entry points, so
+		// a file-scope sampler it names is refused: that is argument-dependent lookup, a template
+		// instance or any other path the scan does not follow.
 		const Binding* findResourceBinding(const std::string& name) const {
 			const auto own = _bindings.find(name);
 			if (own != _bindings.end()) return &own->second;
 			const auto fileScope = _fileScopeSamplerBindings.find(name);
-			return fileScope == _fileScopeSamplerBindings.end() ? nullptr : &fileScope->second;
+			if (fileScope == _fileScopeSamplerBindings.end()) return nullptr;
+			if (_helper && _helper->body && !_samplerDependent.count(_helper)) {
+				throw CompileError("\"" + _helper->name + "\" names the file-scope sampler \"" + name
+					+ "\" but is reached by a path mslc does not follow (argument-dependent lookup or a "
+					"template instance); pass the sampler as a parameter or call it by a qualified name");
+			}
+			return &fileScope->second;
 		}
 		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
 		void reserveFileScopeSamplers();
@@ -9692,9 +9702,9 @@ namespace {
 			+ ", \"name\": \"" + declaration.name + "\" }");
 	}
 
-	// What a call can reach, for the passes that run before emission. An instance member is chosen
-	// by its receiver's struct, which is known only when the call is emitted, so every instance
-	// member of that name is taken.
+	// What a call can reach, for the passes that run before emission. A member is chosen by its
+	// receiver's struct, which is known only when the call is emitted, so every member of that name
+	// is taken.
 	std::vector<const FunctionDecl*> Emitter::functionsCalledBy(const Expression& call) {
 		std::vector<const FunctionDecl*> found;
 		const auto add = [&](const HelperFunction* helper) {
@@ -9706,8 +9716,7 @@ namespace {
 			const std::string suffix = "::" + call.left->memberName;
 			for (const auto& entry: _helpers) {
 				const FunctionDecl& definition = *entry.second.definition;
-				const bool instance = !definition.parameters.empty() && definition.parameters[0].name == "this";
-				if (instance && definition.name.size() > suffix.size()
+				if (definition.name.size() > suffix.size()
 					&& definition.name.compare(definition.name.size() - suffix.size(), suffix.size(), suffix) == 0) {
 					add(&entry.second);
 				}
