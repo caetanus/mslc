@@ -23,6 +23,7 @@ import tempfile
 import checks
 import compare
 import directives
+import graphics
 import hostenv
 import hosts
 import inputs
@@ -139,6 +140,35 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     return result
 
 
+def unknown_directives(opts, d, results):
+    """A directive naming no buffer of any compared kernel is a typo that would silently do nothing."""
+    known = set().union(*(r.get("buffers", []) for r in results))
+    errors = []
+    if known:
+        named = {"DIFFCHECK-EXCLUDE": d["exclude"], "DIFFCHECK-RANGE": d["range"]}
+        if not opts.corpus:
+            named["--range"] = opts.ranges
+        for directive, table in named.items():
+            unknown = sorted(set(table) - known)
+            if unknown:
+                errors.append({"entry": "*", "status": "error", "cases": [], "reason": "%s names %s, which is not "
+                               "a buffer (buffers: %s)" % (directive, ", ".join(unknown), ", ".join(sorted(known)))})
+    return errors
+
+
+def check_graphics_file(opts, path, d, vs, fs, work, includes, std):
+    run = d["run"]
+    params = {"width": opts.width or run.get("width", graphics.DEFAULT_SIZE), "height": opts.height or run.get("height", graphics.DEFAULT_SIZE),
+              "instances": opts.instances or run.get("instances", 1), "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
+              "cases": opts.cases or run.get("cases", 2), "elems": opts.elems or run.get("elems"), "std": std or opts.std,
+              "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
+              "geometry": d["geometry"], "position": d["position"], "depth": d["depth"]}
+    sub = os.path.join(work, "graphics")
+    os.makedirs(sub)
+    results = [graphics.check_pair(opts, path, vs, fs, params, sub, includes)]
+    return results + unknown_directives(opts, d, results)
+
+
 def check_file(opts, path, std=None):
     """Results for every kernel in `path` (or the one named by --entry)."""
     here = os.path.dirname(os.path.abspath(path))
@@ -147,6 +177,11 @@ def check_file(opts, path, std=None):
     d = directives.parse(text)
     work = tempfile.mkdtemp(prefix="diffcheck-", dir=os.environ.get("TMPDIR"))
     try:
+        vs, fs = opts.vertex or d["run"].get("vertex"), opts.fragment or d["run"].get("fragment")
+        if bool(vs) != bool(fs):
+            return [{"entry": "*", "status": "error", "cases": [], "reason": "graphics needs both a vertex and a fragment name"}]
+        if vs:
+            return check_graphics_file(opts, path, d, vs, fs, work, includes, std)
         spv, refl, error = hosts.run_mslc(opts.mslc, path, work, includes)
         if error:
             status, reason = hosts.mslc_failure(error)
@@ -168,17 +203,7 @@ def check_file(opts, path, std=None):
             sub = os.path.join(work, e["name"])
             os.makedirs(sub)
             results.append(check_entry(opts, path, spv, e, e["name"], params, sub, includes))
-        # A directive naming no buffer of any compared kernel is a typo that would silently do nothing.
-        known = set().union(*(r.get("buffers", []) for r in results))
-        if known:
-            named = {"DIFFCHECK-EXCLUDE": d["exclude"], "DIFFCHECK-RANGE": d["range"]}
-            if not opts.corpus:
-                named["--range"] = opts.ranges
-            for directive, table in named.items():
-                unknown = sorted(set(table) - known)
-                if unknown:
-                    results.append({"entry": "*", "status": "error", "cases": [], "reason": "%s names %s, which is not "
-                                    "a buffer (buffers: %s)" % (directive, ", ".join(unknown), ", ".join(sorted(known)))})
+        results += unknown_directives(opts, d, results)
         return results
     finally:
         if not opts.keep:
@@ -233,9 +258,13 @@ def parser():
     p.add_argument("--seed", type=int)
     p.add_argument("--cases", type=int, help="number of seeded cases, cycling the moderate, wide and edge profiles")
     p.add_argument("--elems", type=int, help="elements per buffer (default 4 x grid)")
-    p.add_argument("--profiles", default=",".join(inputs.PROFILES),
-                   help="input profiles the cases cycle through (default: all; use moderate for kernels that "
-                        "take loop bounds or indices from buffers)")
+    p.add_argument("--profiles", help="input profiles the cases cycle through (default: all for a kernel, moderate "
+                   "for graphics; use moderate for kernels that take loop bounds or indices from buffers)")
+    p.add_argument("--vertex", help="vertex function of a graphics pair (or // RUN: vertex=)")
+    p.add_argument("--fragment", help="fragment function of a graphics pair (or // RUN: fragment=)")
+    p.add_argument("--width", type=int, help="graphics target width in pixels (default 32)")
+    p.add_argument("--height", type=int, help="graphics target height in pixels (default 32)")
+    p.add_argument("--instances", type=int, help="graphics instance count (default 1)")
     p.add_argument("--sentinel", action="store_true", help="add a case whose buffers are all 0x7f bytes")
     p.add_argument("--poison-padding", action="store_true", help="fill struct padding with 0xA5")
     p.add_argument("--std", help="Metal language version for Apple's compiler (2.4, 3.0, 3.1, 3.2)")
@@ -263,8 +292,9 @@ def parser():
 def main(argv=None):
     opts = parser().parse_args(argv)
     hosts.TIMEOUT = opts.timeout
-    opts.profiles = opts.profiles.split(",")
-    if not opts.profiles or any(x not in inputs.PROFILES for x in opts.profiles):
+    opts.gfx_profiles = opts.profiles.split(",") if opts.profiles else ["moderate"]
+    opts.profiles = (opts.profiles or ",".join(inputs.PROFILES)).split(",")
+    if any(x not in inputs.PROFILES for x in opts.profiles):
         print("diffcheck: --profiles takes a list of %s" % ", ".join(inputs.PROFILES), file=sys.stderr)
         return ERROR
     try:
@@ -273,7 +303,7 @@ def main(argv=None):
     except ValueError:
         print("diffcheck: --range wants BUFFER=LO:HI", file=sys.stderr)
         return ERROR
-    for name in ("grid", "local", "cases", "elems", "jobs"):
+    for name in ("grid", "local", "cases", "elems", "jobs", "width", "height", "instances"):
         value = getattr(opts, name)
         if value is not None and value < 1:
             print("diffcheck: --%s must be at least 1" % name, file=sys.stderr)

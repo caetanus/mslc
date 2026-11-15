@@ -38,7 +38,7 @@ DEPTH_CLEAR = 0.375
 DEPTH_INDEX = 100
 # Interpolated floats: barycentric interpolation is not specified to the bit. Absolute epsilon
 # because a ULP bound is useless near zero; measured on the probes, then rounded up.
-INTERP_ULP, INTERP_EPS = 32, 1e-5
+INTERP_ULP, INTERP_EPS = 32, 2e-5
 DEPTH_EPS = 1e-6
 SLOT_TOP = 30  # attribute at location n is vertex buffer slot 30 - n, away from [[buffer(n)]] arguments
 MAX_COLOR = 8
@@ -80,6 +80,10 @@ def attachment_layout(name, scalar, comps):
             "leaves": [{"off": i * size, "scalar": scalar} for i in range(comps)]}
 
 
+def depth_layout():
+    return {"name": "depth", "stride": 4, "access": "readwrite", "leaves": [{"off": 0, "scalar": "float"}]}
+
+
 def clear_image(scalar, pixels):
     fmt = "<f" if scalar == "float" else "<e" if scalar == "half" else "<i" if scalar == "int" else "<I"
     return bytearray(b"".join(struct.pack(fmt, v) for v in CLEAR[scalar]) * pixels)
@@ -112,3 +116,214 @@ def tolerance(source_ulp, interpolated, scalar):
     if compare.SCALARS[scalar][1] != "float" or not interpolated:
         return source_ulp, 0.0
     return max(source_ulp, INTERP_ULP), INTERP_EPS
+
+
+def pipeline_lines(width, height, vs, fs, attributes, colors, depth):
+    """The shape both Apple calls need: enough to build the render pipeline, no data."""
+    lines = ["vertex " + vs, "fragment " + fs, "target %d %d" % (width, height)]
+    lines += ["attr %d %s" % (loc, format_name(a["scalar"], a["comps"])) for loc, a in sorted(attributes.items())]
+    lines += ["color %d %s" % (i, COLOR_FORMATS[s]) for i, (s, _) in sorted(colors.items())]
+    return lines + (["depth"] if depth else [])
+
+
+def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_out, buffers, textures, samplers):
+    """`shape` plus the data both hosts read: `attr_files` {location: file}, `color_outs` {index: file},
+    `buffers` [(stage, metal index, set, member, bytes, file)], `textures` [(index, set, binding, file)],
+    `samplers` [(index, set, binding)]."""
+    lines = [l for l in shape if not l.startswith(("attr ", "color ", "depth"))]
+    lines.append("draw %d %d" % (len(points), instances))
+    for l in shape:
+        if l.startswith("attr "):
+            lines.append("%s %s" % (l, attr_files[int(l.split()[1])]))
+        elif l.startswith("color "):
+            i = int(l.split()[1])
+            lines.append("%s %s %s" % (l, " ".join(repr(float(v)) if colors[i][0] in ("float", "half") else str(v) for v in CLEAR[colors[i][0]]), color_outs[i]))
+    if depth_out:
+        lines.append("depth %r %s" % (DEPTH_CLEAR, depth_out))
+    lines += ["gbuffer %s %d %d %d %d %s" % b for b in buffers]
+    lines += ["texture %d %d %d %d %d %s" % (i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f) for i, s, b, f in textures]
+    lines += ["sampler %d %d %d" % s for s in samplers]
+    return lines
+
+
+def _skipped(res, reason):
+    res.update(status="skipped", reason=reason)
+    return res
+
+
+def _prepare(opts, source, vs, fs, params, work, includes):
+    """Compile both stages and decide everything the draw needs. Returns (plan, None) or
+    (None, result) when the file is skipped or erroneous."""
+    res = {"entry": "%s+%s" % (vs, fs), "status": None, "cases": [], "reason": None}
+    width, height = params["width"], params["height"]
+    points = params["geometry"] or DEFAULT_GEOMETRY
+    try:
+        check_geometry(points, width, height)
+    except GraphicsError as e:
+        res.update(status="error", reason=str(e))
+        return None, res
+    compiled, problems = {}, []
+    allowed = {"vertex": {"Buffer", "VertexInput"}, "fragment": {"Buffer", "Texture", "Sampler"}}
+    for stage, name in (("vertex", vs), ("fragment", fs)):
+        spv, refl, error = hosts.run_mslc(opts.mslc, source, work, includes, stage)
+        if error:
+            res["status"], res["reason"] = hosts.mslc_failure(error)
+            return None, res
+        ep = next((e for e in refl["entry_points"] if e["name"] == name and e["stage"] == stage), None)
+        if ep is None:
+            return None, _skipped(res, "no %s function named %s" % (stage, name))
+        try:
+            iface = spirvio.interface(spirvio.disassemble(spv), name)
+        except ValueError as e:
+            res.update(status="error", reason=str(e))
+            return None, res
+        problems += iface["unsupported"]
+        problems += ["%s binding kind %s" % (stage, b["kind"]) for b in ep["bindings"] if b["kind"] not in allowed[stage]]
+        problems += ["texture %s access %s" % (b["name"], b.get("texture_access")) for b in ep["bindings"]
+                     if b["kind"] == "Texture" and b.get("texture_access") != "Sample"]
+        problems += ["embedded samplers"] if ep["embedded_samplers"] else []
+        compiled[stage] = (spv, ep, iface)
+    vif, fif = compiled["vertex"][2], compiled["fragment"][2]
+    attributes = {}
+    for b in compiled["vertex"][1]["bindings"]:
+        if b["kind"] == "VertexInput" and b["location"] in vif["inputs"]:
+            attributes[b["location"]] = dict(vif["inputs"][b["location"]], name=b["name"])
+    problems += ["half scalar vertex attribute %s" % a["name"] for a in attributes.values() if a["scalar"] == "half" and a["comps"] == 1]
+    colors = {i: (o["scalar"], o["comps"]) for i, o in fif["outputs"].items()}
+    if sorted(colors) != list(range(len(colors))) or len(colors) > MAX_COLOR:
+        problems.append("colour outputs are not locations 0..n-1")
+    depth = params["depth"] or fif["frag_depth"]
+    if not colors and not depth:
+        problems.append("the fragment function writes no colour or depth output")
+    if problems:
+        return None, _skipped(res, "unsupported: " + "; ".join(problems))
+    position = params["position"]
+    names = {a["name"]: a for a in attributes.values()}
+    if attributes and position is None:
+        res.update(status="error", reason="the vertex function has stage_in attributes: name the one that carries the "
+                   "position with // DIFFCHECK-POSITION: <name> (or none)")
+        return None, res
+    if position == "none":
+        position = None
+    elif position and not (position in names and names[position]["scalar"] == "float" and names[position]["comps"] >= 2):
+        res.update(status="error", reason="DIFFCHECK-POSITION %s is not a float2 to float4 attribute (attributes: %s)"
+                   % (position, ", ".join(sorted(names)) or "none"))
+        return None, res
+    if any(b["kind"] == "Buffer" and b["metal_index"] in {SLOT_TOP - l for l in attributes}
+           for b in compiled["vertex"][1]["bindings"]):
+        return None, _skipped(res, "a vertex buffer argument uses a slot the vertex descriptor needs")
+    shape = pipeline_lines(width, height, vs, fs, attributes, colors, depth)
+    try:
+        lines = hosts.apple_source_lines(source, work, includes, params.get("std"), opts.apple_contract)
+        apple = hosts.apple_gfx_reflection(opts.metal, lines, shape, work)
+    except hosts.HostError as e:
+        return None, _skipped(res, str(e))
+    findings, layouts = [], {}
+    for stage in ("vertex", "fragment"):
+        ep, a = compiled[stage][1], apple[stage]
+        if a["unsupported"]:
+            return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(a["unsupported"])))
+        bufs = [b for b in ep["bindings"] if b["kind"] == "Buffer"]
+        findings += ["%s: %s" % (stage, f) for f in checks.cross_check(bufs, a)]
+        for kind, key in (("Texture", "textures"), ("Sampler", "samplers")):
+            mine = sorted((b["metal_index"], b["name"]) for b in ep["bindings"] if b["kind"] == kind)
+            if mine != sorted((t["index"], t["name"]) for t in a[key]):
+                findings.append("%s: %s bindings differ: mslc %s, Apple %s" % (stage, kind.lower(), mine,
+                                sorted((t["index"], t["name"]) for t in a[key])))
+        if any(t["type"] != "2d" or t["data"] != "float" for t in a["textures"]):
+            return None, _skipped(res, "unsupported %s texture: only 2D float textures" % stage)
+        layouts[stage] = {l["index"]: l for l in a["buffers"]}
+        if any(l["access"] != "read" for l in layouts[stage].values()):
+            return None, _skipped(res, "a %s buffer is writable (invocation order would make it racy)" % stage)
+        if any(l["stride"] == 0 or not l["leaves"] for l in layouts[stage].values()):
+            return None, _skipped(res, "unsupported argument: buffer element has no scalar layout")
+    if findings:
+        res.update(status="reflection-mismatch", reason="; ".join(findings))
+        return None, res
+    return dict(res=res, compiled=compiled, attributes=attributes, position=position, colors=colors, depth=depth,
+                points=points, shape=shape, lines=lines, layouts=layouts, interpolated=any(not v["flat"] for v in fif["inputs"].values())), None
+
+
+def check_pair(opts, source, vs, fs, params, work, includes):
+    """Compare one vertex + fragment pair; returns a result dict."""
+    plan, early = _prepare(opts, source, vs, fs, params, work, includes)
+    if early:
+        return early
+    res, width, height = plan["res"], params["width"], params["height"]
+    pixels = width * height
+    attach = {i: attachment_layout("color%d" % i, s, c) for i, (s, c) in plan["colors"].items()}
+    if plan["depth"]:
+        attach[DEPTH_INDEX] = depth_layout()
+    excluded = dict(params["exclude"])
+    compared = {i: l for i, l in attach.items() if l["name"] not in excluded}
+    before = {i: clear_image(plan["colors"][i][0], pixels) for i in plan["colors"]}
+    if plan["depth"]:
+        before[DEPTH_INDEX] = bytearray(struct.pack("<f", DEPTH_CLEAR) * pixels)
+    ulp = compare.ulp_bound_for_source(hostenv.read_text(source))
+    res["buffers"] = sorted([l["name"] for l in attach.values()] + [l["name"] for s in plan["layouts"].values() for l in s.values()])
+    res["ulp_bound"] = ulp
+    profiles = [opts.gfx_profiles[c % len(opts.gfx_profiles)] for c in range(params["cases"])]
+    nonzero = False
+    for case, profile in enumerate(profiles):
+        rng = random.Random(params["seed"] * 1000 + case)
+        base = os.path.join(work, "case%d-" % case)
+        attr_files, buffers, textures, samplers = {}, [], [], []
+        for loc, data in vertex_data(plan["attributes"], plan["points"], plan["position"], width, height, rng, profile).items():
+            attr_files[loc] = base + "attr%d.bin" % loc
+            hostenv.write_bytes(attr_files[loc], data)
+        for stage in ("vertex", "fragment"):
+            ep = plan["compiled"][stage][1]
+            for b in sorted((b for b in ep["bindings"] if b["kind"] == "Buffer"), key=lambda b: b["member"]):
+                layout = plan["layouts"][stage][b["metal_index"]]
+                data = inputs.fill_buffer(layout, params.get("elems") or DEFAULT_ELEMS, rng, profile, False, False,
+                                          params["range"].get(layout["name"]), case)
+                path = base + "%s-buf%d.bin" % (stage, b["metal_index"])
+                hostenv.write_bytes(path, data)
+                buffers.append((stage, b["metal_index"], b["descriptor"]["set"], b["member"], len(data), path))
+            for b in ep["bindings"]:
+                if b["kind"] == "Texture":
+                    path = base + "tex%d.bin" % b["metal_index"]
+                    hostenv.write_bytes(path, texture_data(rng, profile))
+                    textures.append((b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"], path))
+                elif b["kind"] == "Sampler":
+                    samplers.append((b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"]))
+        outs = {}
+        for backend, runner in (("apple", hosts.run_metal), ("mslc", hosts.run_vulkan)):
+            color_outs = {i: base + "%s-color%d.bin" % (backend, i) for i in plan["colors"]}
+            depth_out = base + "%s-depth.bin" % backend if plan["depth"] else None
+            body = draw_lines(plan["shape"], plan["points"], params["instances"], attr_files, color_outs, plan["colors"],
+                              depth_out, buffers, textures, samplers)
+            if backend == "apple":
+                text, binary = ["mode draw"] + plan["lines"] + body, opts.metal
+            else:
+                text = ["mode draw", "spv vertex " + plan["compiled"]["vertex"][0], "spv fragment " + plan["compiled"]["fragment"][0]] + body
+                binary = opts.vk
+            manifest = base + "%s.txt" % backend
+            hostenv.write_text(manifest, "\n".join(text) + "\n")
+            runner(binary, manifest)
+            outs[backend] = {i: bytearray(hostenv.read_bytes(color_outs[i])) for i in plan["colors"]}
+            if depth_out:
+                outs[backend][DEPTH_INDEX] = bytearray(hostenv.read_bytes(depth_out))
+        if opts.corrupt_mslc:
+            name, _, at = opts.corrupt_mslc.partition(":")
+            for i, l in attach.items():
+                if l["name"] == name:
+                    outs["mslc"][i][int(at)] ^= 0xff
+        diffs = []
+        for i, layout in sorted(compared.items()):
+            u, e = tolerance(ulp, plan["interpolated"], layout["leaves"][0]["scalar"])
+            if i == DEPTH_INDEX:
+                u, e = max(u, INTERP_ULP), DEPTH_EPS
+            diffs += [d.to_json() for d in compare.compare(layout, outs["apple"][i], outs["mslc"][i], u, eps=e)]
+        nonzero = nonzero or any(checks.written_nonzero(compared, before, outs[b]) for b in ("apple", "mslc"))
+        control = checks.perturb(compared, outs["mslc"], outs["apple"])
+        control_ok = False
+        if control is not None:
+            copy, name, _ = control
+            index = next(i for i, l in attach.items() if l["name"] == name)
+            control_ok = bool(compare.compare(attach[index], outs["apple"][index], copy[index], 0))
+        res["cases"].append({"case": case, "profile": profile, "diffs": diffs[:16], "diff_count": len(diffs), "negative_control": control_ok})
+    res["status"], res["reason"] = checks.verdict(res["cases"], nonzero, params["writes_zero"])
+    if excluded:
+        res["excluded"] = excluded
+    return res

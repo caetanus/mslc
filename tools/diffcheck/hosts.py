@@ -158,3 +158,13 @@ def apple_reflection(binary, source_lines, entry, work):
     hostenv.write_text(path, "\n".join(["mode reflect"] + source_lines + ["entry " + entry, "reflection " + out]) + "\n")
     run_metal(binary, path)
     return hostenv.read_json(out)
+
+
+def apple_gfx_reflection(binary, source_lines, pipeline, work):
+    """{"vertex": {...}, "fragment": {...}}: each stage's buffers (with layouts), textures, samplers
+    and unsupported bindings, from a render pipeline built with the `pipeline` manifest lines."""
+    out = os.path.join(work, "apple-gfx-reflection.json")
+    path = os.path.join(work, "apple-gfx-reflect.txt")
+    hostenv.write_text(path, "\n".join(["mode reflect-gfx"] + source_lines + pipeline + ["reflection " + out]) + "\n")
+    run_metal(binary, path)
+    return hostenv.read_json(out)
