@@ -432,3 +432,40 @@ measured with `xcrun metal` and `mslc` on the same source.
   argument") and accepts the first; mslc refuses the first, as a member of a conditional.
 - `one(ds[0].a)` for a `device` buffer `ds` (x14): Apple says "no matching function" (cannot bind a reference
   in address space 'device'); mslc says the argument is not a variable of this function.
+
+## Function template instantiation: what is refused or approximated (#341, slice 2)
+
+Each of these is a diagnostic, not a silent pick, except where it says "approximated".
+
+- A call whose template parameter would be deduced as an address-space-qualified type is refused: a
+  reference parameter (`thread T&`, `const thread T&`) given an lvalue in device, constant or threadgroup
+  memory makes Apple deduce `T = device float` and bind it, where a function taking `thread float&` cannot
+  bind that lvalue. mslc has no qualified `T`. A by-value `T x` is unaffected (T is `float`).
+- Partial ordering is not modelled: two templates that rank alike are reported ambiguous even where C++
+  prefers the more specialised one.
+- The result type of `f(x)` is known only once T is deduced, so `f(s).field` on a struct result is refused
+  (it reads as a swizzle), and an unqualified call whose argument is such a call and whose name a function in
+  a namespace shares is refused (argument-dependent lookup would need the struct). Assign the result to a
+  variable first.
+- Approximated: a `packed_float3` argument deduces `T = float3` (Apple deduces `packed_float3`). The two
+  differ only in storage layout, so the instance computes the same values; mslc cannot tell them apart
+  anywhere else either.
+- Deduction from an enum, from a pointer that is not a local array, and from a texture is refused.
+- Not lowered: `vec<T, N>` and other template-id types in a signature, `typename T::type`, trailing return
+  types, default function arguments, enum-typed non-type parameters, `enable_if` defaults (slice 3).
+- A constant used in a function body above its declaration (`float g() { return K; } constant float K = 5.0f;`)
+  is accepted for a plain helper and for an instance, where Apple reports an undeclared identifier. This is
+  older than templates (the file-scope constants a function sees are not limited to the ones above it).
+- Inside an instance, a call whose arguments name a parameter of the instance's template type is looked up
+  through its struct arguments' namespaces at the end of the file (clang's point of instantiation). A call
+  whose arguments do not (a local, a literal) is bound where the template is declared in Apple; when a
+  function it could take is declared below the template, mslc refuses it. A local that has a dependent type
+  (`T y = x; g(y)`) is treated as not dependent, so that case is refused too when such a function exists.
+- An instance is an internal function: a `--compile-library` unit never exports or imports it (Apple makes it
+  `linkonce_odr`), and an instance that calls a function the unit only declares is refused.
+- A helper reached only through an instance that names a file-scope sampler is not reserved that sampler (the
+  scan follows calls by name), so the sampler is unbound and the compile fails with `"smp" is not a sampler`.
+  Pass the sampler as an argument. An instance that names one itself is refused earlier, with the same advice.
+- Older gap, refused and not miscompiled: `f(sa, 1)` where `::f` takes one argument and `A::f(SA, int)` is found
+  through the struct argument's namespace is refused by validateHelpers' by-name arity check before lookup
+  runs ("call to f passes 2 arguments, and it takes 1"); Apple calls `A::f`.
