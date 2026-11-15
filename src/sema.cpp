@@ -6747,7 +6747,6 @@ namespace {
 			throw CompileError(what + " has to be a variable, an element or a member: parameter \""
 				+ parameter.name + "\" is a reference to it");
 		}
-		rejectPlaceThroughConditional(argument, "passing by reference");
 		if (isTemporaryPart(argument)) {
 			throw CompileError("no matching function for call to \"" + function + "\": " + what
 				+ " is a temporary, which parameter \"" + parameter.name + "\" cannot bind as a reference");
@@ -6756,6 +6755,7 @@ namespace {
 			throw CompileError(what + " is a component of a vector, which a reference parameter cannot "
 				"name (Apple refuses it too)");
 		}
+		rejectPlaceThroughConditional(argument, "passing by reference");
 
 		const Expression& root = storeRoot(argument);
 		if (root.kind == ExpressionKind::Identifier) {
@@ -10394,6 +10394,11 @@ namespace {
 			_builder.emit(spirv::OpStore, { variable, value });
 			bindLocal(declaration.name, variable, _builder.typeOf(value), referenced);
 			return;
+		}
+		if (isTemporaryPart(place) && !declaration.type.isConst
+			&& declaration.type.addressSpace != AddressSpace::Constant) {
+			throw CompileError("the reference \"" + declaration.name + "\" is bound to a member or element of "
+				"a temporary, which a non-const reference cannot bind (Apple refuses it too)");
 		}
 		rejectPlaceThroughConditional(place, "binding a reference to");
 
