@@ -1,4 +1,6 @@
-// EXPECT: error needs an instantiation, which is not lowered yet
+// EXPECT: valid
+// DISASM-NO-MATCH: OpFunctionParameter %v3float
+// DISASM: OpFMul %float
 // Refs #341: a helper of the template's name must not take the call. Without the
 // check, a float argument would be broadcast into the float3 helper, which is a
 // miscompile (the template, instantiated for float, is what Apple calls).
