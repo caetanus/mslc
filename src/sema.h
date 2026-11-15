@@ -64,7 +64,7 @@ private:
 	std::map<ScalarKind, spirv::Id> _subpassImages;
 	bool _storageReadDeclared = false;
 	bool _storageWriteDeclared = false;
-	bool _image1DDeclared = false;
+	std::set<uint32_t> _capabilities;
 
 	// A matrix member of a laid-out struct needs ColMajor and MatrixStride, which
 	// SPIR-V only allows on a struct member, so every struct with an Offset on a
@@ -100,6 +100,9 @@ public:
 	// src/iridium/air.cpp:771-785). The component type is not in the image type;
 	// a half texture's samples are narrowed after the lookup.
 	spirv::Id image(ResourceKind kind);
+	// Declares a capability once, whichever image type first needs it.
+	void requireCapability(spirv::CapabilityValue capability);
+	spirv::Id imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sampled);
 	// The storage image (Sampled 2, format Unknown) a texture of any access but
 	// sample is declared as, with a uint or a float sampled type; a half texture
 	// is a float image narrowed after the read, as for a sampled one. Iridium

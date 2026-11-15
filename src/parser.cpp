@@ -3671,11 +3671,13 @@ void Parser::parseResourceType(Type& type) {
 		{ "texturecube", ResourceKind::TextureCube },
 		{ "texture3d", ResourceKind::Texture3D },
 		{ "texture2d_array", ResourceKind::Texture2DArray },
+		{ "texture1d_array", ResourceKind::Texture1DArray },
+		{ "texturecube_array", ResourceKind::TextureCubeArray },
 	};
 	const auto lowered = textures.find(name);
 	if (lowered == textures.end()) {
 		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture1d, texture2d, texturecube, "
-			"texture3d and texture2d_array of float or half, and sampler");
+			"texture3d, texture2d_array, texture1d_array and texturecube_array of float or half, and sampler");
 	}
 
 	expect(TokenKind::Less, ("to open the sampled type of " + name).c_str());

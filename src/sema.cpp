@@ -1358,19 +1358,36 @@ Id TypeTable::one(Id type) {
 		std::vector<uint32_t>(vectorWidth(type), scalarOne));
 }
 
+void TypeTable::requireCapability(spirv::CapabilityValue capability) {
+	if (_capabilities.insert(static_cast<uint32_t>(capability)).second) {
+		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(capability) });
+	}
+}
+
+// The Dim, Arrayed flag and capability a texture kind's image type takes; the
+// sampled and the storage image of a kind differ only in the Sampled operand.
+Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sampled) {
+	const bool cube = kind == ResourceKind::TextureCube || kind == ResourceKind::TextureCubeArray;
+	const bool oneD = kind == ResourceKind::Texture1D || kind == ResourceKind::Texture1DArray;
+	const bool arrayed = kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture1DArray
+		|| kind == ResourceKind::TextureCubeArray;
+	if (oneD) {
+		requireCapability(sampled == 2 ? spirv::Capability::Image1D : spirv::Capability::Sampled1D);
+	}
+	if (kind == ResourceKind::TextureCubeArray) {
+		requireCapability(spirv::Capability::ImageCubeArray);
+	}
+	return _builder.emitDecl(spirv::OpTypeImage, { scalar(sampledType),
+		cube ? spirv::Dim::Cube : kind == ResourceKind::Texture3D ? spirv::Dim::Dim3D
+			: oneD ? spirv::Dim::Dim1D : spirv::Dim::Dim2D,
+		sampled == 2 ? 0u : 2u, arrayed ? 1u : 0u, 0u, sampled,
+		static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
+}
+
 Id TypeTable::image(ResourceKind kind) {
 	Id& cached = _images[kind];
 	if (cached == InvalidId) {
-		const uint32_t dimension = kind == ResourceKind::TextureCube ? spirv::Dim::Cube
-			: kind == ResourceKind::Texture3D ? spirv::Dim::Dim3D
-			: kind == ResourceKind::Texture1D ? spirv::Dim::Dim1D : spirv::Dim::Dim2D;
-		if (kind == ResourceKind::Texture1D) {
-			_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Sampled1D) });
-		}
-		const uint32_t arrayed = kind == ResourceKind::Texture2DArray ? 1u : 0u;
-		cached = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::Float),
-			dimension, 2u, arrayed, 0u, 1u,
-			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
+		cached = imageOf(kind, ScalarKind::Float, 1u);
 	}
 
 	return cached;
@@ -1389,16 +1406,7 @@ Id TypeTable::storageImage(ResourceKind kind, TextureAccess access, ScalarKind e
 	}
 	Id& cached = _storageImages[{ kind, element }];
 	if (cached == InvalidId) {
-		const uint32_t dimension = kind == ResourceKind::Texture3D ? spirv::Dim::Dim3D
-			: kind == ResourceKind::TextureCube ? spirv::Dim::Cube
-			: kind == ResourceKind::Texture1D ? spirv::Dim::Dim1D : spirv::Dim::Dim2D;
-		if (kind == ResourceKind::Texture1D && !_image1DDeclared) {
-			_image1DDeclared = true;
-			_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Image1D) });
-		}
-		cached = _builder.emitDecl(spirv::OpTypeImage, { scalar(element),
-			dimension, 0u, kind == ResourceKind::Texture2DArray ? 1u : 0u, 0u, 2u,
-			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
+		cached = imageOf(kind, element, 2u);
 	}
 	return cached;
 }
@@ -2383,6 +2391,7 @@ namespace {
 		bool _imageQueryDeclared = false;
 		bool _gatherExtendedDeclared = false;
 		bool _minLodDeclared = false;
+		std::map<int32_t, Id> _intConstants;
 		bool _sampleRateShadingDeclared = false;
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
@@ -2539,6 +2548,10 @@ namespace {
 		const Binding& samplerArgument(const Expression& argument, ResourceKind kind, const std::string& callName);
 		Id samplingCoordinate(const Expression& coordinate, ResourceKind kind, const Expression* layer, const std::string& callName);
 		Id emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component);
+		Id literalOffset(const Expression& expression, uint32_t width);
+		Id layerIndex(const Expression& layer, const std::string& callName);
+		Id appendLayers(Id coordinate, ResourceKind kind, const std::vector<ExpressionPtr>& arguments, size_t first,
+			const std::string& callName);
 		Id appendArrayLayer(Id coordinate, ScalarKind component, const Expression& layer,
 			const std::string& callName);
 		Id texturePixels(const Binding& texture, Id sampled);
@@ -9787,7 +9800,17 @@ namespace {
 		return it->second;
 	}
 
-	static bool storageLayered(ResourceKind kind);
+	static bool isArrayKind(ResourceKind kind) {
+		return kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture1DArray
+			|| kind == ResourceKind::TextureCubeArray;
+	}
+	static bool isCubeKind(ResourceKind kind) {
+		return kind == ResourceKind::TextureCube || kind == ResourceKind::TextureCubeArray;
+	}
+	static bool isOneDimensional(ResourceKind kind) {
+		return kind == ResourceKind::Texture1D || kind == ResourceKind::Texture1DArray;
+	}
+	static size_t layerArguments(ResourceKind kind);
 	static uint32_t storageCoordinateWidth(ResourceKind kind);
 
 	// write(value, coordinate [, layer]) in statement position, on an access::write or
@@ -9804,19 +9827,19 @@ namespace {
 				"access::write or access::read_write");
 		}
 		const ResourceKind kind = texture.pointeeMsl.resource;
-		const bool layered = storageLayered(kind);
+		const size_t layers = layerArguments(kind);
 		const uint32_t width = storageCoordinateWidth(kind);
 		const std::string suffix = width == 1 ? std::string() : std::to_string(width);
 		const ScalarKind element = texture.pointeeMsl.scalar;
 		const ScalarKind sampled = textureSampledKind(element);
 		const std::string takes = std::string("texture write takes exactly ") + (element == ScalarKind::Int ? "an " : "a ") + scalarKindName(element)
 			+ "4 or a number and a uint" + suffix + " or ushort" + suffix + " coordinate"
-			+ (layered ? (kind == ResourceKind::TextureCube ? " and a face" : " and a layer") : "");
-		if (call.arguments.size() == (layered ? 4u : 3u)) {
+			+ (layers == 2 ? " and a face and an array index" : layers == 1 ? (kind == ResourceKind::TextureCube ? " and a face" : " and a layer") : "");
+		if (call.arguments.size() == 3 + layers) {
 			throw CompileError("mip arguments are unsupported on access::" + std::string(textureAccessName(access))
 				+ " textures; write takes only a value, a coordinate and a layer where the texture has one");
 		}
-		if (call.arguments.size() != (layered ? 3u : 2u)) {
+		if (call.arguments.size() != 2 + layers) {
 			throw CompileError(takes);
 		}
 		const Id value = emitExpression(*call.arguments[0]);
@@ -9831,9 +9854,7 @@ namespace {
 			throw CompileError(takes);
 		}
 		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, width));
-		if (layered) {
-			coordinate = appendArrayLayer(coordinate, ScalarKind::UInt, *call.arguments[2], "write");
-		}
+		coordinate = appendLayers(coordinate, kind, call.arguments, 2, "write");
 		// The image's sampled type is the 32-bit type of the element, and a number is
 		// narrowed to the element type before it is widened to it and put in every
 		// channel, so a half or short texture stores the value rounded to its own type.
@@ -9858,7 +9879,7 @@ namespace {
 		}
 		const bool sized = method == "get_width" || method == "get_height"
 			|| (method == "get_depth" && kind == ResourceKind::Texture3D)
-			|| (method == "get_array_size" && kind == ResourceKind::Texture2DArray);
+			|| (method == "get_array_size" && isArrayKind(kind));
 		if (access == TextureAccess::Write && !sized) {
 			throw CompileError("write-only textures lower only the size queries and statement "
 				"write(value, coordinate); \"" + method + "\" is not lowered yet");
@@ -9884,33 +9905,34 @@ namespace {
 			}
 			return _builder.emitTyped(spirv::OpImageQueryLevels, _uintType, { loadFrom(texture.id, texture.pointeeType) });
 		}
-		if (method == "get_height" && kind == ResourceKind::Texture1D) {
-			throw CompileError("a texture1d has no get_height; it is one texel high");
+		if (method == "get_height" && isOneDimensional(kind)) {
+			throw CompileError(std::string("a ") + resourceKindName(kind) + " has no get_height; it is one texel high");
 		}
 		if (method == "get_width" || method == "get_height") {
 			return emitTextureSize(call, texture,
 				method == "get_width" ? SizeComponent::Width : SizeComponent::Height);
 		}
-		if (method == "read" && (access != TextureAccess::Sample || kind != ResourceKind::TextureCube)) {
+		if (method == "read" && (access != TextureAccess::Sample || !isCubeKind(kind))) {
 			return emitTextureRead(call, texture);
-		}
-		if (kind == ResourceKind::TextureCube) {
-			throw CompileError("the texturecube method \"" + method + "\" is not lowered yet; mslc "
-				"lowers sample, get_width and get_height on a texturecube");
 		}
 		if (method == "get_depth" && kind == ResourceKind::Texture3D) {
 			return emitTextureSize(call, texture, SizeComponent::Depth);
 		}
-		if (method == "get_array_size" && kind == ResourceKind::Texture2DArray) {
+		if (method == "get_array_size" && isArrayKind(kind)) {
 			if (!call.arguments.empty()) {
 				throw CompileError("get_array_size takes no arguments; the layer count has no mip level");
 			}
 			return emitTextureSize(call, texture, SizeComponent::ArraySize);
 		}
 
+		if (isCubeKind(kind)) {
+			throw CompileError(std::string("the ") + resourceKindName(kind) + " method \"" + method
+				+ "\" is not lowered yet; mslc lowers sample, gather, get_width and get_height on a cube "
+				"and get_array_size on a cube array");
+		}
 		throw CompileError("the texture method \"" + method + "\" is not lowered yet; mslc lowers "
-			"sample, read, get_width, get_height, get_depth on a texture3d and get_array_size on a "
-			"texture2d_array");
+			"sample, read, get_width, get_height, get_depth on a texture3d and get_array_size on an "
+			"array texture");
 	}
 
 	// The components of the coordinate argument of sample and read on an image of
@@ -9920,6 +9942,8 @@ namespace {
 	static uint32_t textureCoordinateWidth(ResourceKind kind) {
 		switch (kind) {
 			case ResourceKind::Texture1D: return 1;
+			case ResourceKind::Texture1DArray: return 1;
+			case ResourceKind::TextureCubeArray: return 3;
 			case ResourceKind::Texture2D: return 2;
 			case ResourceKind::Texture2DArray: return 2;
 			case ResourceKind::TextureCube: return 3;
@@ -9940,35 +9964,95 @@ namespace {
 	}
 
 	// A cube storage image keeps the cube view type, but is read and written by texel
-	// and face: a uint2 and a face in Metal, a three-component coordinate in SPIR-V.
-	static bool storageLayered(ResourceKind kind) {
-		return kind == ResourceKind::Texture2DArray || kind == ResourceKind::TextureCube;
+	// and face: a uint2 and a face in Metal (a cube array adds the array index), a
+	// three-component coordinate in SPIR-V.
+	static size_t layerArguments(ResourceKind kind) {
+		return kind == ResourceKind::TextureCubeArray ? 2
+			: kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture1DArray || kind == ResourceKind::TextureCube ? 1 : 0;
 	}
 
 	static uint32_t storageCoordinateWidth(ResourceKind kind) {
-		return kind == ResourceKind::TextureCube ? 2 : textureCoordinateWidth(kind);
+		return isCubeKind(kind) ? 2 : textureCoordinateWidth(kind);
 	}
 
 	static uint32_t textureSizeWidth(ResourceKind kind) {
-		return kind == ResourceKind::Texture2DArray ? 3
+		return kind == ResourceKind::Texture1DArray ? 2
+			: kind == ResourceKind::Texture2DArray || kind == ResourceKind::TextureCubeArray ? 3
 			: kind == ResourceKind::TextureCube ? 2 : textureCoordinateWidth(kind);
 	}
 
 	// A texture2d_array coordinate of `component` with its layer appended as the
 	// last component, which is where an arrayed image instruction takes it. The
 	// layer is a uint in Metal, so an int wraps to uint before a sample sees it.
-	Id Emitter::appendArrayLayer(Id coordinate, ScalarKind component, const Expression& layer,
-		const std::string& callName) {
+	Id Emitter::layerIndex(const Expression& layer, const std::string& callName) {
 		const Id value = emitExpression(layer);
 		const Id valueType = _builder.typeOf(value);
 		if (_types.vectorWidth(valueType) != 1 || _types.isFloat(valueType) || _types.bitWidth(valueType) < 8) {
 			throw CompileError("the array index of " + callName + " has to be an integer");
 		}
 
-		const Id index = convert(value, valueType, _uintType);
+		return convert(value, valueType, _uintType);
+	}
+
+	Id Emitter::appendArrayLayer(Id coordinate, ScalarKind component, const Expression& layer,
+		const std::string& callName) {
+		const Id index = layerIndex(layer, callName);
 		return _builder.emitTyped(spirv::OpCompositeConstruct,
 			_types.vector(component, _types.vectorWidth(_builder.typeOf(coordinate)) + 1),
 			{ coordinate, convert(index, _uintType, _types.scalar(component)) });
+	}
+
+	// The integer coordinate of read and write with the arguments that follow it, a
+	// layer or a face, appended. A cube array takes a face and an array index, which
+	// SPIR-V has as the one layer-face 6 * index + face.
+	Id Emitter::appendLayers(Id coordinate, ResourceKind kind, const std::vector<ExpressionPtr>& arguments,
+		size_t first, const std::string& callName) {
+		const size_t layers = layerArguments(kind);
+		if (layers == 0) {
+			return coordinate;
+		}
+		if (layers == 1) {
+			return appendArrayLayer(coordinate, ScalarKind::UInt, *arguments[first], callName);
+		}
+		const Id face = layerIndex(*arguments[first], callName);
+		const Id index = layerIndex(*arguments[first + 1], callName);
+		const Id layerFace = _builder.emitTyped(spirv::OpIAdd, _uintType,
+			{ _builder.emitTyped(spirv::OpIMul, _uintType, { index, constantU32(6) }), face });
+		return _builder.emitTyped(spirv::OpCompositeConstruct,
+			_types.vector(ScalarKind::UInt, _types.vectorWidth(_builder.typeOf(coordinate)) + 1), { coordinate, layerFace });
+	}
+
+	static bool literalInteger(const Expression& expression, int32_t& value);
+
+	// A texel offset written as an int vector of integer literals, as the OpConstantComposite
+	// ConstOffset takes, or InvalidId for any other expression. Vulkan guarantees offsets of
+	// -8 to 7 only, which is Metal's documented range, so a literal beyond it is refused.
+	Id Emitter::literalOffset(const Expression& expression, uint32_t width) {
+		const bool shape = expression.kind == ExpressionKind::Construct && expression.constructType
+			&& expression.constructType->scalar == ScalarKind::Int && expression.constructType->vectorWidth == width
+			&& (expression.arguments.size() == width || expression.arguments.size() == 1);
+		if (!shape) {
+			return InvalidId;
+		}
+		std::vector<uint32_t> parts;
+		for (const ExpressionPtr& argument: expression.arguments) {
+			int32_t value = 0;
+			if (!literalInteger(*argument, value)) {
+				return InvalidId;
+			}
+			if (value < -8 || value > 7) {
+				throw CompileError("the texel offset " + std::to_string(value) + " is outside -8 to 7, the range Vulkan "
+					"guarantees and Metal documents");
+			}
+			auto cached = _intConstants.find(value);
+			if (cached == _intConstants.end()) {
+				cached = _intConstants.emplace(value,
+					_builder.emitDeclTyped(spirv::OpConstant, _intType, { static_cast<uint32_t>(value) })).first;
+			}
+			parts.push_back(cached->second);
+		}
+		parts.resize(width, parts.front());
+		return _builder.emitDeclTyped(spirv::OpConstantComposite, _types.vector(ScalarKind::Int, width), parts);
 	}
 
 	// The sampler a sample or gather names as its first argument. A coord::pixel sampler
@@ -10015,14 +10099,14 @@ namespace {
 
 	// gather(sampler, coordinate [, array index] [, int2 offset] [, component::x..w]): the
 	// four texels of a 2x2 footprint at one channel, as OpImageGather. The offset is a
-	// texture2d and texture2d_array argument; it takes a runtime value here, which
-	// needs ImageGatherExtended. A coord::pixel sampler is refused.
+	// texture2d and texture2d_array argument; a literal one is ConstOffset, any other an
+	// Offset operand, which needs ImageGatherExtended. A coord::pixel sampler is refused.
 	Id Emitter::emitTextureGather(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
 		const ResourceKind kind = texture.pointeeMsl.resource;
-		const bool arrayed = kind == ResourceKind::Texture2DArray;
+		const bool arrayed = kind == ResourceKind::Texture2DArray || kind == ResourceKind::TextureCubeArray;
 		if (kind != ResourceKind::Texture2D && kind != ResourceKind::TextureCube && !arrayed) {
-			throw CompileError(std::string("gather is defined on texture2d, texture2d_array and texturecube; ")
+			throw CompileError(std::string("gather is defined on texture2d, texture2d_array, texturecube and texturecube_array; ")
 				+ resourceKindName(kind) + " has none");
 		}
 		const size_t fixed = arrayed ? 3 : 2;
@@ -10038,6 +10122,7 @@ namespace {
 		const Id coordinate = samplingCoordinate(*arguments[1], kind, arrayed ? arguments[2].get() : nullptr, "gather");
 
 		Id offset = InvalidId;
+		bool constantOffset = false;
 		uint32_t component = 0;
 		bool componentSeen = false;
 		for (size_t i = fixed; i < arguments.size(); ++i) {
@@ -10050,22 +10135,25 @@ namespace {
 			if (isComponent) {
 				const auto found = std::string("xyzw").find(tail);
 				// Apple takes the component only after the offset, where there is one.
-				if (componentSeen || i != (kind == ResourceKind::TextureCube ? fixed : fixed + 1)
+				if (componentSeen || i != (isCubeKind(kind) ? fixed : fixed + 1)
 					|| tail.size() != 1 || found == std::string::npos) {
 					throw CompileError("gather takes one component::x, y, z or w, after the offset where the texture has one");
 				}
 				component = static_cast<uint32_t>(found);
 				componentSeen = true;
-			} else if (i == fixed && kind != ResourceKind::TextureCube) {
-				const Id value = emitExpression(argument);
-				const Id type = _builder.typeOf(value);
-				if (_types.vectorWidth(type) != 2 || _types.isFloat(type)) {
-					throw CompileError("the offset of gather has to be an int2");
+			} else if (i == fixed && !isCubeKind(kind)) {
+				offset = literalOffset(argument, 2);
+				if (offset != InvalidId) {
+					constantOffset = true;
+				} else {
+					offset = emitExpression(argument);
+					if (_builder.typeOf(offset) != _types.vector(ScalarKind::Int, 2)) {
+						throw CompileError("the offset of gather has to be an int2");
+					}
 				}
-				offset = convert(value, type, _types.vector(ScalarKind::Int, 2));
 			} else {
-				throw CompileError(std::string("gather takes ") + (kind == ResourceKind::TextureCube
-					? "a sampler, a coordinate and optionally a component; a texturecube has no offset"
+				throw CompileError(std::string("gather takes ") + (isCubeKind(kind)
+					? "a sampler, a coordinate and optionally a component; a cube has no offset"
 					: "a sampler, a coordinate, an optional int2 offset and an optional component"));
 			}
 		}
@@ -10075,7 +10163,10 @@ namespace {
 		const Id combined = _builder.emitTyped(spirv::OpSampledImage, _types.sampledImage(kind),
 			{ image, loadedSampler });
 		std::vector<uint32_t> words { combined, coordinate, constantU32(component) };
-		if (offset != InvalidId) {
+		if (offset != InvalidId && constantOffset) {
+			words.push_back(0x8);  // ConstOffset
+			words.push_back(offset);
+		} else if (offset != InvalidId) {
 			if (!_gatherExtendedDeclared) {
 				_gatherExtendedDeclared = true;
 				_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::ImageGatherExtended) });
@@ -10120,7 +10211,7 @@ namespace {
 	Id Emitter::emitTextureSample(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
 		const ResourceKind kind = texture.pointeeMsl.resource;
-		const bool arrayed = kind == ResourceKind::Texture2DArray;
+		const bool arrayed = isArrayKind(kind);
 		const size_t fixed = arrayed ? 3 : 2;
 		if (arguments.size() < fixed || arguments.size() > fixed + 3) {
 			throw CompileError(std::string("sample takes a sampler, a coordinate")
@@ -10131,9 +10222,9 @@ namespace {
 		const Binding& sampler = samplerArgument(*arguments[0], kind, "sample");
 		const Id coordinate = samplingCoordinate(*arguments[1], kind, arrayed ? arguments[2].get() : nullptr, "sample");
 
-		if (kind == ResourceKind::Texture1D && arguments.size() > fixed) {
-			throw CompileError("a texture1d samples with a sampler and a coordinate only; a sample option "
-				"such as level(lod) is not accepted on it");
+		if (isOneDimensional(kind) && arguments.size() > fixed) {
+			throw CompileError(std::string("a ") + resourceKindName(kind) + " samples with a sampler and a coordinate only; "
+				"a sample option such as level(lod) is not accepted on it");
 		}
 
 		const Id floatType = _types.scalar(ScalarKind::Float);
@@ -10148,9 +10239,9 @@ namespace {
 			}
 			return convert(value, valueType, floatType);
 		};
-		const uint32_t gradientWidth = kind == ResourceKind::Texture3D || kind == ResourceKind::TextureCube ? 3 : 2;
+		const uint32_t gradientWidth = kind == ResourceKind::Texture3D || isCubeKind(kind) ? 3 : 2;
 		const std::string gradientName = kind == ResourceKind::Texture3D ? "gradient3d"
-			: kind == ResourceKind::TextureCube ? "gradientcube" : "gradient2d";
+			: isCubeKind(kind) ? "gradientcube" : "gradient2d";
 
 		Id lod = InvalidId, bias = InvalidId, minLod = InvalidId, gradientX = InvalidId, gradientY = InvalidId, offset = InvalidId;
 		int stage = 0;  // the option, then min_lod_clamp, then the offset, in this order
@@ -10191,30 +10282,17 @@ namespace {
 				stage = 2;
 				minLod = scalarArgument(option, "min_lod_clamp");
 			} else {
-				if (stage > 2 || offset != InvalidId || kind == ResourceKind::TextureCube) {
-					throw CompileError(kind == ResourceKind::TextureCube ? "a texturecube sample takes no offset"
+				if (stage > 2 || offset != InvalidId || isCubeKind(kind)) {
+					throw CompileError(isCubeKind(kind) ? "a cube sample takes no offset"
 						: "the sample argument after the offset is not lowered");
 				}
 				stage = 3;
 				const uint32_t offsetWidth = kind == ResourceKind::Texture3D ? 3 : 2;
-				std::vector<uint32_t> parts;
-				const bool shape = option.kind == ExpressionKind::Construct && option.constructType
-					&& option.constructType->scalar == ScalarKind::Int && option.constructType->vectorWidth == offsetWidth
-					&& (option.arguments.size() == offsetWidth || option.arguments.size() == 1);
-				for (size_t k = 0; shape && k < option.arguments.size(); ++k) {
-					int32_t value = 0;
-					if (!literalInteger(*option.arguments[k], value)) {
-						parts.clear();
-						break;
-					}
-					parts.push_back(_builder.emitDeclTyped(spirv::OpConstant, _intType, { static_cast<uint32_t>(value) }));
-				}
-				if (parts.empty()) {
+				offset = literalOffset(option, offsetWidth);
+				if (offset == InvalidId) {
 					throw CompileError("the offset of sample has to be written as an int" + std::to_string(offsetWidth)
 						+ " of integer literals: Vulkan takes a constant texel offset");
 				}
-				parts.resize(offsetWidth, parts.front());
-				offset = _builder.emitDeclTyped(spirv::OpConstantComposite, _types.vector(ScalarKind::Int, offsetWidth), parts);
 			}
 		}
 
@@ -10305,8 +10383,9 @@ namespace {
 		const auto& arguments = call.arguments;
 		const ResourceKind kind = texture.pointeeMsl.resource;
 		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample;
-		const bool arrayed = storage ? storageLayered(kind) : kind == ResourceKind::Texture2DArray;
-		const size_t fixed = arrayed ? 2 : 1;
+		const size_t layers = storage ? layerArguments(kind) : isArrayKind(kind) ? 1 : 0;
+		const bool arrayed = layers > 0;
+		const size_t fixed = 1 + layers;
 		if (storage && arguments.size() == fixed + 1) {
 			throw CompileError(std::string("mip arguments are unsupported on access::")
 				+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures; read takes only a coordinate");
@@ -10328,9 +10407,8 @@ namespace {
 			throw CompileError("the coordinate of read has to be a uint" + suffix + " or a ushort" + suffix);
 		}
 		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, width));
-		if (arrayed) {
-			coordinate = appendArrayLayer(coordinate, ScalarKind::UInt, *arguments[1], "read");
-		}
+		coordinate = appendLayers(coordinate, storage ? kind : arrayed ? ResourceKind::Texture2DArray : ResourceKind::Texture2D,
+			arguments, 1, "read");
 
 		if (storage) {
 			const Id storageImage = loadFrom(texture.id, texture.pointeeType);
@@ -10338,10 +10416,10 @@ namespace {
 				_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4), { storageImage, coordinate }));
 		}
 
-		if (texture.pointeeMsl.resource == ResourceKind::Texture1D && arguments.size() == fixed + 1) {
+		if (isOneDimensional(kind) && arguments.size() == fixed + 1) {
 			requireTexture1DLevelZero(*arguments[fixed], "read");
 		}
-		Id lod = arguments.size() == fixed + 1 && texture.pointeeMsl.resource != ResourceKind::Texture1D
+		Id lod = arguments.size() == fixed + 1 && !isOneDimensional(kind)
 			? emitLod(*arguments[fixed], "read") : constantU32(0);
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
@@ -10364,7 +10442,7 @@ namespace {
 				+ std::to_string(call.arguments.size()));
 		}
 
-		const bool oneLevel = texture.pointeeMsl.resource == ResourceKind::Texture1D;
+		const bool oneLevel = isOneDimensional(texture.pointeeMsl.resource);
 		if (oneLevel && !call.arguments.empty()) {
 			requireTexture1DLevelZero(*call.arguments[0], name);
 		}
@@ -10383,7 +10461,9 @@ namespace {
 		if (texture.pointeeMsl.resource == ResourceKind::Texture1D) {
 			return size;
 		}
-		return _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { size, static_cast<uint32_t>(component) });
+		const uint32_t index = component == SizeComponent::ArraySize && texture.pointeeMsl.resource == ResourceKind::Texture1DArray
+			? 1u : static_cast<uint32_t>(component);
+		return _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { size, index });
 	}
 
 	// A mip level argument: any number, converted to the uint the instruction takes.

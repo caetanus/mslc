@@ -30,6 +30,8 @@ const char* resourceKindName(ResourceKind kind) {
 		case ResourceKind::TextureCube: return "texturecube";
 		case ResourceKind::Texture3D: return "texture3d";
 		case ResourceKind::Texture2DArray: return "texture2d_array";
+		case ResourceKind::Texture1DArray: return "texture1d_array";
+		case ResourceKind::TextureCubeArray: return "texturecube_array";
 		case ResourceKind::Sampler: return "sampler";
 	}
 
