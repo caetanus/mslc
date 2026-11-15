@@ -4715,6 +4715,7 @@ namespace {
 					? _builder.emitTyped(spirv::OpLogicalNot, type, { operand })
 					: _builder.emitTyped(spirv::OpLogicalNot, _boolType, { asCondition(operand) });
 			case UnaryOperator::BitNot:
+				if (_types.isFloat(type)) { throw CompileError("operator ~ needs an integer operand"); }
 				return _builder.emitTyped(spirv::OpNot, type, { operand });
 			default:
 				throw CompileError("++ and -- are lowered only as a statement or a for-loop "
