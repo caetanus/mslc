@@ -3060,8 +3060,8 @@ namespace {
 		// of its own to load, and loading it wrote an OpLoad of id 0.
 		if (binding.bufferPointeeType != InvalidId) {
 			if (binding.isBuffer) {
-				throw CompileError("the buffer \"" + expression.name + "\" is used as a value, "
-					"which is not lowered yet");
+				throw CompileError("the buffer \"" + expression.name + "\" is used as a value (a comparison, a conversion "
+					"to bool or a copy); mslc does not lower pointer values yet");
 			}
 
 			// A reference parameter names the one value its buffer holds, so its

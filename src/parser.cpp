@@ -4764,8 +4764,23 @@ ExpressionPtr Parser::parsePrimary() {
 	// mslc lowers no string type, so a string in expression position is a
 	// rejection. Naming it as one is the whole point: read as a name, it
 	// reported a failed lookup for an identifier spelled with quotes.
+	// Deliberate limit (known-issues.md): char pointers, char arrays and
+	// bool-from-pointer have no lowered representation.
+	static const char* const kStringLimit = "mslc has no string type, so char pointers, "
+		"char arrays and bool-from-pointer are not lowered";
 	if (at(TokenKind::StringLiteral)) {
-		throw CompileError("a string literal is not lowered; mslc has no string type");
+		throw CompileError(std::string("a string literal is not lowered; ") + kStringLimit);
+	}
+
+	// L"x", u8"x", R"(x)": the lexer reads the prefix as an identifier glued to a string.
+	if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::StringLiteral
+		&& current().text.data() + current().text.size() == lookahead().text.data()) {
+		static const std::string_view prefixes[] = {"L", "u", "U", "u8", "R", "LR", "uR", "UR", "u8R"};
+		for (const std::string_view prefix : prefixes) {
+			if (current().text == prefix) {
+				throw CompileError("a prefixed string literal is not lowered; " + std::string(kStringLimit));
+			}
+		}
 	}
 
 	if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Less) {

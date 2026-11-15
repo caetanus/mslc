@@ -187,3 +187,42 @@ for every function, which mslc does not follow.
   constant lvalue is classified (it never binds a thread reference).
 - An import of an overloaded name is refused, but the plain Linkage name of a function with one
   signature does not tell `f(E)` from `f(int)`: an import of one links to an export of the other.
+
+## String literals, char pointers and pointer-to-bool are rejected on purpose (#156)
+
+Apple's compiler accepts `const constant char *p = "abc"`, `constant char *p = "x"`,
+`bool b = "x"`, `if ("x")`, `sizeof("abc")`, `"abc"[1]`, `"a" "b"`, `u8"abc"`, `R"(abc)"`, `L"x"` as a `bool`, in `sizeof` or as a `wchar_t` pointer
+(only `const constant char *s = L"x"` is rejected there), `static_assert(1, "msg")`,
+and accepts a kernel buffer pointer in a bool context (`bool b = p`, `if (p)`, `!p`; measured
+with `xcrun -sdk macosx metal`). mslc rejects all of them, deliberately. The decision is a
+rejection with a clear diagnostic ("a string literal is not lowered; mslc has no string type,
+so char pointers, char arrays and bool-from-pointer are not lowered"; "a prefixed string
+literal ..."; "the buffer ... is used as a value (a comparison, a conversion to bool or a copy); mslc does not lower pointer values yet"), not an accident.
+
+Why: no corpus shader uses a string literal; a char pointer to one has no SPIR-V
+representation without a constant char array plus a pointer into it; a pointer in a bool
+context would need a null test, and the Logical and PhysicalStorageBuffer addressing mslc
+emits give a pointer no meaningful null.
+
+What accepting them would need: a constant char array lowering (a Private or UniformConstant
+variable with an initializer), a pointer type for `const constant char *` as a value, array
+decay and indexing of a literal, adjacent literal concatenation and `sizeof` folding in the
+parser, prefix and raw-string lexing, and an explicit pointer-to-bool rule for buffer
+pointers (a constant true, or an address compare against zero in PhysicalStorageBuffer64).
+Related and separate: a helper function taking a `constant char *` parameter is refused by
+the helper pointer-parameter limit, not by this one.
+
+Also recorded under this entry, all measured against Apple and all pre-existing:
+
+- `static_assert(1, "msg")` inside a function is rejected with the string-literal wording above,
+  because mslc has no `static_assert` and reads it as a call with a string argument.
+- Raw strings Apple accepts (`R"d(a;b)" c)d"` and a multi-line `R"(...)"`) still fail in the lexer
+  with "newline in a string literal at offset N", so the prefixed-literal message never fires
+  for them; it fires only for a single-line prefixed literal that the lexer keeps whole.
+- Character literals (`'a'`, `u8'a'`, `L'a'`) are not lexed at all ("unexpected character"),
+  although Apple accepts them.
+- A prefix separated by a space (`L "x"`) is an identifier and a literal, and keeps the
+  "expected ; after a declaration" error (Apple rejects it too).
+- The buffer-as-value message ("the buffer ... is used as a value") covers every use of a
+  kernel buffer pointer as a value: a comparison, a conversion to bool, a copy. Apple accepts
+  comparisons and bool tests and rejects `float x = p`; mslc rejects all, with one wording.
