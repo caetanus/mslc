@@ -2306,6 +2306,7 @@ namespace {
 		Id declareGlobalConstant(const VariableDeclaration& declaration);
 		Id emitConstant(const FoldedConstant& folded);
 		std::vector<uint32_t> constantWords(const FoldedConstant& folded);
+		FoldedConstant foldScalarConstruct(const Expression& expression);
 		FoldedConstant foldComparison(BinaryOperator op, FoldedConstant left, FoldedConstant right);
 		FoldedConstant foldInitializer(const Type& type, const Expression& initializer, bool braced = false);
 		void foldStructInitializer(FoldedConstant& folded, const StructDecl& decl,
@@ -6229,12 +6230,48 @@ namespace {
 					}
 					return convertConstant(operand, expression.constructType->scalar);
 				}
-				break;
+				return foldScalarConstruct(expression);
 			default: break;
 		}
 
 		throw CompileError("a constant's initialiser has to be a value that can be worked out "
 			"from the declarations before it, and this is not one");
+	}
+
+	// int(x), float(x) and bool(x) of a scalar constant. A float does not become an
+	// integer here: a value outside the integer's range is undefined, and mslc
+	// folds none of those.
+	FoldedConstant Emitter::foldScalarConstruct(const Expression& expression) {
+		const Type* type = expression.constructType ? &*expression.constructType : nullptr;
+		if (!type || !type->isScalar() || type->isMatrix() || type->isPointer || type->isAtomic
+			|| !type->namedType.empty() || !type->enumName.empty() || expression.arguments.size() != 1) {
+			throw CompileError("a constant's initialiser has to be a value that can be worked out "
+				"from the declarations before it, and this is not one");
+		}
+
+		FoldedConstant folded = foldExpression(*expression.arguments.front());
+		if (folded.isComposite) {
+			throw CompileError("a composite constant cannot be converted to a scalar");
+		}
+
+		const ScalarKind to = type->scalar;
+		if (to == ScalarKind::Bool) {
+			folded.boolean = folded.scalar == ScalarKind::Bool ? folded.boolean
+				: isFloatKind(folded.scalar) ? folded.number != 0.0 : folded.integer != 0;
+			folded.scalar = to;
+			return folded;
+		}
+
+		if (folded.scalar == ScalarKind::Bool) {
+			folded.integer = folded.boolean ? 1 : 0;
+			folded.scalar = ScalarKind::Int;
+		}
+
+		if (isFloatKind(folded.scalar) && !isFloatKind(to)) {
+			throw CompileError("a float is not converted to an integer in a constant");
+		}
+
+		return convertConstant(folded, to);
 	}
 
 	FoldedConstant Emitter::foldUnary(const Expression& expression) {
