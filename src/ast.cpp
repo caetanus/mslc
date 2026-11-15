@@ -36,6 +36,15 @@ const char* resourceKindName(ResourceKind kind) {
 	return "unknown";
 }
 
+ScalarKind textureSampledKind(ScalarKind element) {
+	switch (element) {
+		case ScalarKind::Short: return ScalarKind::Int;
+		case ScalarKind::UShort: return ScalarKind::UInt;
+		case ScalarKind::Half: return ScalarKind::Float;
+		default: return element;
+	}
+}
+
 const char* textureAccessName(TextureAccess access) {
 	switch (access) {
 		case TextureAccess::Sample: return "sample";
