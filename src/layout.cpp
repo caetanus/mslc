@@ -88,4 +88,76 @@ VectorLayout memberLayout(const Type& type) {
 	return layout;
 }
 
+namespace {
+
+// A struct's size and alignment, which a nested member and an array of it both take whole.
+struct TypeLayout {
+	uint64_t size;
+	uint32_t alignment;
+};
+
+TypeLayout layoutOf(const Type& type, const TranslationUnit& unit, unsigned depth);
+
+TypeLayout structLayoutOf(const std::string& name, const TranslationUnit& unit, unsigned depth) {
+	const StructDecl* decl = unit.findStruct(name);
+	if (!decl) {
+		throw CompileError("sizeof of \"" + name + "\", which is not a struct this source has declared "
+			"in full");
+	}
+	if (decl->fields.empty()) {
+		throw CompileError("sizeof of the struct \"" + name + "\", which has no members; mslc does not "
+			"size an empty struct");
+	}
+	if (depth > 32) {
+		throw CompileError("sizeof of \"" + name + "\" nests structs too deeply");
+	}
+
+	uint64_t offset = 0;
+	uint32_t alignment = 1;
+	for (const StructField& field: decl->fields) {
+		const TypeLayout member = layoutOf(field.type, unit, depth + 1);
+		offset = (offset + member.alignment - 1) / member.alignment * member.alignment + member.size;
+		alignment = std::max(alignment, member.alignment);
+	}
+	return { (offset + alignment - 1) / alignment * alignment, alignment };
+}
+
+TypeLayout layoutOf(const Type& type, const TranslationUnit& unit, unsigned depth) {
+	if (type.resource != ResourceKind::None) {
+		throw CompileError("sizeof of a texture or sampler, which has no size mslc knows");
+	}
+
+	TypeLayout element{ 0, 1 };
+	if (type.isPointer) {
+		element = { 8, 8 };
+	} else if (!type.namedType.empty()) {
+		element = structLayoutOf(type.namedType, unit, depth);
+	} else if (type.scalar == ScalarKind::Void) {
+		throw CompileError("sizeof of void");
+	} else {
+		const VectorLayout vector = elementLayout(type);
+		element = { vector.size, vector.alignment };
+	}
+
+	// An array steps by its element's size, which already ends on its alignment.
+	uint64_t size = element.size;
+	if (type.arrayLength) {
+		std::vector<uint32_t> lengths{ *type.arrayLength };
+		lengths.insert(lengths.end(), type.innerArrayLengths.begin(), type.innerArrayLengths.end());
+		for (const uint32_t length: lengths) {
+			if (length != 0 && size > (uint64_t(1) << 62) / length) {
+				throw CompileError("sizeof of an array too large to count");
+			}
+			size *= length;
+		}
+	}
+	return { size, element.alignment };
+}
+
+}
+
+uint64_t sizeofType(const Type& type, const TranslationUnit& unit) {
+	return layoutOf(type, unit, 0).size;
+}
+
 }

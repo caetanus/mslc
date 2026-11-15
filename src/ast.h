@@ -277,6 +277,9 @@ struct Expression {
 	// Written with an `h` suffix: the literal is a half, not a float.
 	bool floatIsHalf = false;
 	bool boolValue = false;
+	// IntLiteral: a ulong that sizeof gave, so a constant expression knows its value is
+	// unsigned and does not let it wrap as a signed one would.
+	bool isSizeof = false;
 
 	// Identifier, Member, Index, Call
 	std::string name;

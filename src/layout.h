@@ -30,4 +30,10 @@ VectorLayout elementLayout(const Type& type);
 std::vector<uint32_t> arrayStrides(const Type& type);
 VectorLayout memberLayout(const Type& type);
 
+// What sizeof gives a type: its size with Metal's alignment and tail padding, a struct as
+// big as its members laid out in order rounded up to its own alignment, a pointer 8 bytes.
+// Throws a CompileError for a type with no size here (a texture or sampler, an empty or
+// undeclared struct, void), so a refusal stands in for a guess.
+uint64_t sizeofType(const Type& type, const TranslationUnit& unit);
+
 }

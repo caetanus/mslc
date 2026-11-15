@@ -453,6 +453,7 @@ private:
 	ExpressionPtr parseAdditive();
 	ExpressionPtr parseMultiplicative();
 	ExpressionPtr parseUnary();
+	ExpressionPtr parseSizeof();
 	ExpressionPtr parsePostfix();
 	ExpressionPtr parsePrimary();
 

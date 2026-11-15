@@ -1,6 +1,7 @@
 #include <cmath>
 #include <limits>
 #include "parser.h"
+#include "layout.h"
 
 #include <algorithm>
 #include <climits>
@@ -3246,6 +3247,53 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 	return tag;
 }
 
+// Whether a sizeof is anywhere in a constant expression, which makes the operation around it
+// unsigned.
+static bool containsSizeof(const Expression& expression) {
+	if (expression.kind == ExpressionKind::IntLiteral) {
+		return expression.isSizeof;
+	}
+	if (expression.kind == ExpressionKind::Construct) {
+		// A cast to a type no wider than an int gives an int, which wraps nothing.
+		const ScalarKind target = expression.constructType ? expression.constructType->scalar : ScalarKind::Int;
+		return (target == ScalarKind::UInt || target == ScalarKind::ULong)
+			&& expression.arguments.size() == 1 && containsSizeof(*expression.arguments.front());
+	}
+	return (expression.left && containsSizeof(*expression.left))
+		|| (expression.right && containsSizeof(*expression.right));
+}
+
+// Whether a sizeof is anywhere under an expression, through casts of any type.
+static bool mentionsSizeof(const Expression& expression) {
+	if (expression.kind == ExpressionKind::IntLiteral) {
+		return expression.isSizeof;
+	}
+	for (const ExpressionPtr& argument: expression.arguments) {
+		if (mentionsSizeof(*argument)) {
+			return true;
+		}
+	}
+	return (expression.left && mentionsSizeof(*expression.left))
+		|| (expression.right && mentionsSizeof(*expression.right));
+}
+
+// The range an integer type holds, for a cast of a constant to it. Nothing for a type that is not
+// an integer one.
+static bool integerRange(ScalarKind kind, int64_t& low, int64_t& high) {
+	low = 0;
+	switch (kind) {
+		case ScalarKind::Char: low = INT8_MIN; high = INT8_MAX; return true;
+		case ScalarKind::UChar: high = UINT8_MAX; return true;
+		case ScalarKind::Short: low = INT16_MIN; high = INT16_MAX; return true;
+		case ScalarKind::UShort: high = UINT16_MAX; return true;
+		case ScalarKind::Int: low = INT_MIN; high = INT_MAX; return true;
+		case ScalarKind::UInt: high = UINT32_MAX; return true;
+		case ScalarKind::Long: low = INT64_MIN; high = INT64_MAX; return true;
+		case ScalarKind::ULong: high = INT64_MAX; return true;
+		default: return false;
+	}
+}
+
 // Folds the integer constant expressions an enumerator, an attribute index or an
 // array length may be. Every step is held to what an int holds, so a result that
 // would wrap is an error here, and that is narrower than Apple's compiler, which
@@ -3262,6 +3310,11 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 
 	switch (expression.kind) {
 		case ExpressionKind::IntLiteral:
+			// A sizeof is a ulong, which unsigned arithmetic would wrap but this does not, so
+			// the operators below refuse the one case where a signed result differs.
+			if (expression.isSizeof) {
+				return fit(static_cast<int64_t>(expression.intValue));
+			}
 			if (nested && (expression.intKind == ScalarKind::UInt || expression.intKind == ScalarKind::ULong
 				|| expression.intValue > INT_MAX)) {
 				throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
@@ -3281,6 +3334,11 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 			return namedConstantValue(expression, nested, attribute);
 		case ExpressionKind::Unary: {
 			const int64_t operand = evaluateConstant(*expression.left, true, attribute);
+			if ((expression.unaryOperator == UnaryOperator::Negate || expression.unaryOperator == UnaryOperator::BitNot)
+				&& containsSizeof(*expression.left)) {
+				throw CompileError("a sizeof is unsigned, and negating or complementing it wraps; "
+					"a constant expression that does so is not supported");
+			}
 			switch (expression.unaryOperator) {
 				case UnaryOperator::Negate: return fit(-operand);
 				case UnaryOperator::Plus: return operand;
@@ -3303,6 +3361,13 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 			}
 
 			const int64_t right = evaluateConstant(*expression.right, true, attribute);
+			// A sizeof makes the operation unsigned, so a negative operand converts to a huge one
+			// and a negative result wraps; neither is modelled, and neither is guessed at.
+			if ((containsSizeof(*expression.left) || containsSizeof(*expression.right))
+				&& (left < 0 || right < 0 || (expression.binaryOperator == BinaryOperator::Subtract && left < right))) {
+				throw CompileError("a constant expression that mixes sizeof with a negative value or "
+					"subtracts below zero would wrap as an unsigned one, which is not supported");
+			}
 			switch (expression.binaryOperator) {
 				case BinaryOperator::Add: return fit(left + right);
 				case BinaryOperator::Subtract: return fit(left - right);
@@ -3333,6 +3398,25 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 				case BinaryOperator::LogicalOr: return left != 0 || right != 0;
 			}
 			break;
+		}
+		case ExpressionKind::Construct: {
+			// A cast is only taken of a sizeof, which is the one ulong an attribute index or an array
+			// length is written from; (uint)sizeof(S) and int(sizeof(S)) hold the same value.
+			int64_t low = 0;
+			int64_t high = 0;
+			if (expression.arguments.size() != 1 || !mentionsSizeof(*expression.arguments.front())
+				|| !expression.constructType || expression.constructType->isPointer
+				|| expression.constructType->arrayLength || !expression.constructType->isScalar()
+				|| !expression.constructType->namedType.empty() || !expression.constructType->enumName.empty()
+				|| !integerRange(expression.constructType->scalar, low, high)) {
+				break;
+			}
+			const int64_t operand = evaluateConstant(*expression.arguments.front(), nested, attribute);
+			if (operand < low || operand > high) {
+				throw CompileError("a cast of a constant to a type that cannot hold it wraps, which is "
+					"not supported");
+			}
+			return operand;
 		}
 		default:
 			break;
@@ -3457,6 +3541,12 @@ static bool isSixtyFourBit(const Expression& expression) {
 			return expression.intKind == ScalarKind::Long || expression.intKind == ScalarKind::ULong;
 		case ExpressionKind::Unary:
 			return isSixtyFourBit(*expression.left);
+		case ExpressionKind::Construct:
+			if (expression.constructType && expression.constructType->isScalar() && !expression.constructType->isPointer) {
+				return expression.constructType->scalar == ScalarKind::Long
+					|| expression.constructType->scalar == ScalarKind::ULong;
+			}
+			return false;
 		case ExpressionKind::Binary: {
 			const bool isShift = expression.binaryOperator == BinaryOperator::ShiftLeft
 				|| expression.binaryOperator == BinaryOperator::ShiftRight;
@@ -5526,7 +5616,68 @@ ExpressionPtr Parser::parseMultiplicative() {
 		  { TokenKind::Percent, BinaryOperator::Modulo } });
 }
 
+// sizeof(type) is the type's size under Metal's layout, folded here to a ulong literal so every
+// later stage sees a constant. A bare type name and a parenthesised expression both start with
+// "(", so a type is taken only where one can begin and ")" follows it.
+ExpressionPtr Parser::parseSizeof() {
+	const size_t startLine = line();
+	advance();
+
+	if (at(TokenKind::LParen)) {
+		const size_t open = _position;
+		advance();
+
+		size_t nameTokens = 0;
+		Type probe;
+		const std::string name = kind() == TokenKind::Identifier || at(TokenKind::ColonColon)
+			? peekResolved(nameTokens) : std::string();
+		const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
+			&& isLocal(name);
+		const bool inOwnBody = _structBody && name == _structBody->name;
+		const bool startsType = inOwnBody || (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text))
+			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name)
+				&& (resolveTypeName(name, probe) || isTypeQualifier(name) || isResourceTypeName(name)
+					|| (_unit.findStruct(name) != nullptr && !localHidesStruct)))
+			|| atKeyword("device") || atKeyword("constant") || atKeyword("threadgroup") || atKeyword("thread");
+		if (startsType) {
+			Type type = parseType(true, false);
+			// parseType reads the first array length only; float[2][3] has more.
+			while (type.arrayLength && at(TokenKind::LBracket)) {
+				advance();
+				const int64_t length = parseConstantIndex("an array length");
+				if (length <= 0) {
+					throw CompileError("zero-length arrays are not permitted in C++");
+				}
+				type.innerArrayLengths.push_back(static_cast<uint32_t>(length));
+				expect(TokenKind::RBracket, "to close an array length");
+			}
+			if (at(TokenKind::RParen)) {
+				advance();
+				if (_structBody && _structBody->name == type.namedType && !type.isPointer) {
+					throw CompileError("sizeof of the struct \"" + type.namedType + "\" inside its own body, "
+						"where it is incomplete");
+				}
+				auto expression = std::make_unique<Expression>();
+				expression->kind = ExpressionKind::IntLiteral;
+				expression->line = startLine;
+				expression->intKind = ScalarKind::ULong;
+				expression->isSizeof = true;
+				expression->intValue = sizeofType(type, _unit);
+				return expression;
+			}
+		}
+		_position = open;
+	}
+
+	parseUnary();
+	throw CompileError("sizeof of an expression is not lowered yet; write sizeof(<type>)");
+}
+
 ExpressionPtr Parser::parseUnary() {
+	if (atKeyword("sizeof")) {
+		return parseSizeof();
+	}
+
 	// "*this" is the object itself, which a member function holds by value.
 	if (at(TokenKind::Star) && lookahead().kind == TokenKind::Identifier && lookahead().text == "this"
 		&& isLocal("this")) {
