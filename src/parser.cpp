@@ -409,6 +409,12 @@ TranslationUnit Parser::parse() {
 		parseDeclaration();
 	}
 
+	if (!_unit.templates.empty()) {
+		const auto file = std::make_shared<const std::vector<Token>>(_tokens);
+		for (FunctionTemplate& declaration: _unit.templates) {
+			declaration.file = file;
+		}
+	}
 	return std::move(_unit);
 }
 
@@ -827,11 +833,103 @@ void Parser::skipBalanced(TokenKind open, TokenKind close) {
 	throw CompileError("unbalanced brackets in a template declaration");
 }
 
-// "template" at file scope: a function template. It is parsed far enough to know
-// its name and where it ends, and is not lowered. A body is only meaningful with
-// arguments (a dependent name has no type until then), so one that is never
-// instantiated needs nothing more, as in clang; a call to it is refused by the
-// emitter, never resolved to an unrelated overload.
+// The parameters of a template, from the "<" to the ">" that closes them.
+void Parser::parseTemplateHeader(FunctionTemplate& declaration) {
+	expect(TokenKind::Less, "to open a template parameter list");
+	std::set<std::string> names;
+	for (;;) {
+		TemplateParameter parameter;
+		if (atKeyword("template")) {
+			throw CompileError("a template template parameter is not lowered");
+		}
+		if (at(TokenKind::Ellipsis)) {
+			throw CompileError("a template parameter pack is not lowered");
+		}
+		if (atKeyword("typename") || atKeyword("class")) {
+			advance();
+			if (at(TokenKind::Ellipsis)) {
+				throw CompileError("a template parameter pack is not lowered");
+			}
+		} else {
+			// A non-type parameter: an integer or a bool. Any other type (a parameter whose type is
+			// another parameter, an enum, a pointer) is a template mslc does not instantiate.
+			parameter.isType = false;
+			const Type type = parseType();
+			if (!type.namedType.empty() || type.isVector() || type.isMatrix() || type.isPointer || type.arrayLength
+				|| type.resource != ResourceKind::None || !type.enumName.empty() || type.isAtomic || type.isPacked
+				|| type.scalar == ScalarKind::Void || type.scalar == ScalarKind::Half || type.scalar == ScalarKind::Float
+				|| type.scalar == ScalarKind::Double) {
+				throw CompileError("a non-type template parameter of that type is not lowered; mslc takes an "
+					"integer or a bool");
+			}
+			parameter.kind = type.scalar;
+			if (at(TokenKind::Ellipsis)) {
+				throw CompileError("a template parameter pack is not lowered");
+			}
+		}
+		if (kind() == TokenKind::Identifier) {
+			parameter.name = std::string(advance().text);
+			if (!names.insert(parameter.name).second) {
+				throw CompileError("redeclaration of the template parameter \"" + parameter.name + "\"");
+			}
+		}
+		if (match(TokenKind::Assign)) {
+			// The default's tokens, up to the "," or ">" that ends it. A "<" inside it opens a nested
+			// list; the same ">>" is two closers, and one that would close the header too is refused.
+			parameter.hasDefault = true;
+			const size_t first = _position;
+			size_t angles = 0;
+			for (;;) {
+				if (at(TokenKind::EndOfFile)) {
+					throw CompileError("expected '>' to close a template parameter list");
+				}
+				if (at(TokenKind::Less)) {
+					++angles;
+				} else if (at(TokenKind::Greater)) {
+					if (angles == 0) {
+						break;
+					}
+					--angles;
+				} else if (at(TokenKind::ShiftRight)) {
+					if (angles == 0) {
+						throw CompileError("unbalanced '>>' in a template parameter list");
+					}
+					if (angles == 1) {
+						// One '>' closes the default's own list and the other the header's: split the token.
+						_tokens[_position].kind = TokenKind::Greater;
+						_tokens[_position].text = ">";
+						_tokens.insert(_tokens.begin() + _position, _tokens[_position]);
+						continue;
+					}
+					angles -= 2;
+				} else if (at(TokenKind::Comma) && angles == 0) {
+					break;
+				} else if (at(TokenKind::LParen)) {
+					skipBalanced(TokenKind::LParen, TokenKind::RParen);
+					continue;
+				}
+				advance();
+			}
+			parameter.defaultTokens.assign(_tokens.begin() + first, _tokens.begin() + _position);
+			parameter.defaultTokens.emplace_back();
+		}
+		declaration.parameters.push_back(std::move(parameter));
+		if (match(TokenKind::Comma)) {
+			continue;
+		}
+		if (at(TokenKind::Greater)) {
+			advance();
+			return;
+		}
+		throw CompileError("expected '>' to close a template parameter list");
+	}
+}
+
+// "template" at file scope: a function template. It is parsed far enough to know its parameters,
+// its name and where it ends; the tokens and the name state are kept, and a call that selects it
+// has it re-parsed with its arguments bound (instantiateTemplate). A body is only meaningful with
+// arguments (a dependent name has no type until then), so one that is never instantiated needs
+// nothing more, as in clang.
 void Parser::parseTemplateDeclaration() {
 	advance();
 	if (!at(TokenKind::Less)) {
@@ -842,31 +940,10 @@ void Parser::parseTemplateDeclaration() {
 			"mslc refuses it so that the primary template is never silently used in its place");
 	}
 
-	// The parameter list, to its closing '>' at depth one. A default argument may
-	// hold angle brackets of its own, and ">>" closes two of them.
-	size_t templateDepth = 0;
-	do {
-		if (at(TokenKind::Less)) {
-			++templateDepth;
-		} else if (at(TokenKind::Greater)) {
-			--templateDepth;
-		} else if (at(TokenKind::ShiftRight)) {
-			if (templateDepth < 2) {
-				throw CompileError("unbalanced '>>' in a template parameter list");
-			}
-			templateDepth -= 2;
-		} else if (atKeyword("template")) {
-			throw CompileError("a template template parameter is not lowered");
-		} else if (at(TokenKind::Ellipsis)) {
-			throw CompileError("a template parameter pack is not lowered");
-		} else if (at(TokenKind::LParen)) {
-			skipBalanced(TokenKind::LParen, TokenKind::RParen);
-			continue;
-		} else if (at(TokenKind::EndOfFile)) {
-			throw CompileError("expected '>' to close a template parameter list");
-		}
-		advance();
-	} while (templateDepth > 0);
+	FunctionTemplate declaration;
+	declaration.line = line();
+	const size_t headerStart = _position;
+	parseTemplateHeader(declaration);
 
 	if (atKeyword("struct") || atKeyword("class") || atKeyword("union")) {
 		throw CompileError("a class template is not lowered");
@@ -881,6 +958,7 @@ void Parser::parseTemplateDeclaration() {
 	// skipped whole, so their own parentheses are never mistaken for it. Any other shape
 	// (decltype or typeof in the return type, a parenthesised name) cannot be told apart
 	// from it by a rule, so it is refused: a wrong name would let a helper take the call.
+	const size_t declaratorStart = _position;
 	std::string name;
 	size_t angles = 0;
 	for (;;) {
@@ -957,13 +1035,24 @@ void Parser::parseTemplateDeclaration() {
 			advance();
 		}
 	}
-	if (at(TokenKind::LBrace)) {
+	const size_t signatureEnd = _position;
+	declaration.hasBody = at(TokenKind::LBrace);
+	if (declaration.hasBody) {
 		skipBalanced(TokenKind::LBrace, TokenKind::RBrace);
 	} else {
 		advance();
 	}
 
+	for (size_t i = headerStart; i < signatureEnd; ++i) {
+		declaration.signature += std::string(_tokens[i].text) + " ";
+	}
+	declaration.tokens.assign(_tokens.begin() + declaratorStart, _tokens.begin() + _position);
+	declaration.tokens.emplace_back();
+
 	const std::string qualified = qualify(name);
+	declaration.name = qualified;
+	declaration.order = declaration.bodyOrder = _functionOrder++;
+	declaration.globalsBefore = _unit.globals.size();
 	if (const auto kinds = kindsOf(qualified); !kinds.empty() && std::any_of(kinds.begin(), kinds.end(),
 		[](std::string_view kindName) { return kindName != "function"; })) {
 		throw CompileError("the function template \"" + qualified + "\" shares its name with a type or a "
@@ -971,6 +1060,23 @@ void Parser::parseTemplateDeclaration() {
 	}
 	declareName(qualified, "function");
 	_unit.functionTemplates.insert(qualified);
+	declaration.endAt = _position;
+
+	// A prototype and its definition are one template, found at the prototype's place in the file.
+	for (FunctionTemplate& earlier: _unit.templates) {
+		if (earlier.name != qualified || earlier.signature != declaration.signature) {
+			continue;
+		}
+		if (earlier.hasBody && declaration.hasBody) {
+			throw CompileError("redefinition of the function template \"" + qualified + "\"");
+		}
+		if (declaration.hasBody) {
+			declaration.order = earlier.order;
+			earlier = std::move(declaration);
+		}
+		return;
+	}
+	_unit.templates.push_back(std::move(declaration));
 }
 
 bool Parser::tryParseHelperFunction() {

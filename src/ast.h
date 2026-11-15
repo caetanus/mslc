@@ -468,6 +468,42 @@ struct StructDecl {
 	std::vector<StructField> fields;
 };
 
+// A template parameter: a type, or an integer constant of the given type.
+struct TemplateParameter {
+	std::string name;
+	bool isType = true;
+	ScalarKind kind = ScalarKind::Int; // the type of a non-type parameter
+	// The tokens after "=" (ending in an end-of-file token), or none when it has no default.
+	bool hasDefault = false;
+	std::vector<Token> defaultTokens;
+};
+
+// A function template, kept as tokens and the parser's name state where it was declared, so
+// that each instantiation re-parses it with its arguments bound (see instantiateTemplate).
+struct FunctionTemplate {
+	// Qualified, as a call names it.
+	std::string name;
+	std::vector<TemplateParameter> parameters;
+	// The declaration after the "template<...>" header, to the end of its body or ";", and an
+	// end-of-file token.
+	std::vector<Token> tokens;
+	bool hasBody = false;
+	// The header and declarator as one string: a prototype and its definition spell it alike.
+	std::string signature;
+	size_t line = 0;
+	// Where the template is first declared, which is where a call can first use it, and where its
+	// body is: they differ when a prototype comes first. The instances take the second, and
+	// globalsBefore, as FunctionDecl does.
+	size_t order = 0;
+	size_t bodyOrder = 0;
+	size_t globalsBefore = 0;
+	// The parser's name state where the declaration ends is rebuilt, the first time an instance needs it,
+	// by reading the file again up to endAt (copying it for every template is quadratic in the file).
+	std::shared_ptr<const std::vector<Token>> file;
+	size_t endAt = 0;
+	mutable std::shared_ptr<const void> names;
+};
+
 struct FunctionDecl {
 	Stage stage = Stage::None;
 	Type returnType;
@@ -510,11 +546,14 @@ struct TranslationUnit {
 	// The file's helper functions, prototypes and definitions, in source order.
 	std::vector<FunctionDecl> helpers;
 
-	// Qualified names of the function templates the file declares. They are parsed
-	// and not lowered, so the emitter needs the names to refuse a call to one.
+	// Qualified names of the function templates the file declares.
 	std::set<std::string> functionTemplates;
 	// The qualified names of the inline namespaces, which argument-dependent lookup follows outward and inward.
 	std::set<std::string> inlineNamespaces;
+
+	// The function templates themselves, in declaration order. A template is lowered only where
+	// a call instantiates it: instantiateTemplate re-parses its tokens with the arguments bound.
+	std::vector<FunctionTemplate> templates;
 
 	// File-scope declarations, in the order the source declares them. A
 	// "constant" refers to the ones before it, so the order is the meaning.
