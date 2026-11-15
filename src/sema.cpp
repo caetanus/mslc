@@ -11089,6 +11089,21 @@ namespace {
 	void Emitter::emitAssignment(const Expression& left, const Expression& right,
 		std::optional<BinaryOperator> compound) {
 		requireStorable(left);
+		// A struct prvalue takes the trivial assignment: the right side is evaluated first, as
+		// Apple does, then the left, and the result is dropped.
+		if (!compound && (left.kind == ExpressionKind::InitList || left.kind == ExpressionKind::Call)) {
+			const StructDecl* target = structOf(left);
+			if (!target) {
+				throw CompileError("expression is not assignable");
+			}
+			const Id value = emitExpression(right);
+			const std::string* source = _types.structNameOf(_builder.typeOf(value), nullptr);
+			if (!source || *source != target->name) {
+				throw CompileError("no viable overloaded '=' for a " + target->name + " temporary");
+			}
+			emitExpression(left);
+			return;
+		}
 		if (left.kind == ExpressionKind::Identifier) {
 			const auto named = _bindings.find(left.name);
 			if (named != _bindings.end() && named->second.pointeeMsl.arrayLength && !named->second.isBuffer) {
