@@ -351,3 +351,23 @@ Apple accepts `O o{.p.a = 1.0f, .c = 2.0f};` (a designator that names a member o
 member). mslc stops in the parser with "expected = after a field name". This is a
 separate parser limit; the duplicate and reordered single-level designators of #163 are
 supported. Dropped or type-probed initialisers no longer leave dead function locals.
+
+## S{...} temporary forms still refused (#251)
+
+Apple accepts all of these. The first four are refused loudly; the last two change a message only.
+
+- `using T = S; T{1,2}`: every alias declaration is rejected ("a using declaration has to name a
+  member of a namespace"). It needs the parser's using and lookup code; `typedef S T; T{1,2}` works,
+  at statement start too.
+- `sizeof(S{1,2})` and `sizeof(S)`: `sizeof` is not implemented at all, so any use is refused.
+- `S{{1,2},3}.a[1]`, a member of a temporary that is an array: brace-initialising a struct with an
+  array member is not lowered, and indexing a value that is not a named variable is not either.
+- Assigning to a conditional or comma that yields a place, including `(c ? s : t) = S{3,4}`,
+  `(c ? S{1,2} : S{3,4}) = S{3,4}`, `(c ? s : t).a = 9` and a reference bound to a member of one;
+  a store, `++`, reference binding or by-reference argument on such a member is refused with a
+  message that names the conditional or comma. A member of a conditional with an indexed array,
+  read as `(c ? s : t).arr[1]`, says "a member or an index has to start at a name mslc knows".
+- `(&S{1,2})->a`: refused, Apple warns "taking the address of a temporary"; mslc says `&` is not
+  supported.
+- `S{1,2} += S{1,2}` says "no viable overloaded compound assignment", where Apple names the
+  operator (`'+='`).
