@@ -50,10 +50,28 @@ class Fill(unittest.TestCase):
         self.assertEqual(make("moderate")[12], 0)
         self.assertEqual(make("moderate", poison_padding=True)[12], inputs.POISON)
 
-    def test_sentinel_fills_every_byte(self):
+    def test_sentinel_fills_every_byte_but_a_bool_leaf(self):
         data = make("edge", sentinel=True)
-        self.assertEqual(set(data), {0x7f})
         self.assertEqual(len(data), 400 * 16)
+        bool_at = {i * 16 + 8 for i in range(400)}
+        self.assertEqual({b for i, b in enumerate(data) if i not in bool_at}, {0x7f})
+        self.assertEqual({data[i] for i in bool_at}, {0, 1})
+
+    def test_sentinel_honours_a_range(self):
+        data = make("edge", sentinel=True, bounds=(0, 3))
+        self.assertLessEqual({struct.unpack_from("<I", data, i * 16 + 4)[0] for i in range(400)}, {0, 1, 2, 3})
+
+    def test_a_short_edge_run_reaches_every_edge_float(self):
+        data = inputs.fill_buffer(LAYOUT, 120, random.Random(7), "edge")
+        floats = {struct.unpack_from("<I", data, i * 16)[0] for i in range(120)}
+        for want in (0x7fc00000, 0x7f800000, 0xff800000, 0x80000000, 0x7f7fffff,
+                     int.from_bytes(struct.pack("<f", 1e-38), "little"), int.from_bytes(struct.pack("<f", -1e38), "little")):
+            self.assertIn(want, floats, hex(want))
+
+    def test_the_case_number_shifts_the_walk(self):
+        a = inputs.fill_buffer(LAYOUT, 3, random.Random(1), "edge", phase=0)
+        b = inputs.fill_buffer(LAYOUT, 3, random.Random(1), "edge", phase=5)
+        self.assertNotEqual(a, b)
 
 
 class Bounds(unittest.TestCase):
@@ -80,6 +98,10 @@ class Directives(unittest.TestCase):
     def test_empty_range_is_an_error(self):
         with self.assertRaises(ValueError):
             directives.parse("// DIFFCHECK-RANGE: which 5 2\n")
+
+    def test_a_zero_run_parameter_is_an_error(self):
+        with self.assertRaises(ValueError):
+            directives.parse("// RUN: grid=0\n")
 
     def test_unknown_run_key_is_an_error(self):
         with self.assertRaises(ValueError):

@@ -80,6 +80,11 @@ class Compare(unittest.TestCase):
         self.assertEqual(diff.to_json()["apple"], 6)
         self.assertEqual(diff.to_json()["mslc"], 9)
 
+    def test_signed_leaves_are_reported_signed(self):
+        layout = {"name": "s", "stride": 4, "leaves": [{"off": 0, "scalar": "int"}]}
+        (diff,) = compare.compare(layout, bits(0xfffffffe), bits(1))
+        self.assertEqual(diff.to_json()["apple"], -2)
+
     def test_length_mismatch_is_an_error(self):
         with self.assertRaises(ValueError):
             compare.compare(self.LAYOUT, bytes(8), bytes(16))

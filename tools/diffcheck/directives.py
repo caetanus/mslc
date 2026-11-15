@@ -20,8 +20,8 @@ def parse(source):
         if m:
             for pair in m.group(1).split():
                 key, _, value = pair.partition("=")
-                if key not in RUN_KEYS or not value.isdigit():
-                    raise ValueError("bad RUN parameter %r (keys: %s)" % (pair, ", ".join(sorted(RUN_KEYS))))
+                if key not in RUN_KEYS or not value.isdigit() or int(value) < 1:
+                    raise ValueError("bad RUN parameter %r (a positive number; keys: %s)" % (pair, ", ".join(sorted(RUN_KEYS))))
                 result["run"][key] = int(value)
             continue
         m = re.match(r"\s*//\s*DIFFCHECK:\s*writes-zero\s*$", line)

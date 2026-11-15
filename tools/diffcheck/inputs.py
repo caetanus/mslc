@@ -20,10 +20,14 @@ PROFILES = ("moderate", "wide", "edge")
 SENTINEL = 0x7f
 POISON = 0xA5
 
+def _bits(value, fmt):
+    return int.from_bytes(struct.pack(fmt, value), "little")
+
+
 _EDGE_FLOAT = {
     "float": [0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000, 0x7fc00000,
-              0x00000001, 0x007fffff, 0x00800000, 0x7f7fffff, 0xff7fffff,
-              0x00ae43fd, 0x80ae43fd, 0x7e967699, 0xfe967699],  # +-1e-38, +-1e38
+              0x00000001, 0x007fffff, 0x00800000, 0x7f7fffff, 0xff7fffff]
+             + [_bits(v, "<f") for v in (1e-38, -1e-38, 1e38, -1e38)],
     "half": [0x0000, 0x8000, 0x3c00, 0xbc00, 0x7c00, 0xfc00, 0x7e00, 0x0001, 0x03ff, 0x0400, 0x7bff, 0xfbff],
 }
 
@@ -40,7 +44,16 @@ def _wide_float(rng, scalar):
     return (rng.getrandbits(1) << 15) | (rng.randrange(3, 29) << 10) | rng.getrandbits(10)
 
 
-def leaf_bits(rng, scalar, profile, bounds=None):
+def _step(walk, table, rng):
+    """The next edge value: a walk through the table, so every entry appears within len(table)
+    edge leaves and a short run still reaches NaN and the infinities; random without a walk."""
+    if walk is None:
+        return rng.choice(table)
+    walk[0] += 1
+    return table[(walk[0] + walk[1]) % len(table)]
+
+
+def leaf_bits(rng, scalar, profile, bounds=None, walk=None):
     size, kind = SCALARS[scalar]
     if kind == "bool":
         return rng.getrandbits(1)
@@ -51,7 +64,7 @@ def leaf_bits(rng, scalar, profile, bounds=None):
             fmt = "<f" if scalar == "float" else "<e"
             return int.from_bytes(struct.pack(fmt, value), "little")
         if profile == "edge" and rng.random() < 0.5:
-            return rng.choice(_EDGE_FLOAT[scalar])
+            return _step(walk, _EDGE_FLOAT[scalar], rng)
         return _wide_float(rng, scalar)
     mask = (1 << (size * 8)) - 1
     if bounds and kind == "int":
@@ -60,20 +73,26 @@ def leaf_bits(rng, scalar, profile, bounds=None):
         low = 0 if scalar.startswith("u") else -100
         return rng.randrange(low, 201) & mask
     if profile == "edge" and rng.random() < 0.5:
-        return rng.choice(_edge_int(size))
+        return _step(walk, _edge_int(size), rng)
     return rng.getrandbits(size * 8)
 
 
-def fill_buffer(layout, elements, rng, profile, sentinel=False, poison_padding=False, bounds=None):
+def fill_buffer(layout, elements, rng, profile, sentinel=False, poison_padding=False, bounds=None, phase=0):
     """A bytearray of elements * stride bytes for one buffer. `bounds` (lo, hi) limits its
-    integer leaves, for a buffer a kernel uses as an index."""
+    integer leaves, for a buffer a kernel uses as an index. `phase` (the case number) offsets the
+    walk through the edge values, so different cases start at different ones."""
     stride = layout["stride"]
-    if sentinel:
-        return bytearray([SENTINEL]) * (elements * stride)
-    data = bytearray([POISON if poison_padding else 0]) * (elements * stride)
+    walk = [-1, phase]
+    data = bytearray([SENTINEL if sentinel else POISON if poison_padding else 0]) * (elements * stride)
     for element in range(elements):
         for leaf in layout["leaves"]:
-            size = SCALARS[leaf["scalar"]][0]
+            scalar = leaf["scalar"]
+            size = SCALARS[scalar][0]
             at = element * stride + leaf["off"]
-            data[at:at + size] = leaf_bits(rng, leaf["scalar"], profile, bounds).to_bytes(size, "little")
+            if sentinel and SCALARS[scalar][1] == "bool":
+                data[at] = rng.getrandbits(1)
+            elif sentinel and not (bounds and SCALARS[scalar][1] == "int"):
+                continue
+            else:
+                data[at:at + size] = leaf_bits(rng, scalar, "wide" if sentinel else profile, bounds, walk).to_bytes(size, "little")
     return data

@@ -105,6 +105,8 @@ class Diff:
     def value(self, raw):
         if SCALARS[self.scalar][1] == "float":
             return struct.unpack(_fields(self.scalar)[0], raw)[0]
+        if SCALARS[self.scalar][1] == "int" and not self.scalar.startswith("u"):
+            return int.from_bytes(raw, "little", signed=True)
         return int.from_bytes(raw, "little")
 
     def to_json(self):
