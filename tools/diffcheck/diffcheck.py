@@ -39,7 +39,7 @@ def run_mslc(mslc, source, work, includes):
     val = subprocess.run([shutil.which("spirv-val") or "spirv-val", "--target-env", "vulkan1.3", spv],
                          capture_output=True, text=True)
     if val.returncode != 0:
-        return None, None, "mslc output fails spirv-val: " + (val.stdout + val.stderr).strip().splitlines()[0]
+        return None, None, "INVALID mslc output fails spirv-val: " + (val.stdout + val.stderr).strip().splitlines()[0]
     return spv, json.load(open(refl)), None
 
 
@@ -133,28 +133,19 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
             for d in compare.compare(layout, outs["apple"][i], outs["mslc"][i], ulp):
                 case_diffs.append(d.to_json())
         nonzero = nonzero or checks.written_nonzero(layouts, data, outs["apple"]) or checks.written_nonzero(layouts, data, outs["mslc"])
-        # Negative control: a copy of the mslc result with one leaf changed must differ from
-        # Apple's, or the comparison above could not have told a miscompile from a match.
-        control = checks.perturb(layouts, outs["mslc"])
+        # Negative control: a copy of the mslc result with one leaf of a compared buffer changed
+        # must differ from Apple's, or the comparison above could not have told a miscompile from
+        # a match. Excluded buffers are not candidates: perturbing one would test nothing.
+        compared = {i: l for i, l in layouts.items() if l["name"] not in excluded}
+        control = checks.perturb(compared, outs["mslc"])
         control_ok = False
         if control is not None:
             copy, name, _ = control
             index = next(i for i, l in layouts.items() if l["name"] == name)
             control_ok = bool(compare.compare(layouts[index], outs["apple"][index], copy[index], 0))
-            if layouts[index]["name"] in excluded:
-                control_ok = True
         result["cases"].append({"case": case, "profile": profile, "diffs": case_diffs[:16],
                                 "diff_count": len(case_diffs), "negative_control": control_ok})
-    if any(not c["negative_control"] for c in result["cases"]):
-        result.update(status="control-failed", reason="the perturbed copy compared equal to Apple's output")
-    elif any(c["diff_count"] for c in result["cases"]):
-        first = next(c for c in result["cases"] if c["diff_count"])
-        result.update(status="mismatched", reason="first difference: %s" % json.dumps(first["diffs"][0]))
-    elif not nonzero and not params["writes_zero"]:
-        result.update(status="zero-output", reason="no output leaf was written to a non-zero value on either backend "
-                      "(declare `// DIFFCHECK: writes-zero` if that is right)")
-    else:
-        result["status"] = "matched"
+    result["status"], result["reason"] = checks.verdict(result["cases"], nonzero, params["writes_zero"])
     if excluded:
         result["excluded"] = excluded
     return result
@@ -170,7 +161,9 @@ def check_file(opts, path, std=None):
     try:
         spv, refl, error = run_mslc(opts.mslc, path, work, includes)
         if error:
-            return [{"entry": opts.entry or "*", "status": "skipped", "reason": error, "cases": []}]
+            invalid = error.startswith("INVALID ")
+            return [{"entry": opts.entry or "*", "status": "invalid" if invalid else "skipped",
+                     "reason": error[8:] if invalid else error, "cases": []}]
         entries = [e for e in refl["entry_points"] if e["stage"] == "compute"]
         if opts.entry:
             entries = [e for e in entries if e["name"] == opts.entry]
@@ -226,7 +219,7 @@ def summary(results):
     counts = {}
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-    compared = sum(n for st, n in counts.items() if st not in ("skipped", "error"))
+    compared = sum(n for st, n in counts.items() if st not in ("skipped", "error", "invalid"))
     line = "%d kernels: %d compared" % (len(results), compared)
     return line + "".join(", %d %s" % (n, st) for st, n in sorted(counts.items()))
 
@@ -257,6 +250,9 @@ def parser():
     p.add_argument("--timeout", type=int, default=hosts.TIMEOUT, help="seconds a host or compiler may run")
     p.add_argument("--jobs", type=int, default=1, help="files checked in parallel in --corpus mode")
     p.add_argument("--report", help="write the JSON report here")
+    p.add_argument("--min-compared", type=int, default=0,
+                   help="--corpus fails when fewer kernels than this were compared (guards against mslc "
+                        "regressing to rejecting files, which otherwise only shows as skips)")
     p.add_argument("--keep", action="store_true", help="keep the scratch directory")
     p.add_argument("--corrupt-mslc", metavar="BUFFER:BYTE",
                    help="self-test hook: invert one byte of mslc's output before comparing")
@@ -296,6 +292,13 @@ def main(argv=None):
         print("%-17s %s::%s  %s" % (r["status"], r["file"], r["entry"], (r.get("reason") or "")[:160]))
     print(summary(results))
     statuses = {r["status"] for r in results}
+    if not results:
+        print("diffcheck: nothing to check", file=sys.stderr)
+        return ERROR
+    compared = sum(1 for r in results if r["status"] not in ("skipped", "error", "invalid"))
+    if compared < opts.min_compared:
+        print("diffcheck: %d compared, --min-compared wants %d" % (compared, opts.min_compared), file=sys.stderr)
+        return MISMATCH
     if "error" in statuses:
         return ERROR
     if statuses <= {"matched"}:

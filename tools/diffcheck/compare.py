@@ -50,6 +50,12 @@ def is_nan(raw, scalar):
     return exp == (1 << ebits) - 1 and (v & ((1 << mbits) - 1)) != 0
 
 
+def is_inf(raw, scalar):
+    _, _, ebits, mbits = _fields(scalar)
+    v = int.from_bytes(raw, "little")
+    return (v >> mbits) & ((1 << ebits) - 1) == (1 << ebits) - 1 and (v & ((1 << mbits) - 1)) == 0
+
+
 def ulp_distance(a, b, scalar):
     """Distance in representable values; None when either is a NaN."""
     if is_nan(a, scalar) or is_nan(b, scalar):
@@ -74,13 +80,16 @@ def leaf_equal(a, b, scalar, ulp=0):
         return nan_a and nan_b
     if a == b:
         return True
-    if ulp == 0:
+    # An infinity next to the largest finite value is one ULP away, and is an overflow bug.
+    if ulp == 0 or is_inf(a, scalar) or is_inf(b, scalar):
         return False
     return ulp_distance(a, b, scalar) <= ulp
 
 
 def ulp_bound_for_source(source):
     """The loosest bound among the inexact functions the source calls."""
+    # Comments and string literals are not calls.
+    source = re.sub(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"", " ", source, flags=re.S)
     bound = 0
     for name, ulp in ULP_BOUNDS.items():
         if ulp > bound and re.search(r"(?<![\w.])(?:\w+::)*%s\s*\(" % name, source):
