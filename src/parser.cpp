@@ -3746,10 +3746,6 @@ void Parser::parseResourceType(Type& type) {
 
 	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
 	type.resource = lowered->second;
-	if (element->second != ScalarKind::Float && element->second != ScalarKind::Half && access == "sample") {
-		throw CompileError(name + "<" + component + "> is not lowered yet; mslc lowers integer elements only "
-			"with access::read, access::write or access::read_write");
-	}
 	type.textureAccess = access == "write" ? TextureAccess::Write
 		: access == "read" ? TextureAccess::Read
 		: access == "read_write" ? TextureAccess::ReadWrite : TextureAccess::Sample;

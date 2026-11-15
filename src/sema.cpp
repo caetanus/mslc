@@ -1384,10 +1384,10 @@ Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sample
 		static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 }
 
-Id TypeTable::image(ResourceKind kind) {
-	Id& cached = _images[kind];
+Id TypeTable::image(ResourceKind kind, ScalarKind sampledType) {
+	Id& cached = _images[{ kind, sampledType }];
 	if (cached == InvalidId) {
-		cached = imageOf(kind, ScalarKind::Float, 1u);
+		cached = imageOf(kind, sampledType, 1u);
 	}
 
 	return cached;
@@ -1430,9 +1430,9 @@ Id TypeTable::samplerType() {
 	return _samplerType;
 }
 
-Id TypeTable::sampledImage(ResourceKind kind) {
-	const Id imageType = image(kind);
-	Id& cached = _sampledImages[kind];
+Id TypeTable::sampledImage(ResourceKind kind, ScalarKind sampledType) {
+	const Id imageType = image(kind, sampledType);
+	Id& cached = _sampledImages[{ kind, sampledType }];
 	if (cached == InvalidId) {
 		cached = _builder.emitDecl(spirv::OpTypeSampledImage, { imageType });
 	}
@@ -6843,7 +6843,7 @@ namespace {
 		if (type.textureAccess != TextureAccess::Sample) {
 			return _types.storageImage(type.resource, type.textureAccess, textureSampledKind(type.scalar));
 		}
-		return type.isTexture() ? _types.image(type.resource) : _types.samplerType();
+		return type.isTexture() ? _types.image(type.resource, textureSampledKind(type.scalar)) : _types.samplerType();
 	}
 
 	// The variable behind a texture or sampler argument: it has to be a name for a
@@ -10160,7 +10160,8 @@ namespace {
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id loadedSampler = loadFrom(sampler.id, sampler.pointeeType);
-		const Id combined = _builder.emitTyped(spirv::OpSampledImage, _types.sampledImage(kind),
+		const Id combined = _builder.emitTyped(spirv::OpSampledImage,
+			_types.sampledImage(kind, textureSampledKind(texture.pointeeMsl.scalar)),
 			{ image, loadedSampler });
 		std::vector<uint32_t> words { combined, coordinate, constantU32(component) };
 		if (offset != InvalidId && constantOffset) {
@@ -10175,7 +10176,7 @@ namespace {
 			words.push_back(offset);
 		}
 		return texturePixels(texture, _builder.emitTyped(spirv::OpImageGather,
-			_types.vector(ScalarKind::Float, 4), words));
+			_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4), words));
 	}
 
 	// sample(sampler, float2 coordinate [, level(lod)]), a float3 coordinate on a
@@ -10323,10 +10324,11 @@ namespace {
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id loadedSampler = loadFrom(sampler.id, sampler.pointeeType);
-		const Id combined = _builder.emitTyped(spirv::OpSampledImage, _types.sampledImage(texture.pointeeMsl.resource),
+		const Id combined = _builder.emitTyped(spirv::OpSampledImage,
+			_types.sampledImage(texture.pointeeMsl.resource, textureSampledKind(texture.pointeeMsl.scalar)),
 			{ image, loadedSampler });
 
-		const Id float4 = _types.vector(ScalarKind::Float, 4);
+		const Id float4 = _types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4);
 		const bool noOption = lod == InvalidId && bias == InvalidId && gradientX == InvalidId;
 		if (noOption && minLod == InvalidId && library && !sampler.unnormalizedSampler) {
 			throw StageError("a sample with no explicit level in a library helper: whether it is implicit "
@@ -10424,7 +10426,7 @@ namespace {
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id fetched = _builder.emitTyped(spirv::OpImageFetch,
-			_types.vector(ScalarKind::Float, 4), { image, coordinate, kImageOperandsLod, lod });
+			_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4), { image, coordinate, kImageOperandsLod, lod });
 		return texturePixels(texture, fetched);
 	}
 
