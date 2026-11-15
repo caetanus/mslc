@@ -258,6 +258,10 @@ static const Fmt VFMT[] = {
 static const Fmt CFMT[] = {
     {"rgba32float", VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {"rgba32sint", VK_FORMAT_R32G32B32A32_SINT, 16},
     {"rgba32uint", VK_FORMAT_R32G32B32A32_UINT, 16}, {"rgba16float", VK_FORMAT_R16G16B16A16_SFLOAT, 8},
+    {"rg32float", VK_FORMAT_R32G32_SFLOAT, 8}, {"rg32sint", VK_FORMAT_R32G32_SINT, 8},
+    {"rg32uint", VK_FORMAT_R32G32_UINT, 8}, {"rg16float", VK_FORMAT_R16G16_SFLOAT, 4},
+    {"r32float", VK_FORMAT_R32_SFLOAT, 4}, {"r32sint", VK_FORMAT_R32_SINT, 4},
+    {"r32uint", VK_FORMAT_R32_UINT, 4}, {"r16float", VK_FORMAT_R16_SFLOAT, 2},
 };
 
 static const Fmt *findFmt(const Fmt *t, size_t n, const char *name) {
@@ -536,7 +540,7 @@ static int drawMain(const char *manifest) {
     VkImageMemoryBarrier post[MAXCOLOR + 1]; unsigned npost = 0;
     for (unsigned i = 0; i < nc; i++) post[npost++] = imgBarrier(color[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     if (hasDepth) post[npost++] = imgBarrier(depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    if (npost) vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, npost, post);
+    if (npost) vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, npost, post);
     for (unsigned i = 0; i < nc; i++) {
         VkBufferImageCopy bc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}};
         vkCmdCopyImageToBuffer(cmd, color[i].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb[i].buf, 1, &bc);

@@ -157,6 +157,10 @@ struct CFmt { const char *name; MTLPixelFormat format; NSUInteger bytes; };
 static const CFmt kColorFormats[] = {
     {"rgba32float", MTLPixelFormatRGBA32Float, 16}, {"rgba32sint", MTLPixelFormatRGBA32Sint, 16},
     {"rgba32uint", MTLPixelFormatRGBA32Uint, 16}, {"rgba16float", MTLPixelFormatRGBA16Float, 8},
+    {"rg32float", MTLPixelFormatRG32Float, 8}, {"rg32sint", MTLPixelFormatRG32Sint, 8},
+    {"rg32uint", MTLPixelFormatRG32Uint, 8}, {"rg16float", MTLPixelFormatRG16Float, 4},
+    {"r32float", MTLPixelFormatR32Float, 4}, {"r32sint", MTLPixelFormatR32Sint, 4},
+    {"r32uint", MTLPixelFormatR32Uint, 4}, {"r16float", MTLPixelFormatR16Float, 2},
 };
 
 static const VFmt &vertexFormat(NSString *name) {
