@@ -2621,8 +2621,28 @@ namespace {
 		Id emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
 			const std::string& spelled);
 		Id emitInitListValue(const Type& target, const Expression& list);
+		struct InitPlan;
+		struct InitSlot {
+			size_t index = 0;
+			const InitializerElement* element = nullptr;
+			std::shared_ptr<InitPlan> group;
+		};
+		struct InitPlan {
+			const StructDecl* decl = nullptr;
+			std::vector<InitSlot> slots;
+		};
+		struct DroppedInit {
+			InitSlot slot;
+			const Type* field;
+		};
+		void planStructElements(const StructDecl& decl, const std::vector<InitializerElement>& elements,
+			size_t& cursor, std::vector<std::optional<Id>>& values, bool elided, InitPlan& plan,
+			std::vector<DroppedInit>& dropped);
+		Id emitInitSlot(const Type& field, const InitSlot& slot, std::vector<std::optional<Id>>& values);
+		Id emitInitPlan(const Type& target, const InitPlan& plan, std::vector<std::optional<Id>>& values);
 		Id emitStructElements(const Type& target, const StructDecl& decl, const std::vector<InitializerElement>& elements,
-			size_t& cursor, std::vector<std::optional<Id>>& values, bool elided);
+			std::vector<std::optional<Id>>& values);
+		void discardLifted(const std::function<void()>& emit);
 		Id emitListScalarValue(const Type& target, const Expression& expression, bool dropExcess = false);
 		void checkAndDiscard(const Expression& expression);
 		Id convertListScalar(Id value, const Type& target, const Expression& expression);
@@ -4192,6 +4212,21 @@ namespace {
 		return convertImplicit(value, _types.scalar(to));
 	}
 
+	void Emitter::discardLifted(const std::function<void()>& emit) {
+		const size_t mark = _builder.functionsMark();
+		const Id block = _currentBlock;
+		const bool terminated = _terminated;
+		const uint32_t depth = _controlDepth;
+		const size_t targets = _jumpTargets.size();
+		emit();
+		_builder.takeFunctionsFrom(mark);
+		// A short-circuit or ?: inside the element moved these to a label that the lift removed.
+		_currentBlock = block;
+		_terminated = terminated;
+		_controlDepth = depth;
+		_jumpTargets.resize(targets);
+	}
+
 	// Apple type-checks an ignored initializer element but never evaluates it, so
 	// it is emitted for its diagnostics and the instructions are lifted out again.
 	void Emitter::checkAndDiscard(const Expression& expression) {
@@ -4199,18 +4234,7 @@ namespace {
 			for (const InitializerElement& element: expression.elements) { checkAndDiscard(*element.value); }
 			return;
 		}
-		const size_t mark = _builder.functionsMark();
-		const Id block = _currentBlock;
-		const bool terminated = _terminated;
-		const uint32_t depth = _controlDepth;
-		const size_t targets = _jumpTargets.size();
-		emitExpression(expression);
-		_builder.takeFunctionsFrom(mark);
-		// A short-circuit or ?: inside the element moved these to a label that the lift removed.
-		_currentBlock = block;
-		_terminated = terminated;
-		_controlDepth = depth;
-		_jumpTargets.resize(targets);
+		discardLifted([&] { emitExpression(expression); });
 	}
 
 	Id Emitter::emitListScalarValue(const Type& target, const Expression& expression, bool dropExcess) {
@@ -4229,68 +4253,105 @@ namespace {
 		return first;
 	}
 
-	// A flat cursor over the element list: a struct member that is reached by an element
-	// which is neither braced nor already of the member's struct type is initialised from
-	// the following elements, as Apple does (brace elision).
-	Id Emitter::emitStructElements(const Type& target, const StructDecl& decl,
-			const std::vector<InitializerElement>& elements, size_t& cursor,
-			std::vector<std::optional<Id>>& values, bool elided) {
-		const std::string spelled = typeName(target);
-		Expression empty;
-		empty.kind = ExpressionKind::InitList;
-		std::vector<uint32_t> fields;
+	// Apple keeps the last initializer of each member, drops the earlier ones unevaluated (but still
+	// type-checked) and evaluates the survivors in member order, whatever order they were written in.
+	// A flat cursor over the element list places each element; a struct member that is reached by an
+	// element which is neither braced nor already of the member's struct type takes the following
+	// elements too (brace elision).
+	void Emitter::planStructElements(const StructDecl& decl, const std::vector<InitializerElement>& elements,
+			size_t& cursor, std::vector<std::optional<Id>>& values, bool elided, InitPlan& plan,
+			std::vector<DroppedInit>& dropped) {
+		const std::string spelled = decl.name;
+		plan.decl = &decl;
+		plan.slots.resize(decl.fields.size());
+		size_t next = 0;
 		while (cursor < elements.size()) {
 			const InitializerElement& element = elements[cursor];
 			if (!element.fieldName.empty()) {
 				if (elided) { break; }
-				size_t named = fields.size();
-				while (named < decl.fields.size() && decl.fields[named].name != element.fieldName) {
-					++named;
-				}
-				if (named == decl.fields.size()) {
-					throw CompileError("field " + element.fieldName + " is unknown or out of order in " + spelled + " initializer");
-				}
-				while (fields.size() < named) {
-					fields.push_back(emitInitListValue(decl.fields[fields.size()].type, empty));
+				next = 0;
+				while (next < decl.fields.size() && decl.fields[next].name != element.fieldName) { ++next; }
+				if (next == decl.fields.size()) {
+					throw CompileError("field " + element.fieldName + " is unknown in " + spelled + " initializer");
 				}
 			}
-			if (fields.size() == decl.fields.size()) {
+			if (next == decl.fields.size()) {
 				if (elided) { break; }
 				throw CompileError("excess elements in " + spelled + " initializer");
 			}
-			const Type& field = decl.fields[fields.size()].type;
-			if (element.value->kind == ExpressionKind::InitList) {
-				fields.push_back(emitInitListValue(field, *element.value));
-				++cursor;
-				continue;
-			}
-			if (!values[cursor]) { values[cursor] = emitExpression(*element.value); }
-			const Id value = *values[cursor];
+			const Type& field = decl.fields[next].type;
+			InitSlot slot;
+			slot.index = cursor;
 			const StructDecl* fieldDecl = field.namedType.empty() || field.arrayLength.has_value()
+				|| element.value->kind == ExpressionKind::InitList || !element.fieldName.empty()
 				? nullptr : _unit.findStruct(field.namedType);
-			const std::string* sourceName = _types.structNameOf(_builder.typeOf(value), nullptr);
-			if (fieldDecl && element.fieldName.empty() && !fieldDecl->hasConstructors
-				&& !(sourceName && *sourceName == field.namedType)) {
-				if (fieldDecl->fields.empty()) {
-					throw CompileError("initializer for " + typeName(field) + ", which has no members, requires explicit braces");
+			if (fieldDecl && !fieldDecl->hasConstructors) {
+				Id sourceType = InvalidId;
+				const ExpressionKind kind = element.value->kind;
+				const bool literal = kind == ExpressionKind::IntLiteral || kind == ExpressionKind::FloatLiteral
+					|| kind == ExpressionKind::BoolLiteral;
+				if (values[cursor]) { sourceType = _builder.typeOf(*values[cursor]); }
+				else if (!literal) { discardLifted([&] { sourceType = _builder.typeOf(emitExpression(*element.value)); }); }
+				const std::string* sourceName = _types.structNameOf(sourceType, nullptr);
+				if (!(sourceName && *sourceName == field.namedType)) {
+					if (fieldDecl->fields.empty()) {
+						throw CompileError("initializer for " + typeName(field) + ", which has no members, requires explicit braces");
+					}
+					if (std::any_of(fieldDecl->fields.begin(), fieldDecl->fields.end(),
+							[](const StructField& member) { return member.type.arrayLength.has_value(); })) {
+						throw CompileError("brace elision into " + typeName(field) + ", which has an array member, "
+							"is not lowered yet; add the braces");
+					}
+					slot.group = std::make_shared<InitPlan>();
+					planStructElements(*fieldDecl, elements, cursor, values, true, *slot.group, dropped);
 				}
-				if (std::any_of(fieldDecl->fields.begin(), fieldDecl->fields.end(),
-						[](const StructField& member) { return member.type.arrayLength.has_value(); })) {
-					throw CompileError("brace elision into " + typeName(field) + ", which has an array member, "
-						"is not lowered yet; add the braces");
-				}
-				fields.push_back(emitStructElements(field, *fieldDecl, elements, cursor, values, true));
-				continue;
 			}
-			++cursor;
-			fields.push_back(field.namedType.empty() && field.isScalar()
-				? convertListScalar(value, field, *element.value)
-				: convertImplicit(value, declaredTypeOf(field)));
+			if (!slot.group) {
+				slot.element = &element;
+				++cursor;
+			}
+			if (plan.slots[next].element || plan.slots[next].group) {
+				dropped.push_back({plan.slots[next], &field});
+			}
+			plan.slots[next] = std::move(slot);
+			++next;
 		}
-		while (fields.size() < decl.fields.size()) {
-			fields.push_back(emitInitListValue(decl.fields[fields.size()].type, empty));
+	}
+
+	Id Emitter::emitInitSlot(const Type& field, const InitSlot& slot, std::vector<std::optional<Id>>& values) {
+		if (slot.group) { return emitInitPlan(field, *slot.group, values); }
+		const Expression& expression = *slot.element->value;
+		if (expression.kind == ExpressionKind::InitList) { return emitInitListValue(field, expression); }
+		if (!values[slot.index]) { values[slot.index] = emitExpression(expression); }
+		const Id value = *values[slot.index];
+		return field.namedType.empty() && field.isScalar()
+			? convertListScalar(value, field, expression)
+			: convertImplicit(value, declaredTypeOf(field));
+	}
+
+	Id Emitter::emitInitPlan(const Type& target, const InitPlan& plan, std::vector<std::optional<Id>>& values) {
+		Expression empty;
+		empty.kind = ExpressionKind::InitList;
+		std::vector<uint32_t> fields;
+		for (size_t i = 0; i < plan.decl->fields.size(); ++i) {
+			const Type& field = plan.decl->fields[i].type;
+			const InitSlot& slot = plan.slots[i];
+			fields.push_back(slot.element || slot.group ? emitInitSlot(field, slot, values) : emitInitListValue(field, empty));
 		}
 		return _builder.emitTyped(spirv::OpCompositeConstruct, declaredTypeOf(target), fields);
+	}
+
+	Id Emitter::emitStructElements(const Type& target, const StructDecl& decl,
+			const std::vector<InitializerElement>& elements, std::vector<std::optional<Id>>& values) {
+		size_t cursor = 0;
+		InitPlan plan;
+		std::vector<DroppedInit> dropped;
+		planStructElements(decl, elements, cursor, values, false, plan, dropped);
+		const Id composite = emitInitPlan(target, plan, values);
+		for (const DroppedInit& drop: dropped) {
+			discardLifted([&] { emitInitSlot(*drop.field, drop.slot, values); });
+		}
+		return composite;
 	}
 
 	Id Emitter::emitInitListValue(const Type& target, const Expression& list) {
@@ -4323,8 +4384,7 @@ namespace {
 				throw CompileError("brace initialization of " + spelled + ", which has an array member, "
 					"is not lowered yet; assign the members one by one");
 			}
-			size_t cursor = 0;
-			return emitStructElements(target, decl, list.elements, cursor, values, false);
+			return emitStructElements(target, decl, list.elements, values);
 		}
 		if (list.elements.empty()) { return _types.zero(toType); }
 		for (const InitializerElement& element: list.elements) {
