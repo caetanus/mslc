@@ -183,7 +183,7 @@ def check_file(opts, path, std=None):
                 "grid": opts.grid or run.get("grid", 64), "local": opts.local or run.get("local", 8),
                 "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
                 "cases": opts.cases or run.get("cases", 3), "elems": opts.elems or run.get("elems"),
-                "std": std or opts.std, "exclude": d["exclude"], "range": d["range"], "writes_zero": d["writes_zero"],
+                "std": std or opts.std, "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
             }
             sub = os.path.join(work, e["name"])
             os.makedirs(sub)
@@ -252,6 +252,9 @@ def parser():
     p.add_argument("--mslc", default=os.environ.get("MSLC", "mslc"))
     p.add_argument("--metalhost", default=os.environ.get("DIFFCHECK_METALHOST"))
     p.add_argument("--vkhost", default=os.environ.get("DIFFCHECK_VKHOST"))
+    p.add_argument("--range", dest="ranges", action="append", default=[], metavar="BUFFER=LO:HI",
+                   help="like // DIFFCHECK-RANGE, for a file you do not edit (repeatable)")
+    p.add_argument("--timeout", type=int, default=hosts.TIMEOUT, help="seconds a host or compiler may run")
     p.add_argument("--jobs", type=int, default=1, help="files checked in parallel in --corpus mode")
     p.add_argument("--report", help="write the JSON report here")
     p.add_argument("--keep", action="store_true", help="keep the scratch directory")
@@ -262,6 +265,13 @@ def parser():
 
 def main(argv=None):
     opts = parser().parse_args(argv)
+    hosts.TIMEOUT = opts.timeout
+    try:
+        opts.ranges = {n: (int(lo), int(hi)) for n, _, r in (x.partition("=") for x in opts.ranges)
+                       for lo, hi in [r.split(":")]}
+    except ValueError:
+        print("diffcheck: --range wants BUFFER=LO:HI", file=sys.stderr)
+        return ERROR
     if bool(opts.file) == bool(opts.corpus):
         print("diffcheck: give a file or --corpus list", file=sys.stderr)
         return ERROR
