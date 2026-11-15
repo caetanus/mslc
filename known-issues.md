@@ -476,3 +476,17 @@ Each of these is a diagnostic, not a silent pick, except where it says "approxim
 - `const volatile int N = 3; float a[N];` as a local: Apple refuses it ("array size is not a
   constant expression"); mslc accepts it, because the parser does not record `volatile` on a type.
   The length it takes is the right one, so this accepts invalid source and miscompiles nothing.
+
+
+## Library namespace lookup: leftovers found while fixing #344, #345 and #357
+
+All of these predate those fixes; counts are from generated differentials against Apple.
+
+- A user namespace `precise` or `fast` (at file scope, or inside `A` with `using namespace A;`) beside
+  `using namespace metal;` is silently bound, where Apple reports the name ambiguous with
+  `metal::precise` or `metal::fast`. This is the mechanism #345 fixed for `metal` itself, not yet applied
+  to the library's sub-namespaces (about 29 cases).
+- Unqualified `abs` or `sqrt` with no directive for `metal` in scope is accepted, where Apple reports an
+  undeclared identifier (about 34 cases).
+- The library's names are visible without `#include <metal_stdlib>` (about 11 cases).
+- `namespace NB { typedef int metal; }` followed by `metal::abs` is accepted (2 cases).
