@@ -3835,6 +3835,19 @@ StatementPtr Parser::parseStatement() {
 		return statement;
 	}
 
+	// parseSwitchStatement takes the labels that sit directly in a switch body, so a label
+	// that reaches here is outside any switch or nested in a compound, loop or if within one.
+	// The second form (Duff's device) would need OpSwitch to branch into the middle of a
+	// structured construct, which SPIR-V does not allow.
+	if (atKeyword("case") || atKeyword("default")) {
+		const std::string label = atKeyword("case") ? "case" : "default";
+		if (_switchDepth == 0) {
+			throw CompileError("'" + label + "' label is outside a switch statement");
+		}
+		throw CompileError("a '" + label + "' label nested inside a compound statement, loop or if within a switch "
+			"body is not supported: put every label directly in the switch body");
+	}
+
 	if (atKeyword("namespace") && lookahead().kind == TokenKind::Identifier && lookahead(2).kind == TokenKind::Assign) {
 		advance();
 		parseNamespaceAlias();
