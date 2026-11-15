@@ -7833,6 +7833,25 @@ namespace {
 					"braced list naming its fields, not with a single value");
 			}
 
+			// "float4(1)" and "float4(a, b, c, d)": a float or half vector built by its own
+			// constructor, each component converted as it is at run time.
+			if (type.vectorWidth > 1 && isFloatKind(type.scalar) && type.namedType.empty()
+				&& initializer.kind == ExpressionKind::Construct && initializer.constructType
+				&& initializer.constructType->vectorWidth == type.vectorWidth
+				&& !initializer.constructType->isMatrix() && !initializer.constructType->isPointer
+				&& initializer.constructType->scalar == type.scalar) {
+				FoldedConstant vector;
+				vector.isComposite = true;
+				vector.type = declaredTypeOf(type);
+				for (const double component: foldColumnConstructor(initializer, type.scalar, type.vectorWidth)) {
+					FoldedConstant part;
+					part.scalar = type.scalar;
+					part.number = component;
+					vector.parts.push_back(emitConstant(part));
+				}
+				return vector;
+			}
+
 			if (type.vectorWidth > 1) {
 				throw CompileError("a " + std::string(scalarKindName(type.scalar))
 					+ std::to_string(type.vectorWidth) + " constant is initialised with a braced "
