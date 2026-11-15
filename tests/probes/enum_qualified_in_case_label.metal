@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // DISASM-MATCH: OpSwitch %[_0-9a-zA-Z]+ %[_0-9a-zA-Z]+ 33 %
 //
 // "case E::v:" is a constant expression usable as a case label; the switch

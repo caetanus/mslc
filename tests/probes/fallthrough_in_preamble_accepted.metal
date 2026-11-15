@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // Statements before the first label are not reached, so a marker among them is not checked.
 kernel void fallthrough_in_preamble_accepted(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {
   uint x = 0u;

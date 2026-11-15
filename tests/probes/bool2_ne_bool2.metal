@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // DISASM: OpLogicalNotEqual %v2bool
 
 #include <metal_stdlib>

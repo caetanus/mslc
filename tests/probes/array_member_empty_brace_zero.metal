@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // DISASM-MATCH: OpConstantNull %_struct_[0-9]+
 //
 // "S s = {}" and "S t{}" zero a struct with an array member; the member-by-member

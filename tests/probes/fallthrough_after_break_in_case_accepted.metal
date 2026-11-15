@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // A marker after a break in the same case is unreachable.
 kernel void fallthrough_after_break_in_case_accepted(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {
   uint x = 0u;

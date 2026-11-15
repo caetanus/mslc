@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // The same without braces around the inner case.
 kernel void fallthrough_ending_inner_switch_unbraced_accepted(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {
   uint x = 0u;

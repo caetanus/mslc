@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // Empty blocks and null statements after a nested marker do not count, as in Apple.
 kernel void clang_fallthrough_at_end_of_nested_block_accepted(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {
   uint x = 0u;

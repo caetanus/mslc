@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=64 local=8 cases=3
 // DISASM-MATCH: = OpSLessThan %v2bool
 // DISASM-MATCH: = OpSLessThanEqual %v2bool
 // DISASM-MATCH: = OpSGreaterThan %v2bool

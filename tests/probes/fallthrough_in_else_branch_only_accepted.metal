@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // Only the else branch ends in the marker; the then branch reaches the label by falling off its end.
 kernel void fallthrough_in_else_branch_only_accepted(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {
   uint x = 0u;

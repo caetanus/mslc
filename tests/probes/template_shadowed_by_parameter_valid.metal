@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // Refs #341: a parameter named like a template is the parameter, and "f < 3" is a
 // comparison, not explicit template arguments.
 #include <metal_stdlib>

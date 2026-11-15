@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // 1 / (::n - 7) with the file-scope n (3) is a constant 1 / -4; the local constexpr n (7)
 // would make it a division by zero. Apple accepts it.
 #include <metal_stdlib>
