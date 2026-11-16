@@ -191,6 +191,39 @@ is an `error`, so a stale directive cannot hide a texture. Probes are in `tests/
 miscompiles in the SPIR-V of the real output: swapped texel coordinates, two textures swapped
 between bindings, an unswapped sample coordinate, two samplers swapped between bindings. Each is reported as a mismatch while the baselines match.
 
+## Kernel texel buffers
+
+A kernel with `texture_buffer<T, access>` arguments (T: float, half, int, uint, short or ushort; access read,
+write or read_write) is run too, `get_width` included. Each is a buffer of RGBA texels of T (`elems` texels, so 256 at
+grid 64), seeded from the case's generator like a device buffer (profiles, `DIFFCHECK-RANGE` and `-FLOAT-RANGE` by name) and given
+identical bytes on both sides. Apple binds a `MTLTextureTypeTextureBuffer` over a shared buffer at the Metal index
+(pixel format RGBA32Float, RGBA16Float, RGBA32Sint, RGBA32Uint, RGBA16Sint, RGBA16Uint); Vulkan binds a `VkBufferView`
+of the matching `R32G32B32A32_*` or `R16G16B16A16_*` format at the descriptor mslc's reflection names
+(`UniformTexelBuffer` for access::read, `StorageTexelBuffer` otherwise). The element type and access come from
+Apple's reflection; mslc's reflection must agree on index, name, access and descriptor type or the file is a
+`reflection-mismatch`. After the dispatch the bytes of every texel buffer are read back and compared leaf by leaf
+(four per texel) like a device buffer, so a write-only texel buffer is an output and the texels no thread writes
+must keep their seed. The negative control perturbs one writable device buffer and one writable texel buffer
+separately; both must compare unequal.
+
+Vacuity guard, as for textures: in case 0 the contents of each read or read_write texel buffer are replaced and
+Apple's output must change, else `unused-texture` (declare `// DIFFCHECK-UNUSED: <name> <reason>`). For a read_write
+buffer its own contents count only at texels the kernel wrote, so a buffer the kernel merely overwrites is unused.
+A write-only buffer is an output and is not tested this way.
+
+A host that cannot make the buffer says `unsupported: <reason>` and the file is skipped with it, never passed:
+a Vulkan format without the texel buffer feature, a device without `shaderStorageImageRead/WriteWithoutFormat` (a
+storage texel buffer needs both), more texels than `maxTexelBufferElements`, or no Metal texture over the buffer.
+Lavapipe and Apple Silicon do all six types in both access modes. Limits: R32 and RG32 (and R16, RG16) texel formats are
+never exercised (#380), only the four-component ones, so a wrong format or component count for a one- or two-component
+`texture_buffer` is not seen. A swap of a read and a read_write binding is a descriptor type mismatch; lavapipe
+currently crashes on it, which is reported as an `error`, not a mismatch. The texel count is `elems` plus 4 per Metal
+index plus the case number, so every buffer and every case has a different `get_width`; a kernel must index buffers
+only below the width of the lowest-numbered one.
+Probes (`tests/diffcheck/kernel/texel_buffer_*`) are run at grid 64, local 16, and `diffcheck/kernel-driver` plants nine
+miscompiles (a texel index off by one, a mirrored index off by one, every write two texels away, two components
+swapped, three binding swaps, `get_width` folded to a constant, `get_width` of the wrong buffer) and requires each to be reported as a mismatch while the baselines match.
+
 ## Layout cross-check
 
 mslc's reflection JSON has no layout and a run reads only the bytes under Apple's leaf offsets on

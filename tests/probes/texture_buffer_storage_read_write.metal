@@ -7,6 +7,8 @@
 // DISASM: OpTypeImage %float Buffer 0 0 0 2 Unknown
 // DISASM: OpTypeImage %int Buffer 0 0 0 2 Unknown
 // DISASM: OpTypeImage %uint Buffer 0 0 0 2 Unknown
+// DISASM: OpTypeImage %float Buffer 2 0 0 1 Unknown
+// DISASM: OpCapability SampledBuffer
 // DISASM: NonReadable
 // DISASM-MATCH: OpImageRead %v4float %[0-9]+ %[0-9]+
 // DISASM-NO-MATCH: OpImageRead %v4float %[0-9]+ %[0-9]+ 
@@ -15,6 +17,7 @@
 // DISASM-NOT: OpImageQuerySizeLod
 // REFLECT: "descriptor_type": "StorageTexelBuffer", "texture_access": "ReadWrite"
 // REFLECT: "descriptor_type": "StorageTexelBuffer", "texture_access": "Write"
+// REFLECT: "descriptor_type": "UniformTexelBuffer", "texture_access": "Read"
 // Apple: texture_buffer<half|short|ushort, ...> read and write by uint or ushort index.
 #include <metal_stdlib>
 using namespace metal;
