@@ -544,6 +544,10 @@ for a size mslc cannot give with certainty. Apple accepts, and mslc refuses:
   of another type (`f3 * 2`), vector comparisons and shifts; a shift, `%` or bitwise operator of a
   float (Apple rejects them too); a pointer parameter of a helper function in an operand that is
   more than the bare name (it is bound like a local array).
+- Operands Apple rejects are refused too, not sized: a compound assignment whose operator the operands
+  do not take (`i <<= f`), `++`/`--` of a bool, a write to a const object, a struct assigned to an
+  int, a call whose argument is not typable or does not convert to the parameter, a comma whose left
+  side is not an expression, and a swizzle past the vector's width (`f2.z`) or mixing `xyzw` with `rgba`.
 - A call to a function declared but never defined, inside sizeof (Apple does not need the body).
 - A constant expression where the unsigned sizeof would wrap: `-sizeof(int) + 8`, `sizeof(int) - 8`
   (Apple rejects the latter), a negative operand beside it, or a cast that truncates it.
