@@ -327,6 +327,16 @@ struct ModuleOptions {
 // fragment's own pixel. A consumer binds the colour attachment's view as an input
 // attachment descriptor at that binding and maps pInputAttachments[n] to colour attachment n
 // in the subpass. A half4 is a float image; the module converts.
+// A texture_buffer<T, access> parameter is its own kind, never "Texture":
+// { "kind": "TextureBuffer", "metal_index": n, "descriptor": { "set": s, "binding": b },
+// "descriptor_type": "UniformTexelBuffer"|"StorageTexelBuffer", "texture_access": "Read"|"Write"|"ReadWrite",
+// "param_index": i, "name": ... }. The host binds a VkBufferView at that binding, not an image view.
+// access::read is a sampled texel buffer (descriptor VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, buffer
+// usage UNIFORM_TEXEL_BUFFER, format feature UNIFORM_TEXEL_BUFFER), access::write and
+// access::read_write are storage texel buffers (VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, usage and
+// format feature STORAGE_TEXEL_BUFFER, and shaderStorageImage{Read,Write}WithoutFormat as for any
+// storage texture). The shader indexes it with a scalar uint texel index; the texel size comes from
+// the view's format. A consumer that does not know the kind skips the entry, as for any new kind.
 // reflection_version stays 2 because bindings are additive: a consumer switches
 // on "kind" and ignores kinds it does not know.
 //

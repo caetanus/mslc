@@ -581,3 +581,16 @@ and buffer layout keep Metal's size 1, and a runtime array of them has ArrayStri
 inheritance from an empty base, a class template and `return {};` are refused by the parser, a struct
 with a struct member inside a buffer is refused, and a buffer of empty structs is only validated with
 spirv-val, not run (diffcheck has no scalar layout for it).
+
+
+## texture_buffer is compile-checked only, not run against Apple (#359)
+
+`texture_buffer<float|half|int|uint|short|ushort, access::read|write|read_write>` lowers to a Dim
+Buffer image (read: sampled, SampledBuffer, OpImageFetch; write and read_write: storage, ImageBuffer,
+format-less OpImageRead and OpImageWrite) with a scalar uint or ushort index and OpImageQuerySize for
+get_width. Probes pin the SPIR-V and the `TextureBuffer` reflection kind (descriptor_type
+UniformTexelBuffer or StorageTexelBuffer). Neither diffcheck host (metalhost.mm, vkhost.c) binds a
+texel buffer, and kernel mode skips textures altogether (#366; texel buffers are #378), so no value has been compared with
+Apple's. Refused, though Apple accepts them: texture atomics on a texture_buffer, and an array of
+them. Refused like Apple: access::sample, an int or float index, a lod, get_height,
+get_num_mip_levels, sample and the other sampling methods, and a char or vector element type.
