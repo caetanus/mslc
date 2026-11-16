@@ -336,6 +336,7 @@ namespace {
 		{ "atan", 1, MathShape::Componentwise, 18, kNoInstruction, kNoInstruction },
 		{ "atan2", 2, MathShape::Componentwise, 25, kNoInstruction, kNoInstruction },
 		{ "pow", 2, MathShape::Componentwise, 26, kNoInstruction, kNoInstruction },
+		{ "powr", 2, MathShape::Componentwise, 26, kNoInstruction, kNoInstruction },
 		{ "exp", 1, MathShape::Componentwise, 27, kNoInstruction, kNoInstruction },
 		{ "log", 1, MathShape::Componentwise, 28, kNoInstruction, kNoInstruction },
 		{ "exp2", 1, MathShape::Componentwise, 29, kNoInstruction, kNoInstruction },
@@ -386,8 +387,17 @@ namespace {
 	}
 
 	const MathBuiltin* findMathBuiltin(const std::string& name) {
+		// Precision namespaces share the ordinary math lowering. Only library
+		// scopes are stripped; a user namespace must keep its own functions.
+		std::string_view mathName = name;
+		for (const std::string_view prefix: { "metal::fast::", "metal::precise::", "fast::", "precise::" }) {
+			if (mathName.substr(0, prefix.size()) == prefix) {
+				mathName.remove_prefix(prefix.size());
+				break;
+			}
+		}
 		for (const MathBuiltin& builtin: kMathBuiltins) {
-			if (name == builtin.name) {
+			if (mathName == builtin.name) {
 				return &builtin;
 			}
 		}
@@ -5676,6 +5686,20 @@ namespace {
 
 		if (name == "select") {
 			return emitSelectCall(expression);
+		}
+
+		if (name == "any" || name == "all") {
+			if (expression.arguments.size() != 1) {
+				throw CompileError(name + " takes 1 argument");
+			}
+			const Id value = emitExpression(*expression.arguments[0]);
+			const Id type = _builder.typeOf(value);
+			if (!_types.isBool(type)) {
+				throw CompileError(name + " currently takes bool scalars or vectors");
+			}
+			return _types.vectorWidth(type) == 1 ? value
+				: _builder.emitTyped(name == "any" ? spirv::OpAny : spirv::OpAll,
+					_types.scalar(ScalarKind::Bool), { value });
 		}
 
 		const MathBuiltin* builtin = findMathBuiltin(name);

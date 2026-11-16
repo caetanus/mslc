@@ -1368,9 +1368,16 @@ bool Parser::tryParseHelperFunction() {
 
 	try {
 		// inline, static and constexpr in any order, ahead of the return type.
-		while (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
-			decl.isLocal = true;
-			advance();
+		for (;;) {
+			if (atKeyword("__attribute__") && lookahead().kind == TokenKind::LParen) {
+				advance();
+				skipBalanced(TokenKind::LParen, TokenKind::RParen);
+			} else if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
+				decl.isLocal = true;
+				advance();
+			} else {
+				break;
+			}
 		}
 
 		decl.returnType = parseType();
@@ -3744,6 +3751,14 @@ bool Parser::parseQualifier(Type& type, bool afterPointer) {
 		return false;
 	}
 
+	// GNU attributes can occur among declaration specifiers. Their arguments
+	// may contain nested parentheses; none affect the lowered type.
+	if (atKeyword("__attribute__") && lookahead().kind == TokenKind::LParen) {
+		advance();
+		skipBalanced(TokenKind::LParen, TokenKind::RParen);
+		return true;
+	}
+
 	const std::string_view text = current().text;
 
 	AddressSpace space;
@@ -5887,9 +5902,9 @@ std::optional<Type> Parser::peekCastTargetName(size_t& nameTokens) {
 }
 
 // `(T)operand`, where T names a scalar, vector or matrix type, a typedef, an
-// enum or a struct, is the functional cast T(operand). A type name cannot begin a
-// parenthesised expression, so "(" followed by one is always a cast. Returns null
-// when the parenthesis opens an expression.
+// enum or a struct, is the functional cast T(operand). A type followed by ")"
+// identifies the cast; T(...) can instead begin a parenthesised expression.
+// Returns null when the parenthesis opens an expression.
 ExpressionPtr Parser::parseCast() {
 	const Token& first = lookahead(1);
 	if (first.kind != TokenKind::Identifier && first.kind != TokenKind::ColonColon) {
@@ -5905,9 +5920,15 @@ ExpressionPtr Parser::parseCast() {
 			++skip;
 		}
 		if (lookahead(skip).kind == TokenKind::Identifier && isIntegerSpecifier(lookahead(skip).text)) {
+			const size_t open = _position;
 			advance();
 			Type type;
 			parseSpecifierRun(type);
+			if (at(TokenKind::LParen)) {
+				// (int(x) + y) starts with a functional conversion, not (int)x.
+				_position = open;
+				return nullptr;
+			}
 			if (at(TokenKind::Star) || at(TokenKind::Ampersand) || at(TokenKind::Less)) {
 				throw CompileError("a cast to a pointer, reference or template type is not supported");
 			}

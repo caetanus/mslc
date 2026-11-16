@@ -1,5 +1,15 @@
 # Known issues
 
+## Qt Quick math compatibility
+
+`metal::fast` and `metal::precise` math calls use the same lowering as ordinary math;
+precision differences are not modelled. `powr` uses `Pow` and requires a nonnegative
+base, as in Metal. GNU declaration specifier attributes are ignored, including
+`always_inline`, `noinline`, and unknown attributes.
+
+`any` and `all` currently lower bool scalars and vectors only. Integer overloads are not
+lowered and are diagnosed.
+
 ## Vexing parse: unused function-looking declarations are rejected, `v(1.0)` calls are not modelled (#356)
 
 `float3 v(float(a));` declares a function in C++ and in Apple's compiler, so a later `v.x` or
