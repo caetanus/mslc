@@ -395,7 +395,6 @@ Apple accepts the first five, which are refused loudly. It also rejects the last
 - `using T = S; T{1,2}`: every alias declaration is rejected ("a using declaration has to name a
   member of a namespace"). It needs the parser's using and lookup code; `typedef S T; T{1,2}` works,
   at statement start too.
-- `sizeof(S{1,2})`: a braced temporary is not an operand sizeof can type, so it is refused (`sizeof(S)` works, #361).
 - A struct with an array member is brace-initialised with the array in its own braces (`A x{{1,2},3}`, designators
   included). Still refused where Apple accepts: brace elision into the array member (`A x{1,2,3}`), a
   struct member that is an array of structs ("an array of structs field in value struct is not lowered yet"),
@@ -534,9 +533,17 @@ for a size mslc cannot give with certainty. Apple accepts, and mslc refuses:
   a member (`sizeof(s.a)`), a name a struct body's own field hides, or an element of a vector or
   matrix. `x`, `x[i]` and `*x` of a declared local, parameter or file-scope object work and are
   sized from the innermost declaration the name finds.
-- Operands that are not a name, element, member, literal, cast or arithmetic of those: calls,
-  `?:`, assignments, `i++` (never evaluated by Apple), `S{...}`, a bool operand of `+`.
-- Arithmetic with a packed vector operand (`sizeof(p + p)` is 12 in Apple; the value is a float3).
-- `sizeof(texture2d<float>)` and `sizeof(sampler)` (Apple answers), and an empty struct (Apple: 1).
+- Operands whose type sema cannot read from the source (#370). It types an operand without building
+  it, so nothing in it runs (`sizeof(i++)` leaves `i` alone and emits nothing), and gives the same
+  size as Apple (compared by value) for names, elements, members, literals, casts, unary and binary
+  operators (integer promotion, the usual conversions, a packed vector keeping its type as the left
+  operand or beside a scalar), `?:` of scalars or of equal vectors, assignments, `++`/`--`, comma,
+  `S{...}`, and a call of the one function its name finds. Still refused: a call whose name has more
+  than one function, a template or a library function beside it; `?:` of arrays or of different
+  structs; pointer arithmetic other than `p + n`, `n + p`, `p - n`; `&x`; a vector with a scalar
+  of another type (`f3 * 2`), vector comparisons and shifts; a shift, `%` or bitwise operator of a
+  float (Apple rejects them too); a pointer parameter of a helper function in an operand that is
+  more than the bare name (it is bound like a local array).
+- A call to a function declared but never defined, inside sizeof (Apple does not need the body).
 - A constant expression where the unsigned sizeof would wrap: `-sizeof(int) + 8`, `sizeof(int) - 8`
   (Apple rejects the latter), a negative operand beside it, or a cast that truncates it.
