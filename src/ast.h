@@ -116,6 +116,9 @@ struct Type {
 
 	// Set for an array type; the element type is described by the rest.
 	std::optional<uint32_t> arrayLength;
+	// Spelled metal::array<T, N> rather than T[N]: the same layout, but a value that a copy, an
+	// assignment, a by-value parameter and a return carry. Meaningful only with arrayLength set.
+	bool isStdArray = false;
 	// The lengths inside the outermost one, outer to inner: float a[2][3] is
 	// arrayLength 2 and innerArrayLengths {3}.
 	std::vector<uint32_t> innerArrayLengths;
@@ -124,6 +127,7 @@ struct Type {
 	void dropOuterDimension() {
 		if (innerArrayLengths.empty()) {
 			arrayLength.reset();
+			isStdArray = false;
 			return;
 		}
 		arrayLength = innerArrayLengths.front();

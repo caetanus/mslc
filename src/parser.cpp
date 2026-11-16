@@ -805,8 +805,9 @@ void Parser::parseUsing() {
 	}
 }
 
-static void rejectUnloweredReturn(const Type& returned, const std::string& quoted) {
-	if (returned.isPointer || returned.arrayLength || returned.resource != ResourceKind::None
+static void rejectUnloweredReturn(const Type& returned, const std::string& quoted, bool allowStdArray = false) {
+	if (returned.isPointer || (returned.arrayLength && !(allowStdArray && returned.isStdArray))
+		|| returned.resource != ResourceKind::None
 		|| returned.addressSpace != AddressSpace::None) {
 		throw CompileError(quoted + " returns a pointer, an array, a texture or sampler, or a value "
 			"in an address space, which is not lowered yet; a helper returns a scalar, vector, "
@@ -1699,7 +1700,7 @@ bool Parser::tryParseHelperFunction() {
 	decl.globalsBefore = _unit.globals.size();
 
 	const std::string quoted = "helper function \"" + decl.name + "\"";
-	rejectUnloweredReturn(decl.returnType, quoted);
+	rejectUnloweredReturn(decl.returnType, quoted, true);
 
 	Type builtin;
 	if (isTypeName(decl.name, builtin) || isSimdVectorName(decl.name, builtin)) {
@@ -1948,11 +1949,20 @@ void Parser::parseStructBody(StructDecl& decl) {
 
 			// The brackets before the name, as in "float[2] a;", are not C++, and
 			// would otherwise be joined or dropped by the suffix read below.
-			if (field.type.arrayLength) {
+			if (field.type.arrayLength && !field.type.isStdArray) {
 				throw CompileError("the array member \"" + field.name + "\" of \"" + decl.name
 					+ "\" puts its length before the name; write the length after it, as in float a[2]");
 			}
-			if (parseArrayDimensions(field.type)) {
+			if (field.type.isStdArray && !field.type.isPointer && at(TokenKind::LBracket)
+				&& lookahead().kind != TokenKind::LBracket) {
+				throw CompileError("the member \"" + field.name + "\" of \"" + decl.name
+					+ "\" is an array of array<T, N>, which is not lowered");
+			}
+			if (field.type.isStdArray && field.type.isPointer) {
+				throw CompileError("the member \"" + field.name + "\" of \"" + decl.name
+					+ "\" is a pointer to array<T, N>, which is not lowered");
+			}
+			if (field.type.isStdArray ? false : parseArrayDimensions(field.type)) {
 				throw CompileError("the array member \"" + field.name + "\" of \"" + decl.name
 					+ "\" needs a length: a member cannot be an array of unknown size");
 			}
@@ -2308,7 +2318,9 @@ namespace {
 		return a.scalar == b.scalar && a.vectorWidth == b.vectorWidth
 			&& a.matrixColumns == b.matrixColumns && a.isPacked == b.isPacked
 			&& a.namedType == b.namedType && a.isConst == b.isConst
-			&& a.enumName == b.enumName && a.isAtomic == b.isAtomic;
+			&& a.enumName == b.enumName && a.isAtomic == b.isAtomic
+			&& a.arrayLength == b.arrayLength && a.innerArrayLengths == b.innerArrayLengths
+			&& a.isStdArray == b.isStdArray;
 	}
 
 	// Names the typedef and enum support has to keep distinct from everything else.
@@ -2383,6 +2395,9 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	out.namedType = alias->second.namedType;
 	out.enumName = alias->second.enumName;
 	out.isAtomic = alias->second.isAtomic;
+	out.arrayLength = alias->second.arrayLength;
+	out.innerArrayLengths = alias->second.innerArrayLengths;
+	out.isStdArray = alias->second.isStdArray;
 	out.isConst = out.isConst || alias->second.isConst;
 	return true;
 }
@@ -3378,6 +3393,9 @@ void Parser::parseTypedef() {
 		if (target.isPointer) {
 			throw CompileError("a typedef of a pointer type is not supported");
 		}
+		if (target.arrayLength && !target.isStdArray) {
+			throw CompileError("a typedef of an array type is not supported");
+		}
 		if (target.addressSpace != AddressSpace::None) {
 			throw CompileError("a typedef of a type with an address space is not supported");
 		}
@@ -4189,6 +4207,66 @@ void Parser::parseDeclaratorStars(Type& type) {
 	}
 }
 
+bool Parser::atStdArray(size_t& nameTokens) const {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
+		return false;
+	}
+	// Only a name that could be the library's array is resolved: resolving any other one here would
+	// report an ambiguity the caller handles itself.
+	const Token& first = at(TokenKind::ColonColon) ? lookahead() : current();
+	if (first.kind != TokenKind::Identifier || (first.text != "array" && first.text != "metal")) {
+		return false;
+	}
+	const std::string name = peekResolved(nameTokens);
+	if (name != "metal::array" && (name != "array" || _declared.count("array"))) {
+		return false;
+	}
+	return lookahead(nameTokens).kind == TokenKind::Less;
+}
+
+// metal::array<T, N> is a struct holding T[N] in Apple's library: it lays out as that array and
+// indexes like it, and unlike it, a copy, an assignment, a by-value parameter and a return carry
+// the elements. It is read as the array with isStdArray set, an array of arrays as a
+// multi-dimensional one. The qualifiers read before it apply to the whole array.
+void Parser::parseStdArray(Type& type, size_t nameTokens) {
+	for (size_t i = 0; i < nameTokens; ++i) {
+		advance();
+	}
+	expect(TokenKind::Less, "to open the template arguments of array");
+	const Type qualifiers = type;
+	Type element = parseType(false, false);
+	if (element.isPointer || element.isConst || element.isConstexpr || element.isStatic
+		|| element.addressSpace != AddressSpace::None || element.isAtomic || element.isPacked
+		|| element.resource != ResourceKind::None || !element.enumName.empty()
+		|| (element.arrayLength && !element.isStdArray)) {
+		throw CompileError("array<T, N> with an element that is a pointer, a reference, const, an atomic, a "
+			"packed vector, a resource, an enum or in an address space is not lowered");
+	}
+	expect(TokenKind::Comma, "between the element type and the length of array");
+	const ExpressionPtr length = parseAdditive();
+	if (!at(TokenKind::Greater)) {
+		throw CompileError("this array length is not lowered: a constant that is more than an arithmetic "
+			"expression needs parentheses");
+	}
+	advance();
+	const int64_t count = length->kind == ExpressionKind::BoolLiteral ? (length->boolValue ? 1 : 0)
+		: evaluateConstant(*length, false);
+	if (count <= 0 || count > UINT32_MAX) {
+		throw CompileError("array<T, " + std::to_string(count) + "> is not lowered: the length has to be "
+			"between 1 and 4294967295 (Apple accepts array<T, 0> and gives it the size of one element)");
+	}
+	if (element.arrayLength) {
+		element.innerArrayLengths.insert(element.innerArrayLengths.begin(), *element.arrayLength);
+	}
+	element.arrayLength = static_cast<uint32_t>(count);
+	element.isStdArray = true;
+	element.isConst = qualifiers.isConst;
+	element.isConstexpr = qualifiers.isConstexpr;
+	element.isStatic = qualifiers.isStatic;
+	element.addressSpace = qualifiers.addressSpace;
+	type = element;
+}
+
 Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	Type type;
 	const size_t typenameAt = _position;
@@ -4253,6 +4331,8 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 				"which mslc takes as an entry point parameter only, and a sampler also as a local");
 		}
 		parseResourceType(type);
+	} else if (size_t arrayTokens = 0; atStdArray(arrayTokens)) {
+		parseStdArray(type, arrayTokens);
 	} else if (!name.empty() && resolveTypeName(name, type)) {
 		consumeName();
 	} else if (atKeyword("enum")) {
@@ -4282,6 +4362,9 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	}
 	parseDeclaratorStars(type);
 
+	if (type.isStdArray && at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
+		throw CompileError("an array of array<T, N> is not lowered");
+	}
 	if (auto length = tryParseArrayLength()) {
 		type.arrayLength = length;
 	}
@@ -4454,6 +4537,9 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 
 	if (helper) {
 		const std::string what = "parameter \"" + param.name + "\" of helper function \"" + helperName + "\" ";
+		if (param.type.isStdArray && (param.type.isPointer || at(TokenKind::LBracket))) {
+			throw CompileError(what + "is a pointer to or an array of array<T, N>, which is not lowered");
+		}
 		// "float p[3]", "float p[]" and "float m[3][3]" decay to a thread pointer to the
 		// first element; the first length is dropped and the lengths inside it stay.
 		if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
@@ -4478,7 +4564,7 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 				"a resource, which a helper function does not take yet; it takes scalar, vector, matrix "
 				"and struct values and a thread pointer to a local array");
 		}
-		if (param.type.arrayLength) {
+		if (param.type.arrayLength && !param.type.isStdArray) {
 			throw CompileError(what + "is an array, which a helper function does not take yet");
 		}
 		// A reference to a thread variable may spell its space out; any other
@@ -4500,6 +4586,11 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 		}
 		recordObjectType(param.name, param.type);
 		return param;
+	}
+
+	if (param.type.isStdArray) {
+		throw CompileError("parameter \"" + param.name + "\" is an array<T, N> of an entry point, which is not "
+			"lowered; put the array in a struct, which a buffer holds");
 	}
 
 	if (param.type.resource != ResourceKind::None
@@ -5121,10 +5212,14 @@ StatementPtr Parser::parseStatement() {
 		const bool bracedTemporary = kind() == TokenKind::Identifier && lookahead().kind == TokenKind::LBrace
 			&& (_unit.findStruct(name) != nullptr
 				|| (resolveTypeName(name, typedefOf) && _unit.findStruct(typedefOf.namedType) != nullptr));
+		size_t arrayTokens = 0;
+		const bool stdArrayType = (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
+			&& !isLocal(name) && atStdArray(arrayTokens);
 		const bool looksLikeType = !bracedTemporary &&
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
 				|| (_unit.findStruct(name) != nullptr && !localHidesStruct)))
+			|| stdArrayType
 			|| (kind() == TokenKind::Identifier && (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| atKeyword("enum") || atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
@@ -5134,7 +5229,7 @@ StatementPtr Parser::parseStatement() {
 			VariableDeclaration declaration;
 			Type base;
 			declaration.type = parseType(true, true, &base);
-			if (declaration.type.arrayLength) {
+			if (declaration.type.arrayLength && !declaration.type.isStdArray) {
 				throw CompileError("brackets are not allowed here; write the array length after the name, as float v[N]");
 			}
 			if (declaration.type.isAuto && declaration.type.isPointer) {
@@ -5144,7 +5239,7 @@ StatementPtr Parser::parseStatement() {
 			rejectLocalQualifiers(declaration.type, declaration.isReference, true);
 			if (declaration.isReference) {
 				advance();
-				if (declaration.type.isPointer || declaration.type.arrayLength
+				if (declaration.type.isPointer || (declaration.type.arrayLength && !declaration.type.isStdArray)
 					|| declaration.type.resource != ResourceKind::None) {
 					throw CompileError("a reference to a pointer, an array or a resource is not lowered yet");
 				}
@@ -5914,7 +6009,8 @@ StatementPtr Parser::parseReturnStatement() {
 	expectKeyword("return", "at the start of a return");
 
 	if (!at(TokenKind::Semicolon)) {
-		statement->expression = parseExpression();
+		// "return {1, 2, 3};" copy-initialises the returned value from a braced list.
+		statement->expression = at(TokenKind::LBrace) ? parseInitializerList() : parseExpression();
 	}
 
 	expect(TokenKind::Semicolon, "after a return");
@@ -5968,7 +6064,8 @@ ExpressionPtr Parser::parseAssignment() {
 		expression->compoundOperator = compound;
 		expression->line = left->line;
 		expression->left = std::move(left);
-		expression->right = parseAssignment();
+		// "a = {1, 2, 3};" assigns a braced list, which the emitter takes for an array<T, N> only.
+		expression->right = !compound && at(TokenKind::LBrace) ? parseInitializerList() : parseAssignment();
 		measure(*expression);
 		return expression;
 	}
@@ -6080,7 +6177,7 @@ ExpressionPtr Parser::parseSizeof() {
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name)
 				&& !(kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon && memberHidesName(name))
 				&& (resolveTypeName(name, probe) || isTypeQualifier(name) || isResourceTypeName(name)
-					|| (_unit.findStruct(name) != nullptr && !localHidesStruct)))
+					|| (_unit.findStruct(name) != nullptr && !localHidesStruct) || (!localHidesStruct && atStdArray(nameTokens))))
 			|| atKeyword("device") || atKeyword("constant") || atKeyword("threadgroup") || atKeyword("thread");
 		if (startsType) {
 			Type type = parseType(true, false);
@@ -6394,6 +6491,83 @@ ExpressionPtr Parser::parseNamedCast() {
 	return expression;
 }
 
+std::optional<Type> Parser::declaredPartType(const Expression& operand) const {
+	if (operand.kind == ExpressionKind::Index && !operand.isDereference) {
+		std::optional<Type> base = declaredPartType(*operand.left);
+		if (!base || (base->isPointer && base->arrayLength)) {
+			return std::nullopt;
+		}
+		if (base->arrayLength) {
+			base->dropOuterDimension();
+		} else if (base->isPointer) {
+			base->isPointer = false;
+			base->dropOuterDimension();
+		} else {
+			return std::nullopt;
+		}
+		return base;
+	}
+	if (operand.kind != ExpressionKind::Member) {
+		return declaredObjectType(operand);
+	}
+	const std::optional<Type> owner = declaredPartType(*operand.left);
+	if (!owner || owner->arrayLength || owner->namedType.empty() || owner->isPointer != operand.isArrow) {
+		return std::nullopt;
+	}
+	const StructDecl* decl = _unit.findStruct(owner->namedType);
+	if (!decl) {
+		return std::nullopt;
+	}
+	for (const StructField& field: decl->fields) {
+		if (field.name == operand.memberName) {
+			return field.type;
+		}
+	}
+	return std::nullopt;
+}
+
+ExpressionPtr Parser::foldStdArrayCall(ExpressionPtr& receiver) {
+	if (receiver->kind != ExpressionKind::Member || receiver->isArrow || lookahead().kind != TokenKind::RParen) {
+		return nullptr;
+	}
+	const std::string& name = receiver->memberName;
+	if (name != "size" && name != "max_size" && name != "empty" && name != "front" && name != "back") {
+		return nullptr;
+	}
+	const std::optional<Type> declared = declaredPartType(*receiver->left);
+	if (!declared || !declared->isStdArray || !declared->arrayLength || declared->isPointer) {
+		return nullptr;
+	}
+	const size_t atLine = receiver->line;
+	advance();
+	advance();
+	auto folded = std::make_unique<Expression>();
+	folded->line = atLine;
+	if (name == "empty") {
+		folded->kind = ExpressionKind::BoolLiteral;
+		folded->boolValue = false;
+		return folded;
+	}
+	folded->kind = ExpressionKind::IntLiteral;
+	folded->intKind = ScalarKind::ULong;
+	folded->isSizeof = true;
+	folded->intValue = name == "back" ? *declared->arrayLength - 1 : *declared->arrayLength;
+	if (name == "size" || name == "max_size") {
+		return folded;
+	}
+	// front() and back() are the elements themselves, as places: a[0] and a[N - 1].
+	folded->intValue = name == "back" ? *declared->arrayLength - 1 : 0;
+	folded->isSizeof = false;
+	folded->intKind = ScalarKind::Int;
+	auto index = std::make_unique<Expression>();
+	index->kind = ExpressionKind::Index;
+	index->line = atLine;
+	index->left = std::move(receiver->left);
+	index->arguments.push_back(std::move(folded));
+	measure(*index);
+	return index;
+}
+
 ExpressionPtr Parser::parsePostfix() {
 	auto expression = parsePrimary();
 
@@ -6442,6 +6616,10 @@ ExpressionPtr Parser::parsePostfix() {
 		}
 
 		if (at(TokenKind::LParen)) {
+			if (ExpressionPtr folded = foldStdArrayCall(expression)) {
+				expression = std::move(folded);
+				continue;
+			}
 			advance();
 			auto call = std::make_unique<Expression>();
 			call->kind = ExpressionKind::Call;
@@ -6628,6 +6806,19 @@ ExpressionPtr Parser::parsePrimary() {
 		return expression;
 	}
 
+	if (size_t arrayTokens = 0; (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
+		&& !isLocal(std::string(current().text)) && atStdArray(arrayTokens)) {
+		const size_t atLine = line();
+		const Type type = parseType(false, false);
+		if (!at(TokenKind::LBrace)) {
+			throw CompileError("array<T, N> in an expression is lowered as a braced list, array<T, N>{...}");
+		}
+		ExpressionPtr list = parseInitializerList();
+		list->constructType = type;
+		list->line = atLine;
+		return list;
+	}
+
 	if (kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) {
 		// A name written with namespaces is read whole; a plain one is looked up
 		// unless a parameter or local of that name is in scope.
@@ -6677,6 +6868,14 @@ ExpressionPtr Parser::parsePrimary() {
 			// parenthesised part is a list of arguments; (T)x is parseCast's.
 			consumeName();
 
+			if (type.isStdArray) {
+				if (!at(TokenKind::LBrace)) {
+					throw CompileError("array<T, N> in an expression is lowered as a braced list, " + std::string(text) + "{...}");
+				}
+				ExpressionPtr list = parseInitializerList();
+				list->constructType = type;
+				return list;
+			}
 			if (!at(TokenKind::LParen)) {
 				throw CompileError("expected '(' after type \"" + std::string(text) + "\"");
 			}

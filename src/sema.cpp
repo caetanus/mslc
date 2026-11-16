@@ -2840,6 +2840,11 @@ namespace {
 		// binding-0 block, and the base type is exactly what a member of it has to
 		// point at. This function answers the value a type denotes, which for a
 		// pointer is its pointee, and refusing it here would refuse every buffer.
+		// An array<T, N> is a value of its array type; a T[N] has only its elements as values.
+		if (type.isStdArray && type.arrayLength && !type.isPointer) {
+			return arrayTypeOf(type);
+		}
+
 		if (!type.namedType.empty()) {
 			const Id id = _types.valueStruct(type.namedType);
 			if (id == InvalidId) {
@@ -2993,7 +2998,7 @@ namespace {
 		for (uint32_t i = 0; i < _types.arrayLength(fromType); ++i) {
 			Id element = _builder.emitTyped(spirv::OpCompositeExtract, fromElement, { value, i });
 			if (fromElement != toElement) {
-				element = convertArray(element, fromElement, toElement);
+				element = convert(element, fromElement, toElement);
 			}
 			elements.push_back(element);
 		}
@@ -3052,6 +3057,16 @@ namespace {
 	Id Emitter::convert(Id value, Id fromType, Id toType) {
 		if (fromType == toType) {
 			return value;
+		}
+
+		// An array of one layout as the same array of another (a stride differs between a buffer's
+		// and a local's); a different length or element is no conversion.
+		if (_types.arrayElement(fromType) != InvalidId || _types.arrayElement(toType) != InvalidId) {
+			if (_types.arrayElement(fromType) == InvalidId || _types.arrayElement(toType) == InvalidId
+				|| _types.arrayLength(fromType) != _types.arrayLength(toType)) {
+				throw CompileError("an array is used where an array of another length or element type is expected");
+			}
+			return convertArray(value, fromType, toType);
 		}
 
 		TypeTable::StructForm fromForm;
@@ -3239,6 +3254,11 @@ namespace {
 				"use atomic_load_explicit");
 		}
 
+		if (binding.pointeeMsl.isStdArray && binding.pointeeMsl.arrayLength && binding.isPointer && !binding.isBuffer
+			&& binding.bufferPointeeType == InvalidId && isLocalStorage(binding.storageClass) && !binding.isAddress) {
+			return loadFrom(binding.id, binding.pointeeType);
+		}
+
 		if (binding.pointeeMsl.arrayLength && !binding.isBuffer && binding.bufferPointeeType == InvalidId) {
 			throw CompileError("\"" + expression.name + "\" is an array, which is not a value: index it, as "
 				+ expression.name + "[i]");
@@ -3362,7 +3382,7 @@ namespace {
 			type = _types.arrayElement(type);
 		}
 
-		if (msl.arrayLength) {
+		if (msl.arrayLength && !msl.isStdArray) {
 			throw CompileError("\"" + name + "\" indexed this far is still an array, which is not a value: "
 				"index it down to an element");
 		}
@@ -3599,6 +3619,24 @@ namespace {
 		if (!asAddress) {
 			const Id vector = emitExpression(base);
 			const Id type = _builder.typeOf(vector);
+			if (const Id element = _types.arrayElement(type); element != InvalidId) {
+				// An element of an array value (a call's result): a constant index is read out of the
+				// value, any other one through a temporary the value is stored in.
+				const Expression& at = *expression.arguments[0];
+				if (const auto literal = literalIndex(at); literal && (*literal < 0 || *literal >= _types.arrayLength(type))) {
+					throw CompileError("the index " + std::to_string(*literal) + " is outside an array of "
+						+ std::to_string(_types.arrayLength(type)));
+				} else if (literal) {
+					return _builder.emitTyped(spirv::OpCompositeExtract, element, { vector, static_cast<uint32_t>(*literal) });
+				}
+				const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
+					_types.pointer(spirv::StorageClass::Function, type),
+					{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+				_builder.emit(spirv::OpStore, { variable, vector });
+				const Id address = _builder.emitTyped(spirv::OpAccessChain,
+					_types.pointer(spirv::StorageClass::Function, element), { variable, stepIndex(at, "array element") });
+				return loadFrom(address, element);
+			}
 			if (const auto* matrix = _types.matrixInfo(type)) {
 				return emitMatrixValueColumn(vector, *matrix, *expression.arguments[0]);
 			}
@@ -3887,8 +3925,15 @@ namespace {
 			return std::nullopt;
 		}
 		if (indices < rank) {
-			throw CompileError("an array member indexed this far is still an array, which is not a value: "
-				"index it down to an element");
+			const Expression* base = &expression;
+			while (base->kind == ExpressionKind::Index) {
+				base = base->left.get();
+			}
+			const std::optional<Type> member = placeType(*base);
+			if (!member || !member->isStdArray) {
+				throw CompileError("an array member indexed this far is still an array, which is not a value: "
+					"index it down to an element");
+			}
 		}
 		Id fieldType = InvalidId;
 		const Id address = emitMemberAddress(expression, fieldType);
@@ -4015,6 +4060,8 @@ namespace {
 
 		outFieldType = InvalidId;
 		bool inMember = false;
+		const StructDecl* memberOwner = nullptr;
+		size_t memberField = 0;
 
 		for (const AccessStep& step: steps) {
 			if (step.isIndex) {
@@ -4083,17 +4130,32 @@ namespace {
 			operands.push_back(constantU32(static_cast<uint32_t>(field)));
 			current = decl->fields[field].type;
 			inMember = true;
+			memberOwner = decl;
+			memberField = field;
 		}
 
 		if (current.namedType.empty() && steps.back().isIndex && !inMember) {
 			throw CompileError("a member access has to end at a struct field");
 		}
-		if (current.arrayLength) {
+		if (current.arrayLength && !current.isStdArray) {
 			throw CompileError("an array member is used as a whole value, "
 				"which mslc does not lower; index it down to an element");
 		}
 
 		outFieldType = declaredTypeOf(current);
+		const bool arrayInBuffer = fromBuffer || binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer;
+		if (current.arrayLength && arrayInBuffer) {
+			// A struct in a buffer holds its array with a stride, which is another type than the
+			// local's; the member's type in the laid-out struct is what the chain points at.
+			TypeTable::StructForm form;
+			if (!memberOwner || !_types.structForm(_types.namedStruct(memberOwner->name), form)) {
+				throw CompileError("an array member in a buffer has no laid-out struct to take its type from");
+			}
+			outFieldType = form.declared[memberField];
+			for (size_t dimension = memberOwner->fields[memberField].type.arrayRank(); dimension > current.arrayRank(); --dimension) {
+				outFieldType = _types.arrayElement(outFieldType);
+			}
+		}
 
 		const spirv::StorageClassValue storageClass = fromBuffer
 			? spirv::StorageClass::PhysicalStorageBuffer : binding.storageClass;
@@ -7939,7 +8001,12 @@ namespace {
 		if (!_helper->returnType.enumName.empty()) {
 			requireEnumValue(_helper->returnType.enumName, *statement.expression, "the value " + quoted + " returns");
 		}
-		const Id value = emitExpression(*statement.expression);
+		const bool braced = statement.expression->kind == ExpressionKind::InitList && !statement.expression->constructType;
+		if (braced && !_helper->returnType.enumName.empty()) {
+			throw CompileError("a braced list is returned as " + typeName(_helper->returnType) + ", an enum, which is not lowered");
+		}
+		const Id value = braced ? emitInitListValue(_helper->returnType, *statement.expression)
+			: emitExpression(*statement.expression);
 		terminate(spirv::OpReturnValue, { convertImplicit(value, declaredTypeOf(_helper->returnType)) });
 	}
 
@@ -12440,6 +12507,13 @@ namespace {
 	// list is consumed from position, and a braced list that leaves entries over is an error.
 	Id Emitter::emitArrayInit(const Type& type, const std::vector<InitializerElement>& entries,
 		size_t& position, bool braced, const ArrayLeaves& leaves) {
+		// array<T, N> a = {{1, 2, 3}}: the outer braces are the struct's and the inner ones the
+		// array member's, where {1, 2, 3} reaches the member by brace elision.
+		if (type.isStdArray && braced && entries.size() == 1 && entries[0].fieldName.empty()
+			&& entries[0].value->kind == ExpressionKind::InitList) {
+			size_t inner = 0;
+			return emitArrayInit(type, entries[0].value->elements, inner, true, leaves);
+		}
 		Type element = type;
 		element.dropOuterDimension();
 		const bool rows = element.arrayLength.has_value();
@@ -12571,6 +12645,8 @@ namespace {
 		if (!storageOnly && !threadgroup) {
 			if (!declaration.initializer) {
 				initial = _types.zero(arrayType);
+			} else if (declaration.initializer->kind != ExpressionKind::InitList && type.isStdArray) {
+				initial = convertImplicit(emitExpression(*declaration.initializer), arrayType);
 			} else if (declaration.initializer->kind != ExpressionKind::InitList) {
 				throw CompileError("array initializer must be an initializer list");
 			} else {
@@ -13187,7 +13263,8 @@ namespace {
 					+ ", which cannot be assigned: mslc binds a texture or sampler name to one descriptor "
 					"and does not lower choosing another at run time");
 			}
-			if (named != _bindings.end() && named->second.pointeeMsl.arrayLength && !named->second.isBuffer) {
+			if (named != _bindings.end() && named->second.pointeeMsl.arrayLength && !named->second.isBuffer
+				&& !(named->second.pointeeMsl.isStdArray && isLocalStorage(named->second.storageClass))) {
 				const bool unsized = *named->second.pointeeMsl.arrayLength == UINT32_MAX;
 				throw CompileError(unsized ? "the threadgroup argument \"" + left.name + "\" is not assignable; assign through it"
 					: "array type " + typeName(named->second.pointeeMsl) + " is not assignable");
@@ -13239,6 +13316,12 @@ namespace {
 				? loadFromBuffer(address, pointeeType) : loadFrom(address, pointeeType);
 			value = emitCompoundOperation(*compound, current,
 				emitExpression(right));
+		} else if (right.kind == ExpressionKind::InitList && !right.constructType) {
+			const std::optional<Type> target = placeType(left);
+			if (!target || !target->isStdArray || !target->arrayLength || target->isPointer) {
+				throw CompileError("assigning a braced list is lowered to an array<T, N> only");
+			}
+			value = emitInitListValue(*target, right);
 		} else {
 			value = emitExpression(right);
 		}

@@ -310,6 +310,11 @@ private:
 	// plain, nearest "metal::" is the literal branches' and counts as none.
 	size_t libraryPrefixParts(const QualifiedName& name) const;
 	size_t libraryPrefixTokens() const;
+	// Whether the cursor is at metal::array<, spelled with or without the namespace unless the file
+	// declares its own array; nameTokens is how many tokens the name takes.
+	bool atStdArray(size_t& nameTokens) const;
+	// array<T, N> after its qualifiers, folded into type as the array T[N] with isStdArray set.
+	void parseStdArray(Type& type, size_t nameTokens);
 	// Whether a using directive in scope, directly or through the namespaces it nominates, reaches metal.
 	bool libraryNominatedFromHere() const;
 	// The library's resource type name that a library prefix qualifies, or 0.
@@ -368,6 +373,13 @@ private:
 	void recordConstant(const VariableDeclaration& declaration, bool local);
 	void recordObjectType(const std::string& name, const Type& type);
 	std::optional<Type> declaredObjectType(const Expression& operand) const;
+	// declaredObjectType, and a member of a declared struct value that is itself typed this way.
+	std::optional<Type> declaredPartType(const Expression& operand) const;
+	// The expression an array<T, N> member call is: a constant of the length for size(),
+	// max_size() and empty(), the element at 0 or N - 1 for front() and back(). Null when the
+	// receiver is not a declared array<T, N> or the call is another one; consumes the "()" if it
+	// is one.
+	ExpressionPtr foldStdArrayCall(ExpressionPtr& receiver);
 	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	// A file-scope function that is not an entry point. False, with the position
