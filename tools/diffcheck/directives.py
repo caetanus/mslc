@@ -4,6 +4,9 @@
   // DIFFCHECK: writes-zero                          every output is legitimately all zero
   // DIFFCHECK-RANGE: <buffer> <lo> <hi>             integer leaves of that buffer are drawn from lo..hi,
                                                      for a buffer the kernel uses as an index
+  // DIFFCHECK-FLOAT-RANGE: <buffer> <lo> <hi>       float leaves of that buffer are drawn from the integers lo..hi,
+                                                     for a buffer whose value the kernel converts to an index or
+                                                     a loop bound (so the conversion is defined)
   // DIFFCHECK-EXCLUDE: <buffer> <reason>            skip a buffer's comparison; the reason
                                                      is required and is printed in the report
 
@@ -33,7 +36,7 @@ def _point(token):
 
 
 def parse(source):
-    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "geometry": None, "position": None,
+    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "geometry": None, "position": None,
               "depth": False}
     for line in source.splitlines():
         m = re.match(r"\s*//\s*RUN:\s*(.*)$", line)
@@ -70,6 +73,13 @@ def parse(source):
             if lo > hi:
                 raise ValueError("DIFFCHECK-RANGE %s: %d > %d" % (m.group(1), lo, hi))
             result["range"][m.group(1)] = (lo, hi)
+            continue
+        m = re.match(r"\s*//\s*DIFFCHECK-FLOAT-RANGE:\s*(\S+)\s+(-?\d+)\s+(-?\d+)\s*$", line)
+        if m:
+            lo, hi = int(m.group(2)), int(m.group(3))
+            if lo > hi:
+                raise ValueError("DIFFCHECK-FLOAT-RANGE %s: %d > %d" % (m.group(1), lo, hi))
+            result["float_range"][m.group(1)] = (lo, hi)
             continue
         m = re.match(r"\s*//\s*DIFFCHECK-EXCLUDE:\s*(\S+)\s*(.*)$", line)
         if m:

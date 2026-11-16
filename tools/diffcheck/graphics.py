@@ -315,7 +315,8 @@ def check_pair(opts, source, vs, fs, params, work, includes):
             for b in sorted((b for b in ep["bindings"] if b["kind"] == "Buffer"), key=lambda b: b["member"]):
                 layout = plan["layouts"][stage][b["metal_index"]]
                 data = inputs.fill_buffer(layout, params.get("elems") or DEFAULT_ELEMS, rng, profile, False, False,
-                                          params["range"].get(layout["name"]), case)
+                                          params["range"].get(layout["name"]), case,
+                                          params["float_range"].get(layout["name"]))
                 path = base + "%s-buf%d.bin" % (stage, b["metal_index"])
                 hostenv.write_bytes(path, data)
                 buffers.append((stage, b["metal_index"], b["descriptor"]["set"], b["member"], len(data), path))

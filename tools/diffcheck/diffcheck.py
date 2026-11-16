@@ -86,7 +86,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     for case, (profile, sentinel) in enumerate(profiles):
         rng = random.Random(params["seed"] * 1000 + case)
         data = {i: inputs.fill_buffer(l, elements, rng, profile, sentinel, opts.poison_padding,
-                                  params["range"].get(l["name"]), case)
+                                  params["range"].get(l["name"]), case, params["float_range"].get(l["name"]))
                 for i, l in sorted(layouts.items())}
         outs = {}
         for backend, runner in (("apple", hosts.run_metal), ("mslc", hosts.run_vulkan)):
@@ -145,7 +145,7 @@ def unknown_directives(opts, d, results):
     known = set().union(*(r.get("buffers", []) for r in results))
     errors = []
     if known:
-        named = {"DIFFCHECK-EXCLUDE": d["exclude"], "DIFFCHECK-RANGE": d["range"]}
+        named = {"DIFFCHECK-EXCLUDE": d["exclude"], "DIFFCHECK-RANGE": d["range"], "DIFFCHECK-FLOAT-RANGE": d["float_range"]}
         if not opts.corpus:
             named["--range"] = opts.ranges
         for directive, table in named.items():
@@ -162,7 +162,7 @@ def check_graphics_file(opts, path, d, vs, fs, work, includes, std):
               "instances": opts.instances or run.get("instances", 1), "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
               "cases": opts.cases or run.get("cases", 2), "elems": opts.elems or run.get("elems"), "std": std or opts.std,
               "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
-              "geometry": d["geometry"], "position": d["position"], "depth": d["depth"]}
+              "geometry": d["geometry"], "position": d["position"], "depth": d["depth"], "float_range": d["float_range"]}
     sub = os.path.join(work, "graphics")
     os.makedirs(sub)
     results = [graphics.check_pair(opts, path, vs, fs, params, sub, includes)]
@@ -199,6 +199,7 @@ def check_file(opts, path, std=None):
                 "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
                 "cases": opts.cases or run.get("cases", 3), "elems": opts.elems or run.get("elems"),
                 "std": std or opts.std, "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
+                "float_range": d["float_range"],
             }
             sub = os.path.join(work, e["name"])
             os.makedirs(sub)

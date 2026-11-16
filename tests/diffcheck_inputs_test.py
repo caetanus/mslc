@@ -82,6 +82,22 @@ class Bounds(unittest.TestCase):
         floats = {struct.unpack_from("<I", make("wide", bounds=(0, 3)), i * 16)[0] for i in range(400)}
         self.assertGreater(len(floats), 100)
 
+    def test_float_bounds_give_integer_valued_floats_and_leave_integers_alone(self):
+        for profile in inputs.PROFILES:
+            data = make(profile, float_bounds=(1, 3))
+            self.assertEqual({struct.unpack_from("<f", data, i * 16)[0] for i in range(400)}, {1.0, 2.0, 3.0}, profile)
+            self.assertEqual({struct.unpack_from("<e", data, i * 16 + 10)[0] for i in range(400)} <= {1.0, 2.0, 3.0}, True)
+            ints = {struct.unpack_from("<I", data, i * 16 + 4)[0] for i in range(400)}
+            self.assertGreater(len(ints), 100, profile)
+
+
+    def test_float_bounds_apply_to_a_sentinel_case_and_a_half_must_fit(self):
+        data = make("wide", sentinel=True, float_bounds=(1, 3))
+        self.assertEqual({struct.unpack_from("<f", data, i * 16)[0] for i in range(400)}, {1.0, 2.0, 3.0})
+        self.assertEqual({data[i * 16 + 4] for i in range(400)}, {0x7f})
+        with self.assertRaises(ValueError):
+            make("wide", float_bounds=(0, 70000))
+
 
 class Directives(unittest.TestCase):
     def test_parse(self):
@@ -89,7 +105,12 @@ class Directives(unittest.TestCase):
                              "// DIFFCHECK-EXCLUDE: scratch reads uninitialised memory\nkernel void k() {}\n")
         self.assertEqual(d, {"run": {"grid": 64, "seed": 2}, "writes_zero": True,
                              "exclude": {"scratch": "reads uninitialised memory"},
-                             "range": {"which": (0, 3)}, "geometry": None, "position": None, "depth": False})
+                             "range": {"which": (0, 3)}, "float_range": {}, "geometry": None, "position": None, "depth": False})
+
+    def test_float_range(self):
+        self.assertEqual(directives.parse("// DIFFCHECK-FLOAT-RANGE: in 0 1\n")["float_range"], {"in": (0, 1)})
+        with self.assertRaises(ValueError):
+            directives.parse("// DIFFCHECK-FLOAT-RANGE: in 3 1\n")
 
     def test_exclusion_without_a_reason_is_an_error(self):
         with self.assertRaises(ValueError):

@@ -53,11 +53,15 @@ def _step(walk, table, rng):
     return table[(walk[0] + walk[1]) % len(table)]
 
 
-def leaf_bits(rng, scalar, profile, bounds=None, walk=None):
+def leaf_bits(rng, scalar, profile, bounds=None, walk=None, float_bounds=None):
     size, kind = SCALARS[scalar]
     if kind == "bool":
         return rng.getrandbits(1)
     if kind == "float":
+        if float_bounds:
+            if scalar == "half" and max(abs(b) for b in float_bounds) > 65504:
+                raise ValueError("DIFFCHECK-FLOAT-RANGE %d..%d does not fit a half" % float_bounds)
+            return _bits(float(rng.randint(*float_bounds)), "<f" if scalar == "float" else "<e")
         if profile == "moderate":
             quarter = rng.random() < 0.25
             value = rng.randrange(-16, 17) / 4 if quarter else rng.uniform(-4, 4)
@@ -77,10 +81,12 @@ def leaf_bits(rng, scalar, profile, bounds=None, walk=None):
     return rng.getrandbits(size * 8)
 
 
-def fill_buffer(layout, elements, rng, profile, sentinel=False, poison_padding=False, bounds=None, phase=0):
+def fill_buffer(layout, elements, rng, profile, sentinel=False, poison_padding=False, bounds=None, phase=0,
+                float_bounds=None):
     """A bytearray of elements * stride bytes for one buffer. `bounds` (lo, hi) limits its
     integer leaves, for a buffer a kernel uses as an index. `phase` (the case number) offsets the
-    walk through the edge values, so different cases start at different ones."""
+    walk through the edge values, so different cases start at different ones. `float_bounds` does the
+    same for float leaves (integer-valued)."""
     stride = layout["stride"]
     walk = [-1, phase]
     data = bytearray([SENTINEL if sentinel else POISON if poison_padding else 0]) * (elements * stride)
@@ -91,8 +97,8 @@ def fill_buffer(layout, elements, rng, profile, sentinel=False, poison_padding=F
             at = element * stride + leaf["off"]
             if sentinel and SCALARS[scalar][1] == "bool":
                 data[at] = rng.getrandbits(1)
-            elif sentinel and not (bounds and SCALARS[scalar][1] == "int"):
+            elif sentinel and not ((bounds and SCALARS[scalar][1] == "int") or (float_bounds and SCALARS[scalar][1] == "float")):
                 continue
             else:
-                data[at:at + size] = leaf_bits(rng, scalar, "wide" if sentinel else profile, bounds, walk).to_bytes(size, "little")
+                data[at:at + size] = leaf_bits(rng, scalar, "wide" if sentinel else profile, bounds, walk, float_bounds).to_bytes(size, "little")
     return data
