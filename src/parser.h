@@ -369,6 +369,10 @@ private:
 	void parseTemplateDeclaration();
 	void skipBalanced(TokenKind open, TokenKind close);
 	void skipFunctionAttribute();
+	// The <type_traits> predicates (is_same, is_floating_point ...), folded where the types are known.
+	void closeAngle(const char* what);
+	std::string libraryName(const std::string& resolved) const;
+	ExpressionPtr tryParseTraitValue();
 	size_t _functionOrder = 0;
 	void parseGlobalDeclaration();
 	VariableDeclaration parseGlobalDeclarator(VariableDeclaration declaration);

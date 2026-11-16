@@ -1357,6 +1357,180 @@ TemplateArgument Parser::parseTemplateArgument() {
 	return argument;
 }
 
+namespace {
+
+// A trait's argument is a deduction marker: its value is not known until the type is.
+class DependentTrait: public CompileError {
+public:
+	using CompileError::CompileError;
+};
+
+bool isDeductionMarker(const Type& type) {
+	return type.namedType.size() > 2 && type.namedType.front() == '<' && type.namedType.back() == '>';
+}
+
+bool isScalarOrVector(const Type& type) {
+	return type.matrixColumns == 0 && type.namedType.empty() && type.enumName.empty() && type.scalar != ScalarKind::Void;
+}
+
+bool sameTraitType(const Type& a, const Type& b) {
+	return a.scalar == b.scalar && a.vectorWidth == b.vectorWidth && a.matrixColumns == b.matrixColumns
+		&& a.isPacked == b.isPacked && a.namedType == b.namedType && a.enumName == b.enumName && a.isConst == b.isConst;
+}
+
+}
+
+// <type_traits> as Metal's library has it (measured against Apple's compiler), for the types mslc
+// has: scalar, vector (packed or not), matrix, struct and enum. A vector counts as floating point,
+// integral, signed or unsigned by its element, and as arithmetic; a matrix is a class; an enum is
+// a scalar and nothing else numeric. A type with a pointer, array, address space or resource is
+// refused, not guessed at.
+static bool traitHolds(const std::string& trait, const std::vector<Type>& operands, const TranslationUnit& unit) {
+	for (const Type& type: operands) {
+		if (isDeductionMarker(type)) {
+			throw DependentTrait("the trait \"" + trait + "\" depends on a type that is not deduced yet");
+		}
+		if (type.isPointer || type.arrayLength || type.resource != ResourceKind::None || type.isAtomic
+			|| type.addressSpace != AddressSpace::None || type.isAuto) {
+			throw CompileError("the trait \"" + trait + "\" of a pointer, array, texture, sampler, atomic or "
+				"address-space-qualified type is not lowered");
+		}
+		if (!type.namedType.empty() && !unit.findStruct(type.namedType)) {
+			throw CompileError("the trait \"" + trait + "\" of \"" + type.namedType + "\", which is not a type "
+				"mslc knows");
+		}
+		if (type.scalar == ScalarKind::Double && isScalarOrVector(type)) {
+			throw CompileError("the trait \"" + trait + "\" of a double is not lowered");
+		}
+	}
+	if (trait == "is_same") {
+		return sameTraitType(operands.at(0), operands.at(1));
+	}
+	const Type& type = operands.at(0);
+	const bool numeric = isScalarOrVector(type);
+	const ScalarKind kind = type.scalar;
+	const bool floating = kind == ScalarKind::Half || kind == ScalarKind::Float;
+	const bool unsignedKind = kind == ScalarKind::Bool || kind == ScalarKind::UChar || kind == ScalarKind::UShort
+		|| kind == ScalarKind::UInt || kind == ScalarKind::ULong;
+	if (trait == "is_floating_point") {
+		return numeric && floating;
+	}
+	if (trait == "is_integral") {
+		return numeric && !floating;
+	}
+	if (trait == "is_arithmetic") {
+		return numeric;
+	}
+	if (trait == "is_signed") {
+		return numeric && !unsignedKind;
+	}
+	if (trait == "is_unsigned") {
+		return numeric && unsignedKind;
+	}
+	if (trait == "is_scalar") {
+		return (numeric && type.vectorWidth == 0) || !type.enumName.empty();
+	}
+	if (trait == "is_vector") {
+		return numeric && type.vectorWidth != 0;
+	}
+	if (trait == "is_class") {
+		return type.matrixColumns != 0 || !type.namedType.empty();
+	}
+	if (trait == "is_enum") {
+		return !type.enumName.empty();
+	}
+	if (trait == "is_const") {
+		return type.isConst;
+	}
+	throw CompileError("the trait \"" + trait + "\" is not lowered");
+}
+
+// The ">" that closes a template argument list; a ">>" is two of them, and the first is taken.
+void Parser::closeAngle(const char* what) {
+	if (at(TokenKind::ShiftRight)) {
+		_tokens[_position].kind = TokenKind::Greater;
+		_tokens[_position].text = ">";
+		_tokens.insert(_tokens.begin() + _position, _tokens[_position]);
+	}
+	expect(TokenKind::Greater, what);
+}
+
+// The name in the standard library's namespace that a resolved name denotes, or none when the
+// file declares its own: an unqualified name is resolved as spelled, so a local or a declaration
+// of that spelling hides the library's.
+std::string Parser::libraryName(const std::string& resolved) const {
+	if (resolved.rfind("metal::", 0) == 0) {
+		return resolved.substr(7);
+	}
+	if (resolved.find("::") == std::string::npos && kindsOf(resolved).empty() && !isLocal(resolved)
+		&& !memberHidesName(resolved)) {
+		return resolved;
+	}
+	return std::string();
+}
+
+// "is_same<A, B>::value", "is_same_v<A, B>" and the other one- and two-type predicates, as a bool.
+ExpressionPtr Parser::tryParseTraitValue() {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
+		return nullptr;
+	}
+	// Only a spelling that ends in "is_...<" is resolved: resolving every identifier here would throw
+	// for a function name that is ambiguous until its arguments choose the overload.
+	const auto tokenAt = [&](size_t offset) -> const Token& {
+		return _tokens[std::min(_position + offset, _tokens.size() - 1)];
+	};
+	size_t end = at(TokenKind::ColonColon) ? 1 : 0;
+	while (tokenAt(end + 1).kind == TokenKind::ColonColon && tokenAt(end + 2).kind == TokenKind::Identifier) {
+		end += 2;
+	}
+	if (tokenAt(end).kind != TokenKind::Identifier || tokenAt(end).text.rfind("is_", 0) != 0
+		|| tokenAt(end + 1).kind != TokenKind::Less) {
+		return nullptr;
+	}
+	size_t nameTokens = 0;
+	std::string name = peekResolved(nameTokens);
+	name = libraryName(name);
+	if (name.rfind("is_", 0) != 0 || lookahead(nameTokens).kind != TokenKind::Less) {
+		return nullptr;
+	}
+	const bool variable = name.size() > 2 && name.compare(name.size() - 2, 2, "_v") == 0;
+	const std::string trait = variable ? name.substr(0, name.size() - 2) : name;
+	static const std::set<std::string> kTraits = { "is_same", "is_floating_point", "is_integral", "is_arithmetic",
+		"is_signed", "is_unsigned", "is_scalar", "is_vector", "is_class", "is_enum", "is_const" };
+	if (!kTraits.count(trait)) {
+		throw CompileError("the trait \"" + trait + "\" is not lowered; mslc folds is_same, is_floating_point, "
+			"is_integral, is_arithmetic, is_signed, is_unsigned, is_scalar, is_vector, is_class, is_enum and is_const");
+	}
+	const size_t startLine = line();
+	for (size_t i = 0; i < nameTokens; ++i) {
+		advance();
+	}
+	advance();
+	std::vector<Type> operands;
+	const size_t wanted = trait == "is_same" ? 2 : 1;
+	for (;;) {
+		operands.push_back(parseType());
+		if (operands.size() < wanted) {
+			expect(TokenKind::Comma, ("between the types of \"" + trait + "\"").c_str());
+			continue;
+		}
+		break;
+	}
+	closeAngle(("to close the types of \"" + trait + "\"").c_str());
+	if (!variable) {
+		expect(TokenKind::ColonColon, ("after \"" + trait + "<...>\"").c_str());
+		if (!atKeyword("value")) {
+			throw CompileError("expected \"value\" after \"" + trait + "<...>::\"");
+		}
+		advance();
+	}
+	auto expression = std::make_unique<Expression>();
+	expression->kind = ExpressionKind::BoolLiteral;
+	expression->line = startLine;
+	expression->boolValue = traitHolds(trait, operands, _unit);
+	return expression;
+}
+
 // "__attribute__((...))" ahead of a helper's return type, as METAL_FUNC expands to. The ones that
 // only steer inlining or diagnostics change no value and are dropped; any other is refused, since
 // ignoring one that matters (noreturn, aligned) would compile a different program.
@@ -6229,6 +6403,10 @@ ExpressionPtr Parser::parsePrimary() {
 				throw CompileError("a prefixed string literal is not lowered; " + std::string(kStringLimit));
 			}
 		}
+	}
+
+	if (ExpressionPtr trait = tryParseTraitValue()) {
+		return trait;
 	}
 
 	if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Less) {
