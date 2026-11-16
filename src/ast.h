@@ -99,6 +99,9 @@ struct Type {
 
 	bool isPointer = false;
 	bool isConst = false;
+	// Written volatile. Nothing but the type traits and template arguments reads it (it changes no
+	// code), and they refuse it, since is_same<volatile int, int> is false.
+	bool isVolatile = false;
 
 	// Written as auto: the scalar, vector and name above are not known until
 	// semantic analysis deduces them from the initialiser. Only a local has one.

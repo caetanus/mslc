@@ -1175,8 +1175,7 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 
 	const auto skipAttributes = [&] {
 		while (atKeyword("__attribute__") && lookahead().kind == TokenKind::LParen) {
-			advance();
-			skipBalanced(TokenKind::LParen, TokenKind::RParen);
+			skipFunctionAttribute();
 		}
 	};
 	FunctionDecl decl;
@@ -1315,8 +1314,9 @@ TemplateArgument templateDefault(const FunctionTemplate& declaration, size_t ind
 		if (parameter.isType) {
 			result.type = parser.parseType();
 			if (result.type.isPointer || result.type.arrayLength || result.type.resource != ResourceKind::None
-				|| !result.type.enumName.empty() || result.type.addressSpace != AddressSpace::None) {
-				throw CompileError("that is a pointer, an array, a resource, an enum or in an address space");
+				|| !result.type.enumName.empty() || result.type.addressSpace != AddressSpace::None
+				|| result.type.isVolatile) {
+				throw CompileError("that is a pointer, an array, a resource, an enum, volatile or in an address space");
 			}
 		} else {
 			const ExpressionPtr expression = parser.parseAssignment();
@@ -1349,9 +1349,10 @@ TemplateArgument Parser::parseTemplateArgument() {
 	if (isTypeArgument) {
 		argument.type = parseType();
 		if (argument.type.isPointer || argument.type.arrayLength || argument.type.resource != ResourceKind::None
-			|| !argument.type.enumName.empty() || argument.type.addressSpace != AddressSpace::None) {
-			throw CompileError("a template argument that is a pointer, an array, a resource, an enum or in an "
-				"address space is not lowered");
+			|| !argument.type.enumName.empty() || argument.type.addressSpace != AddressSpace::None
+			|| argument.type.isVolatile) {
+			throw CompileError("a template argument that is a pointer, an array, a resource, an enum, volatile or "
+				"in an address space is not lowered");
 		}
 		return argument;
 	}
@@ -1372,6 +1373,17 @@ namespace {
 class DependentTrait: public CompileError {
 public:
 	using CompileError::CompileError;
+};
+
+// Sets a parser flag for a scope and puts it back on every way out, an exception included: a
+// failed read is retried (tryParseHelperFunction backtracks) with the parser's flags as they were.
+class RestoreFlag {
+	bool& _flag;
+	bool _old;
+
+public:
+	RestoreFlag(bool& flag, bool value): _flag(flag), _old(flag) { _flag = value; }
+	~RestoreFlag() { _flag = _old; }
 };
 
 bool isDeductionMarker(const Type& type) {
@@ -1396,6 +1408,9 @@ bool sameTraitType(const Type& a, const Type& b) {
 // refused, not guessed at.
 static bool traitHolds(const std::string& trait, const std::vector<Type>& operands, const TranslationUnit& unit) {
 	for (const Type& type: operands) {
+		if (type.isVolatile) {
+			throw CompileError("the trait \"" + trait + "\" of a volatile type is not lowered");
+		}
 		if (isDeductionMarker(type)) {
 			throw DependentTrait("the trait \"" + trait + "\" depends on a type that is not deduced yet");
 		}
@@ -1417,6 +1432,9 @@ static bool traitHolds(const std::string& trait, const std::vector<Type>& operan
 	}
 	const Type& type = operands.at(0);
 	const bool numeric = isScalarOrVector(type);
+	// Apple (measured): a const vector is neither signed nor unsigned, though it is still a vector,
+	// floating point or integral and arithmetic.
+	const bool constVector = numeric && type.isConst && type.vectorWidth != 0;
 	const ScalarKind kind = type.scalar;
 	const bool floating = kind == ScalarKind::Half || kind == ScalarKind::Float;
 	const bool unsignedKind = kind == ScalarKind::Bool || kind == ScalarKind::UChar || kind == ScalarKind::UShort
@@ -1431,10 +1449,10 @@ static bool traitHolds(const std::string& trait, const std::vector<Type>& operan
 		return numeric;
 	}
 	if (trait == "is_signed") {
-		return numeric && !unsignedKind;
+		return numeric && !unsignedKind && !constVector;
 	}
 	if (trait == "is_unsigned") {
-		return numeric && unsignedKind;
+		return numeric && unsignedKind && !constVector;
 	}
 	if (trait == "is_scalar") {
 		return (numeric && type.vectorWidth == 0) || !type.enumName.empty();
@@ -1555,16 +1573,16 @@ void Parser::parseTraitType(const std::string& name, Type& type) {
 	expect(TokenKind::Less, ("after \"" + name + "\"").c_str());
 	Type result;
 	if (enableIf) {
-		const bool outerNoGreater = std::exchange(_noGreater, true);
-		const bool outerInside = std::exchange(_inEnableIf, true);
-		const bool outerDependent = std::exchange(_dependentCondition, false);
-		const ExpressionPtr condition = parseConditional();
-		_noGreater = outerNoGreater;
-		_inEnableIf = outerInside;
-		// A condition that names a type parameter being deduced holds for now: the instance's own
-		// signature is read again with the type, and that read decides.
-		const bool holds = _dependentCondition || evaluateConstant(*condition, false) != 0;
-		_dependentCondition = outerDependent;
+		bool holds = false;
+		{
+			const RestoreFlag noGreater(_noGreater, true);
+			const RestoreFlag inside(_inEnableIf, true);
+			const RestoreFlag dependent(_dependentCondition, false);
+			const ExpressionPtr condition = parseConditional();
+			// A condition that names a type parameter being deduced holds for now: the instance's own
+			// signature is read again with the type, and that read decides.
+			holds = _dependentCondition || evaluateConstant(*condition, false) != 0;
+		}
 		result.scalar = ScalarKind::Void;
 		if (match(TokenKind::Comma)) {
 			result = parseType();
@@ -4054,6 +4072,9 @@ bool Parser::parseQualifier(Type& type, bool afterPointer) {
 
 	if (text == "const" && !afterPointer) {
 		type.isConst = true;
+	}
+	if (text == "volatile" && !afterPointer) {
+		type.isVolatile = true;
 	}
 	if (text == "constexpr") {
 		type.isConstexpr = true;
@@ -6561,9 +6582,8 @@ ExpressionPtr Parser::parsePrimary() {
 
 	if (at(TokenKind::LParen)) {
 		advance();
-		const bool outerNoGreater = std::exchange(_noGreater, false);
+		const RestoreFlag freshExpression(_noGreater, false);
 		auto expression = parseExpression();
-		_noGreater = outerNoGreater;
 		expect(TokenKind::RParen, "to close a parenthesised expression");
 		return expression;
 	}

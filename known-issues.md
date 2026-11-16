@@ -541,9 +541,15 @@ measured with `xcrun metal` and `mslc` on the same source.
 - Not diagnosed (mslc is more lenient than Apple, no wrong value): two templates of one name and signature
   that differ only in their defaults, or a default repeated on a redeclaration (Apple: "template parameter
   redefines default argument"); an `enable_if<false>` or an undeclared trait in a template that is never
-  instantiated (Apple rejects it at the definition).
+  instantiated, and an enable_if whose condition does not name a template parameter and is false
+  (`enable_if_t<false, int>`, `is_same_v<float, int>`), which drops the template silently where Apple rejects
+  it at the definition.
+- `volatile` is not part of a type in mslc, so a trait of a volatile type and a volatile template argument
+  (`f<volatile float>`) are diagnostics; Apple treats `volatile float` as a type of its own.
+- A trait of a struct declared after the template that uses it, inside a namespace, is "not a type mslc
+  knows" (an error, no wrong value).
 - A function attribute ahead of a helper's return type is dropped for `always_inline`, `noinline`, `unused` and
-  `used` (METAL_FUNC) and refused for any other; it is read in that position only.
+  `used` (METAL_FUNC) and refused for any other, on a template when it is instantiated.
 
 ## Function template instantiation: what is refused or approximated (#341, slice 2)
 
