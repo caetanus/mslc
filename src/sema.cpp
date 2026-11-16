@@ -7293,7 +7293,8 @@ namespace {
 	std::optional<Type> Emitter::placeType(const Expression& place) {
 		switch (place.kind) {
 			case ExpressionKind::Identifier: {
-				const auto binding = _bindings.find(place.name);
+				// "::x" is the file-scope x, whatever local hides it.
+				const auto binding = place.fileScope ? _bindings.end() : _bindings.find(place.name);
 				if (binding != _bindings.end()) {
 					Type type = binding->second.pointeeMsl;
 					if (binding->second.isBuffer) {
@@ -7312,7 +7313,18 @@ namespace {
 				return std::nullopt;
 			}
 			case ExpressionKind::Member: {
-				const StructDecl* decl = structOf(*place.left);
+				// A member of "::s" finds its struct from the file-scope s, not the local that hides it.
+				const Expression* root = place.left.get();
+				while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
+					root = root->left.get();
+				}
+				const StructDecl* decl = nullptr;
+				if (root->kind == ExpressionKind::Identifier && root->fileScope) {
+					const std::optional<Type> owner = placeType(*place.left);
+					decl = owner && !owner->isPointer ? _unit.findStruct(owner->namedType) : nullptr;
+				} else {
+					decl = structOf(*place.left);
+				}
 				if (!decl) {
 					return std::nullopt;
 				}
@@ -7346,10 +7358,22 @@ namespace {
 	std::optional<Type> Emitter::sizeofPlaceType(const Expression& place) {
 		if (place.kind == ExpressionKind::Member && !structOf(*place.left)) {
 			std::optional<Type> base = sizeofPlaceType(*place.left);
+			if (base && !base->namedType.empty() && !base->isPointer) {
+				// structOf found the struct of a local that hides "::name"; placeType reads the file-scope one.
+				return placeType(place);
+			}
 			const size_t lanes = place.memberName.size();
 			if (!base || !base->isVector() || base->isMatrix() || base->arrayLength || base->isPointer
 				|| lanes < 1 || lanes > 4) {
 				return std::nullopt;
+			}
+			// Letters of one set, each naming a component the vector has.
+			const std::string letters = place.memberName.find_first_of("xyzw") == 0 ? "xyzw" : "rgba";
+			for (const char letter: place.memberName) {
+				const size_t index = letters.find(letter);
+				if (index == std::string::npos || index >= base->vectorWidth) {
+					return std::nullopt;
+				}
 			}
 			base->isPacked = false;
 			base->vectorWidth = lanes > 1 ? static_cast<uint32_t>(lanes) : 0;
@@ -7406,6 +7430,69 @@ namespace {
 			return left.isScalar() ? right : left;
 		};
 
+		// What a binary operator gives for operands of these types, or nothing where the operator does not
+		// take them (a shift or a remainder of a float) or the result is not modelled.
+		const auto binaryType = [&](BinaryOperator op, const Type& left, const Type& right) -> std::optional<Type> {
+			// A pointer moved by an integer is that pointer.
+			const bool offset = op == BinaryOperator::Add || op == BinaryOperator::Subtract;
+			const auto integer = [&](const Type& type) { return plain(type) && type.isScalar() && !isFloatKind(type.scalar); };
+			if (offset && left.isPointer && !left.arrayLength && integer(right)) {
+				return left;
+			}
+			if (op == BinaryOperator::Add && right.isPointer && !right.arrayLength && integer(left)) {
+				return right;
+			}
+			if (!plain(left) || !plain(right)) {
+				return std::nullopt;
+			}
+			switch (op) {
+				case BinaryOperator::Less: case BinaryOperator::LessEqual: case BinaryOperator::Greater:
+				case BinaryOperator::GreaterEqual: case BinaryOperator::Equal: case BinaryOperator::NotEqual:
+				case BinaryOperator::LogicalAnd: case BinaryOperator::LogicalOr:
+					return left.isScalar() && right.isScalar() ? std::optional<Type>(scalarOf(ScalarKind::Bool)) : std::nullopt;
+				case BinaryOperator::ShiftLeft: case BinaryOperator::ShiftRight:
+					return left.isScalar() && right.isScalar() && !isFloatKind(left.scalar) && !isFloatKind(right.scalar)
+						? std::optional<Type>(promoted(left)) : std::nullopt;
+				case BinaryOperator::Modulo:
+				case BinaryOperator::BitAnd: case BinaryOperator::BitOr: case BinaryOperator::BitXor:
+					return isFloatKind(left.scalar) || isFloatKind(right.scalar) ? std::nullopt : arithmetic(left, right);
+				default:
+					return arithmetic(left, right);
+			}
+		};
+		// Whether a value of type `from` converts to an object of type `to` the way Apple accepts: any
+		// scalar to any scalar, otherwise the same vector, matrix, struct or pointer.
+		const auto converts = [&](const Type& to, const Type& from) {
+			if (to.isPointer || from.isPointer) {
+				return to.isPointer && from.isPointer && !to.arrayLength && !from.arrayLength && to.scalar == from.scalar
+					&& to.namedType == from.namedType && to.vectorWidth == from.vectorWidth
+					&& to.matrixColumns == from.matrixColumns && to.isPacked == from.isPacked;
+			}
+			if (to.arrayLength || from.arrayLength || to.resource != ResourceKind::None || from.resource != ResourceKind::None
+				|| to.isAuto || from.isAuto || !to.enumName.empty() || !from.enumName.empty() || to.isAtomic || from.isAtomic) {
+				return false;
+			}
+			if (!to.namedType.empty() || !from.namedType.empty()) {
+				return to.namedType == from.namedType;
+			}
+			if (to.isScalar() && from.isScalar() && !to.isMatrix() && !from.isMatrix()) {
+				return to.scalar != ScalarKind::Void && from.scalar != ScalarKind::Void;
+			}
+			return to.scalar == from.scalar && to.vectorWidth == from.vectorWidth && to.matrixColumns == from.matrixColumns;
+		};
+		// Whether a place cannot be written: a const object, one in the constant address space, or a member of one.
+		const auto readOnly = [&](const Expression& place) {
+			const Expression& root = storeRoot(place);
+			if (root.kind != ExpressionKind::Identifier) {
+				return true;
+			}
+			const auto binding = root.fileScope ? _bindings.end() : _bindings.find(root.name);
+			if (binding != _bindings.end()) {
+				return binding->second.readOnly || binding->second.pointeeMsl.isConst;
+			}
+			return true;
+		};
+
 		switch (expression.kind) {
 			case ExpressionKind::IntLiteral: return scalarOf(expression.intKind);
 			case ExpressionKind::FloatLiteral: return scalarOf(expression.floatIsHalf ? ScalarKind::Half : ScalarKind::Float);
@@ -7420,7 +7507,7 @@ namespace {
 			case ExpressionKind::Identifier:
 			case ExpressionKind::Member:
 			case ExpressionKind::Index: {
-				if (expression.kind == ExpressionKind::Identifier) {
+				if (expression.kind == ExpressionKind::Identifier && !expression.fileScope) {
 					const auto binding = _bindings.find(expression.name);
 					if (binding != _bindings.end() && binding->second.isBuffer) {
 						Type pointer = binding->second.pointeeMsl;
@@ -7460,7 +7547,9 @@ namespace {
 				return yes->isScalar() && no->isScalar() ? std::optional<Type>(scalarOf(commonKind(yes->scalar, no->scalar)))
 					: std::nullopt;
 			}
-			case ExpressionKind::Comma: return sizeofExpressionType(*expression.right);
+			case ExpressionKind::Comma:
+				// The left side is not built, but Apple still rejects one that is not an expression.
+				return sizeofExpressionType(*expression.left) ? sizeofExpressionType(*expression.right) : std::nullopt;
 			case ExpressionKind::Call: {
 				// The return type of the one function the name can find: any overload, template, library
 				// function beside it or argument-dependent lookup would need the arguments' types.
@@ -7478,6 +7567,16 @@ namespace {
 				if (set.size() != 1 || set.front()->definition->parameters.size() != expression.arguments.size()) {
 					return std::nullopt;
 				}
+				// Each argument has to be one the parameter takes: a mismatch is an error in Apple, and
+				// a reference parameter binds to a place, which is not modelled.
+				for (size_t i = 0; i < expression.arguments.size(); ++i) {
+					const Parameter& parameter = set.front()->definition->parameters[i];
+					const std::optional<Type> argument = sizeofExpressionType(*expression.arguments[i]);
+					if (!argument || parameter.isReference || parameter.type.addressSpace != AddressSpace::None
+						|| !converts(parameter.type, *argument)) {
+						return std::nullopt;
+					}
+				}
 				const Type& result = set.front()->definition->returnType;
 				return result.scalar == ScalarKind::Void && result.namedType.empty() && !result.isPointer
 					? std::nullopt : std::optional<Type>(result);
@@ -7489,8 +7588,22 @@ namespace {
 					return std::nullopt;
 				}
 				const std::optional<Type> place = sizeofExpressionType(*expression.left);
-				return place && !place->arrayLength && place->resource == ResourceKind::None && !place->isAuto
-					? place : std::nullopt;
+				const std::optional<Type> value = sizeofExpressionType(*expression.right);
+				if (!place || !value || place->isConst || readOnly(*expression.left)
+					|| (!expression.compoundOperator && !converts(*place, *value))) {
+					return std::nullopt;
+				}
+				if (expression.compoundOperator) {
+					// x op= y is x = x op y, which has to be a valid operator and convert back.
+					if (place->isPointer) {
+						return std::nullopt;
+					}
+					const std::optional<Type> result = binaryType(*expression.compoundOperator, *place, *value);
+					if (!result || !converts(*place, *result)) {
+						return std::nullopt;
+					}
+				}
+				return place;
 			}
 			case ExpressionKind::Unary: {
 				const std::optional<Type> operand = sizeofExpressionType(*expression.left);
@@ -7509,8 +7622,9 @@ namespace {
 					case UnaryOperator::PostIncrement:
 					case UnaryOperator::PostDecrement: {
 						const ExpressionKind target = expression.left->kind;
-						return target == ExpressionKind::Identifier || target == ExpressionKind::Member
-							|| target == ExpressionKind::Index ? operand : std::nullopt;
+						return (target == ExpressionKind::Identifier || target == ExpressionKind::Member
+							|| target == ExpressionKind::Index) && operand->scalar != ScalarKind::Bool && !operand->isConst
+							&& !readOnly(*expression.left) ? operand : std::nullopt;
 					}
 					case UnaryOperator::BitNot:
 						return isFloatKind(operand->scalar) || operand->scalar == ScalarKind::Bool ? std::nullopt
@@ -7521,36 +7635,7 @@ namespace {
 			case ExpressionKind::Binary: {
 				const std::optional<Type> left = sizeofExpressionType(*expression.left);
 				const std::optional<Type> right = sizeofExpressionType(*expression.right);
-				if (!left || !right) {
-					return std::nullopt;
-				}
-				// A pointer moved by an integer is that pointer.
-				const bool offset = expression.binaryOperator == BinaryOperator::Add
-					|| expression.binaryOperator == BinaryOperator::Subtract;
-				const auto integer = [&](const Type& type) { return plain(type) && type.isScalar() && !isFloatKind(type.scalar); };
-				if (offset && left->isPointer && !left->arrayLength && integer(*right)) {
-					return left;
-				}
-				if (expression.binaryOperator == BinaryOperator::Add && right->isPointer && !right->arrayLength && integer(*left)) {
-					return right;
-				}
-				if (!plain(*left) || !plain(*right)) {
-					return std::nullopt;
-				}
-				switch (expression.binaryOperator) {
-					case BinaryOperator::Less: case BinaryOperator::LessEqual: case BinaryOperator::Greater:
-					case BinaryOperator::GreaterEqual: case BinaryOperator::Equal: case BinaryOperator::NotEqual:
-					case BinaryOperator::LogicalAnd: case BinaryOperator::LogicalOr:
-						return left->isScalar() && right->isScalar() ? std::optional<Type>(scalarOf(ScalarKind::Bool)) : std::nullopt;
-					case BinaryOperator::ShiftLeft: case BinaryOperator::ShiftRight:
-						return left->isScalar() && right->isScalar() && !isFloatKind(left->scalar) && !isFloatKind(right->scalar)
-							? std::optional<Type>(promoted(*left)) : std::nullopt;
-					case BinaryOperator::Modulo:
-					case BinaryOperator::BitAnd: case BinaryOperator::BitOr: case BinaryOperator::BitXor:
-						return isFloatKind(left->scalar) || isFloatKind(right->scalar) ? std::nullopt : arithmetic(*left, *right);
-					default:
-						return arithmetic(*left, *right);
-				}
+				return left && right ? binaryType(expression.binaryOperator, *left, *right) : std::nullopt;
 			}
 			default:
 				return std::nullopt;
