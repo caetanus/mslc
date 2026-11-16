@@ -104,10 +104,6 @@ TypeLayout structLayoutOf(const std::string& name, const TranslationUnit& unit, 
 		throw CompileError("sizeof of \"" + name + "\", which is not a struct this source has declared "
 			"in full");
 	}
-	if (decl->fields.empty()) {
-		throw CompileError("sizeof of the struct \"" + name + "\", which has no members; mslc does not "
-			"size an empty struct");
-	}
 	if (depth > 32) {
 		throw CompileError("sizeof of \"" + name + "\" nests structs too deeply");
 	}
@@ -119,16 +115,14 @@ TypeLayout structLayoutOf(const std::string& name, const TranslationUnit& unit, 
 		offset = (offset + member.alignment - 1) / member.alignment * member.alignment + member.size;
 		alignment = std::max(alignment, member.alignment);
 	}
-	return { (offset + alignment - 1) / alignment * alignment, alignment };
+	// An empty struct is one byte, so two distinct objects have distinct addresses.
+	return { std::max<uint64_t>(1, (offset + alignment - 1) / alignment * alignment), alignment };
 }
 
 TypeLayout layoutOf(const Type& type, const TranslationUnit& unit, unsigned depth) {
-	if (type.resource != ResourceKind::None) {
-		throw CompileError("sizeof of a texture or sampler, which has no size mslc knows");
-	}
-
 	TypeLayout element{ 0, 1 };
-	if (type.isPointer) {
+	if (type.isPointer || type.resource != ResourceKind::None) {
+		// A texture or a sampler is a handle of one pointer's size (Apple: 8).
 		element = { 8, 8 };
 	} else if (!type.namedType.empty()) {
 		element = structLayoutOf(type.namedType, unit, depth);
