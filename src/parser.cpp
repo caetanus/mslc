@@ -1766,6 +1766,10 @@ void Parser::parseGlobalDeclaration() {
 		declaration.name = qualify(std::string(advance().text));
 		declareName(declaration.name, "variable");
 		parseSamplerLocal(declaration);
+		if (!declaration.sampler) {
+			throw CompileError("the file-scope sampler \"" + declaration.name + "\" is initialised from "
+				"\"sampler(options)\" or a brace list only; a copy of another sampler is not lowered at file scope");
+		}
 		_unit.globals.push_back(std::move(declaration));
 		return;
 	}
@@ -5257,8 +5261,21 @@ VariableDeclaration Parser::parseNextLocalDeclarator(const Type& base) {
 void Parser::parseSamplerLocal(VariableDeclaration& declaration) {
 	const Type& type = declaration.type;
 	if (type.resource != ResourceKind::Sampler) {
-		throw CompileError("a local \"" + declaration.name + "\" of type " + typeName(type)
-			+ " is not lowered yet; a texture is an entry point parameter");
+		if (type.isPointer || type.arrayLength || (type.addressSpace != AddressSpace::None
+			&& type.addressSpace != AddressSpace::Thread)) {
+			throw CompileError("a local texture \"" + declaration.name + "\" that is a pointer, an array or in an "
+				"address space other than thread is not lowered yet");
+		}
+		// A texture local is another name for a texture the function already names: sema binds it to
+		// the same descriptor. Reassigning it, or choosing it at run time, has no such model.
+		if (!match(TokenKind::Assign)) {
+			throw CompileError("the texture \"" + declaration.name + "\" needs an initialiser that names a "
+				"texture, as in \"texture2d<float> b = a;\": a texture local is another name for one, and "
+				"mslc does not lower one that is bound later");
+		}
+		declaration.initializer = parseAssignment();
+		expect(TokenKind::Semicolon, "after a declaration");
+		return;
 	}
 	if (type.isPointer || type.arrayLength
 		|| (type.addressSpace != AddressSpace::None && type.addressSpace != AddressSpace::Thread
@@ -5283,8 +5300,10 @@ void Parser::parseSamplerLocal(VariableDeclaration& declaration) {
 		}
 		if (kind() != TokenKind::Identifier || current().text != "sampler"
 			|| lookahead().kind != TokenKind::LParen) {
-			throw CompileError("a sampler local \"" + declaration.name + "\" is initialised from "
-				"\"sampler(options)\" only; a copy of another sampler is not lowered yet");
+			// A copy of a sampler: sema binds the name to the same descriptor.
+			declaration.initializer = parseAssignment();
+			expect(TokenKind::Semicolon, "after a declaration");
+			return;
 		}
 		advance();
 		advance();

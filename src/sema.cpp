@@ -573,6 +573,14 @@ constexpr uint32_t kImageOperandsOffset = 0x10;
 		if (opensScope) scopes.pop_back();
 	}
 
+	// Whether a texture or sampler of type have can stand where one of type want is wanted: the
+	// same kind, and for a texture the same element, depth, multisampling and access.
+	bool sameResourceType(const Type& have, const Type& want) {
+		return have.resource == want.resource
+			&& (!want.isTexture() || (have.scalar == want.scalar && have.isDepth == want.isDepth
+				&& have.isMultisampled == want.isMultisampled && have.textureAccess == want.textureAccess));
+	}
+
 	uint16_t comparisonOpcode(BinaryOperator op, bool isFloat, bool isSigned) {
 		using Op = uint16_t;
 
@@ -2484,6 +2492,7 @@ namespace {
 		void reserveFileScopeSamplers();
 		std::vector<const FunctionDecl*> functionsCalledBy(const Expression& call);
 		void declareLocalSampler(const VariableDeclaration& declaration);
+		void bindResourceAlias(const VariableDeclaration& declaration, const Type* declared);
 		void addReflectionEntry(const std::string& entry);
 		std::string descriptorJson(uint32_t binding) const;
 		const Binding& textureReceiver(const Expression& call);
@@ -6696,11 +6705,7 @@ namespace {
 
 		if (type.resource != ResourceKind::None) {
 			const Binding* binding = argument.kind == OverloadArgument::Kind::Resource ? argument.binding : nullptr;
-			return binding && binding->pointeeMsl.resource == type.resource
-				&& (!type.isTexture() || (binding->pointeeMsl.scalar == type.scalar
-					&& binding->pointeeMsl.isDepth == type.isDepth
-					&& binding->pointeeMsl.isMultisampled == type.isMultisampled
-					&& binding->pointeeMsl.textureAccess == type.textureAccess)) ? exact(-1) : none;
+			return binding && sameResourceType(binding->pointeeMsl, type) ? exact(-1) : none;
 		}
 		if (type.isPointer || type.arrayLength) {
 			if (argument.kind != OverloadArgument::Kind::Array) {
@@ -6868,12 +6873,7 @@ namespace {
 
 		const Binding* binding = findResourceBinding(argument.name);
 		const Type& wanted = parameter.type;
-		const bool matches = binding && binding->pointeeMsl.resource == wanted.resource
-			&& (!wanted.isTexture() || (binding->pointeeMsl.scalar == wanted.scalar
-				&& binding->pointeeMsl.isDepth == wanted.isDepth
-				&& binding->pointeeMsl.isMultisampled == wanted.isMultisampled
-				&& binding->pointeeMsl.textureAccess == wanted.textureAccess));
-		if (!matches) {
+		if (!binding || !sameResourceType(binding->pointeeMsl, wanted)) {
 			throw CompileError(what + " is \"" + argument.name + "\", which is not a "
 				+ typeName(wanted));
 		}
@@ -10307,6 +10307,34 @@ namespace {
 		_bindings[declaration.name] = embeddedSamplerBinding(declaration);
 	}
 
+	// "texture2d<float> b = a;", "sampler t = s;" and the auto forms: the new name is the same
+	// descriptor as the one it was copied from, so nothing is declared and the reflection gains no
+	// entry. Only a name is accepted on the right, and the name is never rebound (emitAssignment),
+	// so there is no run-time choice among descriptors for the alias to stand for.
+	void Emitter::bindResourceAlias(const VariableDeclaration& declaration, const Type* declared) {
+		const Expression& source = *declaration.initializer;
+		const std::string what = std::string("the ") + (declared && declared->resource == ResourceKind::Sampler
+			? "sampler" : "texture or sampler") + " \"" + declaration.name + "\"";
+		if (source.kind != ExpressionKind::Identifier) {
+			throw CompileError(what + " has to be initialised from the name of a texture or sampler: a "
+				"conditional, a call, a member or an element would pick the descriptor at run time, which "
+				"mslc does not lower");
+		}
+		if (source.name == declaration.name) {
+			throw CompileError(what + " is initialised from itself");
+		}
+		const Binding* named = findResourceBinding(source.name);
+		if (!named || named->pointeeMsl.resource == ResourceKind::None) {
+			throw CompileError(what + " is initialised from \"" + source.name + "\", which is not a texture or "
+				"a sampler");
+		}
+		if (declared && !sameResourceType(named->pointeeMsl, *declared)) {
+			throw CompileError(what + " is initialised from \"" + source.name + "\", which is not a "
+				+ typeName(*declared));
+		}
+		_bindings[declaration.name] = *named;
+	}
+
 	// A half texture is sampled as a float image, a short one as an int image and a
 	// ushort one as a uint image, and narrowed here, because the image type's sampled
 	// type has 32 bits whatever the texture's component is.
@@ -12647,6 +12675,14 @@ namespace {
 				"cannot appear in its own initializer");
 		}
 
+		if (initializer.kind == ExpressionKind::Identifier) {
+			const Binding* named = findResourceBinding(initializer.name);
+			if (named && named->pointeeMsl.resource != ResourceKind::None) {
+				bindResourceAlias(declaration, nullptr);
+				return;
+			}
+		}
+
 		const Id value = emitExpression(initializer);
 		const Type type = deduceAutoType(declaration.type, _builder.typeOf(value), declaration.name);
 		emitValueDeclaration(declaration, type, value, false);
@@ -12657,7 +12693,11 @@ namespace {
 	void Emitter::emitValueDeclaration(const VariableDeclaration& declaration, const Type& type, Id deduced,
 		bool storageOnly) {
 		if (type.resource != ResourceKind::None) {
-			declareLocalSampler(declaration);
+			if (declaration.initializer) {
+				bindResourceAlias(declaration, &type);
+			} else {
+				declareLocalSampler(declaration);
+			}
 			return;
 		}
 
@@ -13141,6 +13181,12 @@ namespace {
 		}
 		if (left.kind == ExpressionKind::Identifier) {
 			const auto named = _bindings.find(left.name);
+			if (named != _bindings.end() && named->second.pointeeMsl.resource != ResourceKind::None
+				&& !named->second.pointeeMsl.arrayLength) {
+				throw CompileError("\"" + left.name + "\" is a " + typeName(named->second.pointeeMsl)
+					+ ", which cannot be assigned: mslc binds a texture or sampler name to one descriptor "
+					"and does not lower choosing another at run time");
+			}
 			if (named != _bindings.end() && named->second.pointeeMsl.arrayLength && !named->second.isBuffer) {
 				const bool unsized = *named->second.pointeeMsl.arrayLength == UINT32_MAX;
 				throw CompileError(unsized ? "the threadgroup argument \"" + left.name + "\" is not assignable; assign through it"
