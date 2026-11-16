@@ -1062,6 +1062,12 @@ spirv::Id TypeTable::array(spirv::Id element, uint32_t length) {
 	return id;
 }
 
+spirv::Id TypeTable::arrayOfLengthId(spirv::Id element, spirv::Id lengthId) {
+	const Id id = _builder.emitDecl(spirv::OpTypeArray, { element, lengthId });
+	_arrayElement.emplace(id, element);
+	return id;
+}
+
 // An array in a laid-out struct: the same element and length as array() and a
 // stride, which SPIR-V needs on a buffer's array and forbids on a Workgroup
 // one, so the value form and this are two types.
@@ -2322,6 +2328,8 @@ namespace {
 		// The Workgroup variable of each threadgroup local in the kernel body, declared
 		// before the entry point because SPIR-V 1.5 lists every module-scope variable in it.
 		std::map<const VariableDeclaration*, Id> _threadgroupLocals;
+		// The next SpecId for a threadgroup argument's element count; 0, 1 and 2 are the workgroup size.
+		uint32_t _nextSpecId = 3;
 
 		// What a return statement writes: one variable for a returned scalar or
 		// vector, or one per field of a returned struct. Empty for a void function.
@@ -2447,6 +2455,7 @@ namespace {
 		FoldedConstant foldBinary(const Expression& expression);
 		FoldedConstant foldUnary(const Expression& expression);
 		void declareParameters();
+		void declareThreadgroupArgument(const Parameter& parameter, size_t index, uint32_t metalIndex);
 		void declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources);
 		Id declareDescriptorVariable(Id pointee, uint32_t binding);
 		void reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used);
@@ -9414,6 +9423,8 @@ namespace {
 			if (parameter.attributes.bufferIndex || parameter.attributes.textureIndex
 				|| parameter.attributes.samplerIndex || parameter.attributes.builtin
 				|| parameter.attributes.stageIn || parameter.attributes.colorIndex
+				|| parameter.attributes.threadgroupIndex
+				|| parameter.type.addressSpace == AddressSpace::Threadgroup
 				|| parameter.type.resource != ResourceKind::None) {
 				continue;
 			}
@@ -9430,6 +9441,40 @@ namespace {
 	void Emitter::declareParameters() {
 		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(*_entryPoint);
 		std::vector<std::pair<size_t, const Parameter*>> resources;
+
+		// Apple numbers the threadgroup arguments apart from the buffers: an explicit
+		// [[threadgroup(n)]] keeps n, and one without takes the lowest free index, in order.
+		std::map<const Parameter*, uint32_t> threadgroupIndices;
+		{
+			std::set<uint32_t> taken;
+			for (const Parameter& parameter: _entryPoint->parameters) {
+				if (!parameter.attributes.threadgroupIndex) { continue; }
+				if (parameter.type.addressSpace != AddressSpace::Threadgroup
+					|| !(parameter.type.isPointer || parameter.isReference) || parameter.attributes.bufferIndex) {
+					throw CompileError("parameter \"" + parameter.name + "\" has [[threadgroup(n)]], which a "
+						"pointer or reference in the threadgroup address space takes, with no other index");
+				}
+				if (!taken.insert(*parameter.attributes.threadgroupIndex).second) {
+					throw CompileError("parameter \"" + parameter.name + "\" reserves threadgroup index "
+						+ std::to_string(*parameter.attributes.threadgroupIndex) + ", which another argument "
+						"already has");
+				}
+				threadgroupIndices[&parameter] = *parameter.attributes.threadgroupIndex;
+			}
+			uint32_t next = 0;
+			for (const Parameter& parameter: _entryPoint->parameters) {
+				if (parameter.type.addressSpace != AddressSpace::Threadgroup || parameter.attributes.bufferIndex
+					|| threadgroupIndices.count(&parameter)) {
+					continue;
+				}
+				while (taken.count(next)) { ++next; }
+				if (next > 30) {
+					throw CompileError("parameter \"" + parameter.name + "\" is past the last threadgroup index, 30");
+				}
+				taken.insert(next);
+				threadgroupIndices[&parameter] = next;
+			}
+		}
 
 		for (size_t index = 0; index < _entryPoint->parameters.size(); ++index) {
 			const Parameter& parameter = _entryPoint->parameters[index];
@@ -9685,6 +9730,15 @@ namespace {
 				continue;
 			}
 
+			if (threadgroupIndices.count(&parameter)) {
+				if (_entryPoint->stage != Stage::Kernel) {
+					throw CompileError("parameter \"" + parameter.name + "\" is a threadgroup parameter; "
+						"threadgroup parameters are only supported on kernel functions");
+				}
+				declareThreadgroupArgument(parameter, index, threadgroupIndices[&parameter]);
+				continue;
+			}
+
 			// An unbinding parameter takes the next index among the binding
 			// parameters, which is what Metal does.
 			uint32_t bindingIndex = 0;
@@ -9700,22 +9754,14 @@ namespace {
 				bindingIndex = static_cast<uint32_t>(it - implicitlyBound.begin());
 			}
 
-		// Apple takes a threadgroup pointer on a kernel only as an argument of its
-		// own, with no [[buffer]], and takes thread and an unwritten address space
-		// nowhere.
+		// A threadgroup pointer with no [[buffer]] is an argument of its own and was
+		// handled above; with [[buffer]] Apple rejects it, and so does the check below.
 		const AddressSpace space = parameter.type.addressSpace;
-		const bool threadgroupArgument = space == AddressSpace::Threadgroup
-			&& !parameter.attributes.bufferIndex && _entryPoint->stage == Stage::Kernel;
-		if (space == AddressSpace::Threadgroup && !parameter.attributes.bufferIndex
-			&& _entryPoint->stage != Stage::Kernel) {
-			throw CompileError("parameter \"" + parameter.name + "\" is a threadgroup parameter; "
-				"threadgroup parameters are only supported on kernel functions");
-		}
 		if (space == AddressSpace::None) {
 			throw CompileError("parameter \"" + parameter.name + "\": pointer parameter needs an "
 				"explicit address space (device or constant)");
 		}
-		if (space != AddressSpace::Device && space != AddressSpace::Constant && !threadgroupArgument) {
+		if (space != AddressSpace::Device && space != AddressSpace::Constant) {
 			throw CompileError("parameter \"" + parameter.name + "\" needs a device or constant "
 				"address space to be a buffer binding, not " + std::string(addressSpaceName(space)));
 		}
@@ -9839,6 +9885,51 @@ namespace {
 		// Last, so the constexpr samplers keep the bindings right after the textures and samplers,
 		// the order indium binds by; an attachment is not part of Iridium's argument list.
 		declareAttachments();
+	}
+
+	// A kernel's `threadgroup T *p [[threadgroup(n)]]`. Metal sets the byte length at encode time
+	// (setThreadgroupMemoryLength:atIndex:), Vulkan fixes Workgroup size at pipeline creation, so the
+	// variable is a Workgroup array whose length is a specialization constant, set to the element
+	// count the host computes from the byte length and the reflected element_size. The SpecId is
+	// per argument, from 3 up, because SpecIds are per module and two kernels can take index n with
+	// different element types; each entry point's reflection names its own.
+	void Emitter::declareThreadgroupArgument(const Parameter& parameter, size_t index, uint32_t metalIndex) {
+		const std::string what = "threadgroup argument \"" + parameter.name + "\"";
+		if (parameter.isReference) {
+			throw CompileError(what + " is a reference, which is not lowered yet; take a pointer");
+		}
+		Type element = parameter.type;
+		element.isPointer = false;
+		if (element.isAtomic) {
+			throw CompileError(what + " points at an atomic, which is not lowered yet");
+		}
+		if (element.resource != ResourceKind::None || element.arrayLength
+			|| (element.scalar == ScalarKind::Void && element.namedType.empty())) {
+			throw CompileError(what + " has a pointee mslc cannot lay out in threadgroup memory; it takes a "
+				"scalar, vector, matrix or struct");
+		}
+		const uint64_t elementSize = sizeofType(element, _unit);
+
+		const Id elementType = declaredTypeOf(element);
+		const Id count = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 1u });
+		const uint32_t specId = _nextSpecId++;
+		_builder.emit(spirv::OpDecorate, { count, static_cast<uint32_t>(spirv::Decoration::SpecId), specId });
+		const Id arrayType = _types.arrayOfLengthId(elementType, count);
+		const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(spirv::StorageClass::Workgroup, arrayType),
+			{ static_cast<uint32_t>(spirv::StorageClass::Workgroup) });
+		_interface.push_back(variable);
+
+		// An array with no length of its own to check literal indexes against.
+		Type msl = element;
+		msl.arrayLength = UINT32_MAX;
+		bindLocal(parameter.name, variable, arrayType, msl, spirv::StorageClass::Workgroup);
+
+		addReflectionEntry("{ \"kind\": \"ThreadgroupMemory\", \"metal_index\": " + std::to_string(metalIndex)
+			+ ", \"spec_id\": " + std::to_string(specId)
+			+ ", \"element_size\": " + std::to_string(elementSize)
+			+ ", \"param_index\": " + std::to_string(index)
+			+ ", \"name\": \"" + parameter.name + "\" }");
 	}
 
 	// One entry per binding goes in the reflection. The separator goes before the

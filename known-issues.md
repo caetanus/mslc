@@ -117,6 +117,22 @@ struct members, a `device atomic_uint&` reference, pointer arithmetic on the
 atomic pointer, threadgroup atomic arrays, `atomic<uint>`, and an alias
 declared with `using A = atomic_uint` (a `typedef` alias is supported).
 
+## Threadgroup memory arguments (#373)
+
+`threadgroup T *p [[threadgroup(n)]]` (or no attribute: the lowest free index) lowers to a Workgroup array
+whose length is a specialization constant, and the reflection gets one `ThreadgroupMemory` entry per
+argument (`metal_index`, `spec_id`, `element_size`, `param_index`, `name`). The host must set that spec
+constant to the element count, `max(1, bytes / element_size)` from the byte length Apple's
+`setThreadgroupMemoryLength:atIndex:` would take, when it creates the pipeline. The default is 1 element.
+Vulkan fixes the length at pipeline creation and Metal at encode time, so a consumer that changes the
+length per dispatch needs a pipeline per length (or a cache keyed by it). `element_size` is Metal's, so
+a `float3` element steps 16; a `packed_float3` or `bool` element may take more or fewer bytes in the
+Vulkan driver, so a host that checks `maxComputeSharedMemorySize` should do it with some margin.
+
+Refused, though Apple accepts it: a reference (`threadgroup T &`), an atomic or `void` pointee, passing
+the argument to a helper function, and pointer arithmetic on it (`p + 1`, `*(p + 1)`). Apple itself rejects a duplicate index, an index above 30, `[[buffer]]` together with
+`[[threadgroup]]`, an array-pointer pointee, and the argument in a vertex or fragment function.
+
 ## An anonymous enum's enumerator converts to a named enum (#261)
 
 `typedef enum { TA, TB } Anon; constant Mode km = TB;` (and the same through an

@@ -86,6 +86,9 @@ public:
 	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
 	// A fixed-length array of element, in Function storage, so it carries no stride.
 	spirv::Id array(spirv::Id element, uint32_t length);
+	// An array of element whose length is the given constant id, which may be a specialization
+	// constant. Not cached, and arrayLength() answers 0 for it.
+	spirv::Id arrayOfLengthId(spirv::Id element, spirv::Id lengthId);
 	// The element type of an array this table made, or InvalidId for anything else.
 	spirv::Id arrayElement(spirv::Id type) const;
 	// The length of an array this table made, or 0 for anything else.
@@ -337,6 +340,14 @@ struct ModuleOptions {
 // format feature STORAGE_TEXEL_BUFFER, and shaderStorageImage{Read,Write}WithoutFormat as for any
 // storage texture). The shader indexes it with a scalar uint texel index; the texel size comes from
 // the view's format. A consumer that does not know the kind skips the entry, as for any new kind.
+// A kernel's threadgroup memory argument (`threadgroup T *p [[threadgroup(n)]]`) adds
+// { "kind": "ThreadgroupMemory", "metal_index": n, "spec_id": s, "element_size": e,
+// "param_index": i, "name": ... }, in parameter order with the buffers. The variable is a Workgroup
+// array of T whose length is the OpSpecConstant s, which defaults to 1. Metal sets the byte length at
+// encode time (setThreadgroupMemoryLength:atIndex:) and Vulkan fixes it at pipeline creation, so the host
+// writes constantID s = max(1, bytes / e) into VkSpecializationInfo when it creates the pipeline, where e
+// is Metal's element size (a float3 is 16). SpecIds 0 to 2 are the workgroup size; the arguments take
+// 3 upward in declaration order across the module, so two kernels never share one. There is no descriptor.
 // reflection_version stays 2 because bindings are additive: a consumer switches
 // on "kind" and ignores kinds it does not know.
 //

@@ -4207,7 +4207,7 @@ ParameterAttributes Parser::parseParameterAttributes() {
 	ParameterAttributes attributes;
 
 	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
-		if (argument && (name == "buffer" || name == "texture" || name == "sampler")) {
+		if (argument && (name == "buffer" || name == "texture" || name == "sampler" || name == "threadgroup")) {
 			checkAttributeIndex(name, *argument);
 		}
 
@@ -4216,6 +4216,11 @@ ParameterAttributes Parser::parseParameterAttributes() {
 				throw CompileError("[[buffer]] needs an index");
 			}
 			attributes.bufferIndex = argument;
+		} else if (name == "threadgroup") {
+			if (!argument) {
+				throw CompileError("[[threadgroup]] needs an index");
+			}
+			attributes.threadgroupIndex = argument;
 		} else if (name == "texture") {
 			if (!argument) {
 				throw CompileError("[[texture]] needs an index");

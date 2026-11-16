@@ -187,6 +187,9 @@ struct ParameterAttributes {
 	// [[buffer(n)]]
 	std::optional<uint32_t> bufferIndex;
 
+	// [[threadgroup(n)]]: a kernel's threadgroup memory argument
+	std::optional<uint32_t> threadgroupIndex;
+
 	// [[texture(n)]] and [[sampler(n)]]
 	std::optional<uint32_t> textureIndex;
 	std::optional<uint32_t> samplerIndex;
