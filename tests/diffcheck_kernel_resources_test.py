@@ -159,6 +159,17 @@ class Resources(unittest.TestCase):
         self.assertEqual([(l["off"], l["scalar"]) for l in lay["leaves"]], [(0, "ushort"), (2, "ushort"), (4, "ushort"), (6, "ushort")])
         self.assertLess(resources.texel_key(plan[0]), 0)  # never a device buffer's Metal index
 
+    def test_texel_buffer_components(self):
+        for n in (1, 2, 4):
+            plan = resources.texel_plan([self.TEXEL], {"textures": [self.APPLE_TEXEL]}, {"tb": n})
+            self.assertEqual(plan[0].components, n)
+            lay = plan[0].layout
+            self.assertEqual((lay["stride"], [l["off"] for l in lay["leaves"]]), (2 * n, [2 * c for c in range(n)]))
+            with tempfile.TemporaryDirectory() as d:
+                seeded = resources.seed_texels(plan, 16, random.Random(5), "edge", os.path.join(d, "a-"))
+                self.assertEqual(len(seeded[0][2]), (16 + 4 * 3) * 2 * n)
+                self.assertIn("storage ushort %d 28 " % n, resources.texel_lines(seeded, {3: "o"})[0])
+
     def test_texel_buffer_seed_is_deterministic_and_lines(self):
         plan = resources.texel_plan([self.TEXEL], {"textures": [self.APPLE_TEXEL]})
         with tempfile.TemporaryDirectory() as d:
@@ -169,7 +180,7 @@ class Resources(unittest.TestCase):
             with open(a[0][1], "rb") as f:
                 self.assertEqual(f.read(), bytes(a[0][2]))
         self.assertEqual(resources.texel_lines(a, {3: "out.bin"}),
-                         ["texelbuffer 3 1 4 storage ushort 28 %s out.bin" % a[0][1]])
+                         ["texelbuffer 3 1 4 storage ushort 4 28 %s out.bin" % a[0][1]])
 
     def test_texel_buffer_cross_check(self):
         good = {"textures": [self.APPLE_TEXEL], "samplers": []}
@@ -188,6 +199,13 @@ class Resources(unittest.TestCase):
 
 
 class Directives(unittest.TestCase):
+    def test_texel(self):
+        self.assertEqual(directives.parse("// DIFFCHECK-TEXEL: a 1\n// DIFFCHECK-TEXEL: b 2\n")["texel"], {"a": 1, "b": 2})
+        self.assertEqual(directives.parse("")["texel"], {})
+        for bad in ("// DIFFCHECK-TEXEL: a 3\n", "// DIFFCHECK-TEXEL: a\n", "// DIFFCHECK-TEXEL: a 8\n", "// DIFFCHECK-TEXEL: 2\n"):
+            with self.assertRaises(ValueError, msg=bad):
+                directives.parse(bad)
+
     def test_ulp_and_unused(self):
         d = directives.parse("// DIFFCHECK-ULP: exact 0\n// DIFFCHECK-ULP: loose 8\n// DIFFCHECK-UNUSED: t never read\n")
         self.assertEqual(d["ulp"], {"exact": 0, "loose": 8})

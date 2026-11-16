@@ -160,7 +160,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     if findings:
         result.update(status="reflection-mismatch", reason="; ".join(findings))
         return result
-    tplan = resources.texel_plan(bindings, apple)
+    tplan = resources.texel_plan(bindings, apple, params["texel"])
     if not any(l["access"] != "read" for l in layouts.values()) and not any(tb.layout["access"] != "read" for tb in tplan):
         result.update(status="skipped", reason="no writable buffer to compare")
         return result
@@ -174,6 +174,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     tlayouts = {resources.texel_key(tb): tb.layout for tb in tplan}
     result["buffers"] = sorted([l["name"] for l in layouts.values()] + [l["name"] for l in tlayouts.values()])
     result["textures"] = sorted(t["name"] for t in apple["textures"])
+    result["texel_buffers"] = sorted(tb.layout["name"] for tb in tplan)
     compared = {i: l for i, l in layouts.items() if l["name"] not in excluded}
     tcompared = {i: l for i, l in tlayouts.items() if l["name"] not in excluded}
 
@@ -234,19 +235,20 @@ def unknown_directives(opts, d, results):
     would silently do nothing."""
     known = set().union(*(r.get("buffers", []) for r in results))
     textures = set().union(*(r.get("textures", []) for r in results))
+    texel_buffers = set().union(*(r.get("texel_buffers", []) for r in results))
     errors = []
     if known:
         named = {"DIFFCHECK-EXCLUDE": (d["exclude"], known), "DIFFCHECK-RANGE": (d["range"], known),
                  "DIFFCHECK-FLOAT-RANGE": (d["float_range"], known), "DIFFCHECK-UNUSED": (d["unused"], textures),
-                 "DIFFCHECK-ULP": (d["ulp"], known)}
+                 "DIFFCHECK-ULP": (d["ulp"], known), "DIFFCHECK-TEXEL": (d["texel"], texel_buffers)}
         if not opts.corpus:
             named["--range"] = (opts.ranges, known)
         for directive, (table, names) in named.items():
             unknown = sorted(set(table) - names)
             if unknown:
                 errors.append({"entry": "*", "status": "error", "cases": [], "reason": "%s names %s, which is not "
-                               "a %s (%s: %s)" % (directive, ", ".join(unknown), "texture" if names is textures else "buffer",
-                                                  "textures" if names is textures else "buffers", ", ".join(sorted(names)) or "none")})
+                               "a %s (%s: %s)" % (directive, ", ".join(unknown), "texture" if names is textures else "texture_buffer" if names is texel_buffers else "buffer",
+                                                  "textures" if names is textures else "texture_buffers" if names is texel_buffers else "buffers", ", ".join(sorted(names)) or "none")})
     return errors
 
 
@@ -294,7 +296,7 @@ def check_file(opts, path, std=None):
                 "cases": opts.cases or run.get("cases", 3), "elems": opts.elems or run.get("elems"),
                 "std": std or opts.std, "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
                 "float_range": d["float_range"],
-                "unused": d["unused"], "ulp": d["ulp"],
+                "unused": d["unused"], "ulp": d["ulp"], "texel": d["texel"],
             }
             sub = os.path.join(work, e["name"])
             os.makedirs(sub)

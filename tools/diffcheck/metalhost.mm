@@ -10,7 +10,7 @@
 //                                                    (run mode; storage: mslc's read-access image; set and binding are
 //   sampler <metal index> <set> <binding>                              vkhost's, ignored here)
 //   threadgroup <metal index> <bytes>   setThreadgroupMemoryLength:atIndex: (run mode)
-//   texelbuffer <metal index> <set> <binding> uniform|storage <type> <texels> <input file> <output file>
+//   texelbuffer <metal index> <set> <binding> uniform|storage <type> <components 1|2|4> <texels> <input file> <output file>
 //                                       (run mode; a texture_buffer over a shared buffer of RGBA texels of <type>:
 //                                        float half int uint short ushort; storage: shader read and write)
 // A texture is 2D RGBA32Float, shader read; a sampler is nearest and normalised. A texel buffer's bytes
@@ -208,16 +208,19 @@ static const CFmt &colorFormat(NSString *name) {
 
 static NSData *slurp(NSString *path, NSUInteger expect);
 
-struct TexelFmt { const char *type; MTLPixelFormat format; NSUInteger bytes; };
+struct TexelFmt { const char *type; NSUInteger components; MTLPixelFormat format; NSUInteger bytes; };
 static const TexelFmt kTexelFormats[] = {
-    {"float", MTLPixelFormatRGBA32Float, 16}, {"half", MTLPixelFormatRGBA16Float, 8},
-    {"int", MTLPixelFormatRGBA32Sint, 16}, {"uint", MTLPixelFormatRGBA32Uint, 16},
-    {"short", MTLPixelFormatRGBA16Sint, 8}, {"ushort", MTLPixelFormatRGBA16Uint, 8},
+    {"float", 1, MTLPixelFormatR32Float, 4}, {"float", 2, MTLPixelFormatRG32Float, 8}, {"float", 4, MTLPixelFormatRGBA32Float, 16},
+    {"half", 1, MTLPixelFormatR16Float, 2}, {"half", 2, MTLPixelFormatRG16Float, 4}, {"half", 4, MTLPixelFormatRGBA16Float, 8},
+    {"int", 1, MTLPixelFormatR32Sint, 4}, {"int", 2, MTLPixelFormatRG32Sint, 8}, {"int", 4, MTLPixelFormatRGBA32Sint, 16},
+    {"uint", 1, MTLPixelFormatR32Uint, 4}, {"uint", 2, MTLPixelFormatRG32Uint, 8}, {"uint", 4, MTLPixelFormatRGBA32Uint, 16},
+    {"short", 1, MTLPixelFormatR16Sint, 2}, {"short", 2, MTLPixelFormatRG16Sint, 4}, {"short", 4, MTLPixelFormatRGBA16Sint, 8},
+    {"ushort", 1, MTLPixelFormatR16Uint, 2}, {"ushort", 2, MTLPixelFormatRG16Uint, 4}, {"ushort", 4, MTLPixelFormatRGBA16Uint, 8},
 };
 
-static const TexelFmt &texelFormat(NSString *type) {
-    for (const TexelFmt &f : kTexelFormats) if ([type isEqual:@(f.type)]) return f;
-    die([@"unknown texel buffer type " stringByAppendingString:type]);
+static const TexelFmt &texelFormat(NSString *type, NSUInteger components) {
+    for (const TexelFmt &f : kTexelFormats) if ([type isEqual:@(f.type)] && f.components == components) return f;
+    die([NSString stringWithFormat:@"unknown texel buffer type %@ with %lu components", type, (unsigned long)components]);
     abort();
 }
 
@@ -227,12 +230,12 @@ static void refuse(NSString *reason) {
 }
 
 // The texture_buffer of a `texelbuffer` manifest line over a new shared buffer holding the input
-// file: RGBA texels, so a texture_buffer<T> read returns all four stored components. The buffer is
+// file: texels of 1, 2 or 4 components of T (a read of the missing ones gives 0, 0 and 1). The buffer is
 // returned in `*backing` for the read-back after the dispatch.
 static id<MTLTexture> texelBuffer(id<MTLDevice> device, NSArray *w, id<MTLBuffer> *backing) {
-    const TexelFmt &f = texelFormat(w[5]);
-    NSUInteger texels = [w[6] integerValue];
-    NSData *d = slurp(w[7], texels * f.bytes);
+    const TexelFmt &f = texelFormat(w[5], [w[6] integerValue]);
+    NSUInteger texels = [w[7] integerValue];
+    NSData *d = slurp(w[8], texels * f.bytes);
     id<MTLBuffer> b = [device newBufferWithBytes:d.bytes length:d.length options:MTLResourceStorageModeShared];
     if (!b) refuse([NSString stringWithFormat:@"no %lu byte buffer", (unsigned long)d.length]);
     MTLTextureUsage usage = [w[4] isEqual:@"storage"] ? (MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite) : MTLTextureUsageShaderRead;
@@ -499,7 +502,7 @@ int main(int argc, char **argv) {
             if (![o writeToFile:bufSpecs[i][4] atomically:YES]) die(@"cannot write an output file");
         }
         for (NSUInteger i = 0; i < texelBacking.count; i++)
-            if (![[NSData dataWithBytes:texelBacking[i].contents length:texelBacking[i].length] writeToFile:lists[@"texelbuffer"][i][8] atomically:YES])
+            if (![[NSData dataWithBytes:texelBacking[i].contents length:texelBacking[i].length] writeToFile:lists[@"texelbuffer"][i][9] atomically:YES])
                 die(@"cannot write a texel buffer output file");
         printf("device: %s\n", device.name.UTF8String);
     }

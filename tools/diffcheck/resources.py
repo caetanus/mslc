@@ -5,9 +5,10 @@ A texture is 2D, RGBA32Float, shader-read; a sampler is nearest, normalised, no 
 address mode picked by its Metal index (0 clamp to edge, 1 repeat, 2 mirrored repeat). Probes should sample at a texel centre (an edge or a filter is where the backends may
 legitimately differ). Anything else is reported by `unsupported` and the file is skipped.
 
-A texel buffer (`texture_buffer<T, access>`, kernel mode only) is a buffer of RGBA texels of T (float, half,
-int, uint, short or ushort), seeded like a device buffer, bound as a MTLTextureTypeTextureBuffer on Apple and as a
-VkBufferView on lavapipe, and compared after the dispatch like a device buffer: its layout is four leaves of T.
+A texel buffer (`texture_buffer<T, access>`, kernel mode only) is a buffer of texels of 4 (the default), 2 or 1
+components of T (float, half, int, uint, short or ushort; `DIFFCHECK-TEXEL` picks the count), seeded like a device
+buffer, bound as a MTLTextureTypeTextureBuffer on Apple and as a VkBufferView on lavapipe, and compared after the
+dispatch like a device buffer: its layout is one leaf of T per component.
 The element type and access come from Apple's reflection, never from mslc's module.
 """
 
@@ -25,7 +26,7 @@ TEXEL_ACCESS = {"read": ("Read", "UniformTexelBuffer"), "readwrite": ("ReadWrite
                 "write": ("Write", "StorageTexelBuffer")}
 # One entry of a texel buffer: its output key in the comparison (negative, so it never meets a device
 # buffer's Metal index), the layout of one texel and where mslc binds it.
-TexelBuffer = collections.namedtuple("TexelBuffer", "index set binding uniform scalar layout")
+TexelBuffer = collections.namedtuple("TexelBuffer", "index set binding uniform scalar components layout")
 
 
 def texture_data(rng, profile):
@@ -105,21 +106,27 @@ def lines(textures, samplers):
             + ["sampler %d %d %d" % s for s in samplers])
 
 
-def texel_layout(name, scalar, access):
-    """The layout of a texel buffer in compare's terms: one element is one RGBA texel."""
+def texel_layout(name, scalar, access, components=4):
+    """The layout of a texel buffer in compare's terms: one element is one texel of `components` components."""
     size = compare.SCALARS[scalar][0]
-    return {"name": name, "access": access, "stride": 4 * size, "pointer": False,
-            "leaves": [{"off": c * size, "scalar": scalar} for c in range(4)]}
+    return {"name": name, "access": access, "stride": components * size, "pointer": False,
+            "leaves": [{"off": c * size, "scalar": scalar} for c in range(components)]}
 
 
-def texel_plan(bindings, apple):
-    """The TexelBuffers of an entry point: mslc's binding, Apple's name, element type and access."""
+def texel_plan(bindings, apple, components=None):
+    """The TexelBuffers of an entry point: mslc's binding, Apple's name, element type and access, and the component
+    count `components` (a {buffer name: count} of DIFFCHECK-TEXEL) gives, 4 otherwise."""
+    components = components or {}
     by_index = {t["index"]: t for t in apple["textures"] if t["type"] == "texturebuffer"}
-    return [TexelBuffer(b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"],
-                        b["descriptor_type"] == "UniformTexelBuffer", by_index[b["metal_index"]]["data"],
-                        texel_layout(by_index[b["metal_index"]]["name"], by_index[b["metal_index"]]["data"],
-                                     by_index[b["metal_index"]]["access"]))
-            for b in bindings if b["kind"] == "TextureBuffer"]
+    plan = []
+    for b in bindings:
+        if b["kind"] != "TextureBuffer":
+            continue
+        t = by_index[b["metal_index"]]
+        n = components.get(t["name"], 4)
+        plan.append(TexelBuffer(b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"],
+                                b["descriptor_type"] == "UniformTexelBuffer", t["data"], n, texel_layout(t["name"], t["data"], t["access"], n)))
+    return plan
 
 
 def texel_key(tb):
@@ -149,5 +156,5 @@ def seed_texels(plan, texels, rng, profile, base, sentinel=False, poison=False, 
 
 def texel_lines(seeded, outputs):
     """The manifest lines both hosts read; `outputs` maps a texel buffer's Metal index to its output file."""
-    return ["texelbuffer %d %d %d %s %s %d %s %s" % (tb.index, tb.set, tb.binding, "uniform" if tb.uniform else "storage",
-                                                    tb.scalar, len(data) // tb.layout["stride"], path, outputs[tb.index]) for tb, path, data in seeded]
+    return ["texelbuffer %d %d %d %s %s %d %d %s %s" % (tb.index, tb.set, tb.binding, "uniform" if tb.uniform else "storage",
+                                                       tb.scalar, tb.components, len(data) // tb.layout["stride"], path, outputs[tb.index]) for tb, path, data in seeded]

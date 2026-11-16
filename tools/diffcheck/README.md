@@ -156,6 +156,7 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
 - `// DIFFCHECK-ULP: <buffer> <n>` replaces the file-wide ULP bound for one buffer (0 = bit-exact),
   so a buffer that must be exact is not loosened by a neighbour fed by `exp` (a graphics attachment
   is named `color0`, ...). It cannot loosen the interpolation tolerance of a graphics attachment.
+- `// DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>` runs that texel buffer with R, RG or RGBA texels (default 4; see Kernel texel buffers).
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
 - Not supported yet in kernel mode, skipped with the reason: argument buffers, atomics (#374), writable
   textures, non-2D or non-float textures, embedded (`constexpr`) samplers (all #374). Graphics pairs have their
@@ -194,15 +195,16 @@ between bindings, an unswapped sample coordinate, two samplers swapped between b
 ## Kernel texel buffers
 
 A kernel with `texture_buffer<T, access>` arguments (T: float, half, int, uint, short or ushort; access read,
-write or read_write) is run too, `get_width` included. Each is a buffer of RGBA texels of T (`elems` texels, so 256 at
+write or read_write) is run too, `get_width` included. Each is a buffer of texels of T (RGBA unless `// DIFFCHECK-TEXEL: <name> 1|2`
+picks R or RG; `elems` texels, so 256 at
 grid 64), seeded from the case's generator like a device buffer (profiles, `DIFFCHECK-RANGE` and `-FLOAT-RANGE` by name) and given
 identical bytes on both sides. Apple binds a `MTLTextureTypeTextureBuffer` over a shared buffer at the Metal index
-(pixel format RGBA32Float, RGBA16Float, RGBA32Sint, RGBA32Uint, RGBA16Sint, RGBA16Uint); Vulkan binds a `VkBufferView`
-of the matching `R32G32B32A32_*` or `R16G16B16A16_*` format at the descriptor mslc's reflection names
+(pixel format RGBA32Float, RGBA16Float, RGBA32Sint, RGBA32Uint, RGBA16Sint, RGBA16Uint, or the R and RG ones of the same
+types); Vulkan binds a `VkBufferView` of the matching `R32G32B32A32_*`, `R32G32_*`, `R32_*` or `R16...` format at the descriptor mslc's reflection names
 (`UniformTexelBuffer` for access::read, `StorageTexelBuffer` otherwise). The element type and access come from
 Apple's reflection; mslc's reflection must agree on index, name, access and descriptor type or the file is a
 `reflection-mismatch`. After the dispatch the bytes of every texel buffer are read back and compared leaf by leaf
-(four per texel) like a device buffer, so a write-only texel buffer is an output and the texels no thread writes
+(one per component, four for RGBA) like a device buffer, so a write-only texel buffer is an output and the texels no thread writes
 must keep their seed. The negative control perturbs one writable device buffer and one writable texel buffer
 separately; both must compare unequal.
 
@@ -214,15 +216,18 @@ A write-only buffer is an output and is not tested this way.
 A host that cannot make the buffer says `unsupported: <reason>` and the file is skipped with it, never passed:
 a Vulkan format without the texel buffer feature, a device without `shaderStorageImageRead/WriteWithoutFormat` (a
 storage texel buffer needs both), more texels than `maxTexelBufferElements`, or no Metal texture over the buffer.
-Lavapipe and Apple Silicon do all six types in both access modes. Limits: R32 and RG32 (and R16, RG16) texel formats are
-never exercised (#380), only the four-component ones, so a wrong format or component count for a one- or two-component
-`texture_buffer` is not seen. A swap of a read and a read_write binding is a descriptor type mismatch; lavapipe
+Lavapipe and Apple Silicon do all six types in both access modes and with 1, 2 and 4 components. A texel of fewer than four
+components reads as `(r, 0, 0, 1)` or `(r, g, 0, 1)` and a write keeps only the components the format has, on both sides; mslc's
+SPIR-V carries no format (OpTypeImage `Unknown`), so these probes pin that it neither invents the missing components nor
+depends on a count it cannot see. A swap of a read and a read_write binding is a descriptor type mismatch; lavapipe
 currently crashes on it, which is reported as an `error`, not a mismatch. The texel count is `elems` plus 4 per Metal
 index plus the case number, so every buffer and every case has a different `get_width`; a kernel must index buffers
 only below the width of the lowest-numbered one.
-Probes (`tests/diffcheck/kernel/texel_buffer_*`) are run at grid 64, local 16, and `diffcheck/kernel-driver` plants nine
-miscompiles (a texel index off by one, a mirrored index off by one, every write two texels away, two components
-swapped, three binding swaps, `get_width` folded to a constant, `get_width` of the wrong buffer) and requires each to be reported as a mismatch while the baselines match.
+Probes (`tests/diffcheck/kernel/texel_buffer_*`; the `_r_`, `_rg_` and `narrow` ones use `DIFFCHECK-TEXEL`) are run at grid 64, local 16, and
+`diffcheck/kernel-driver` plants nine miscompiles (a texel index off by one, a mirrored index off by one, every write two texels away, two components
+swapped, three binding swaps, `get_width` folded to a constant, `get_width` of the wrong buffer) and requires each to be reported as a mismatch while the baselines match. Five more are specific to R and RG buffers (a read that
+repeats x or y in a later component, a write with x and y or y and z swapped, an R and an RG buffer exchanging bindings), and
+swapping z and w of a write to an RG buffer, which changes no stored byte, must still match.
 
 ## Layout cross-check
 

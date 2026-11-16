@@ -14,12 +14,12 @@
 //   sampler <metal index> <set> <binding>                               (at most 4)
 //   spec <constant id> <value>   a specialization constant besides the local size (mslc's threadgroup
 //                                memory arguments: the element count of their Workgroup array; at most 8)
-//   texelbuffer <metal index> <set> <binding> uniform|storage <type> <texels> <input file> <output file>
+//   texelbuffer <metal index> <set> <binding> uniform|storage <type> <components 1|2|4> <texels> <input file> <output file>
 //                                                                       (at most 8)
 // A texture is a 2D RGBA32F sampled image (a storagetexture: a read-only storage image, which is
 // what mslc declares for access::read) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
-// 2 mirrored repeat), as in metalhost. A texel buffer is a VkBufferView of <texels> RGBA texels of <type>
-// (float half int uint short ushort: R32G32B32A32_SFLOAT, R16G16B16A16_SFLOAT, ..._SINT, ..._UINT) over a
+// 2 mirrored repeat), as in metalhost. A texel buffer is a VkBufferView of <texels> texels of <components> (1, 2 or 4) components of <type>
+// (float half int uint short ushort: R32_SFLOAT, R32G32_SFLOAT, R32G32B32A32_SFLOAT, R16..., ..._SINT, ..._UINT) over a
 // buffer filled from the input file, a UNIFORM_TEXEL_BUFFER descriptor (sampled) or a STORAGE_TEXEL_BUFFER one,
 // and its bytes are written to the output file after the dispatch. A device without the format feature or
 // the format-less storage image read and write features exits 2 with "unsupported: <reason>", which the
@@ -139,7 +139,7 @@ static uint32_t initDevice(VkQueueFlags queueFlag) {
 
 #define MAXTEX 4
 #define MAXTB 8
-static VkFormat texelFormat(const char *type, unsigned *bytes);
+static VkFormat texelFormat(const char *type, unsigned components, unsigned *bytes);
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Img;
 static Img makeImage(VkFormat f, unsigned w, unsigned h, VkImageUsageFlags usage, VkImageAspectFlags aspect);
 static VkImageMemoryBarrier imgBarrier(VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
@@ -199,7 +199,7 @@ int main(int argc, char **argv) {
     unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], nt = 0, sset[MAXTEX], sbind[MAXTEX], sidx[MAXTEX], ns = 0;
     char tfile[MAXTEX][1024]; int tstore[MAXTEX];
     unsigned specid[MAXSPEC], specval[MAXSPEC], nspec = 0;
-    unsigned bset[MAXTB], bbind[MAXTB], btexels[MAXTB], bbytes[MAXTB], nb = 0; int bstore[MAXTB];
+    unsigned bset[MAXTB], bbind[MAXTB], bcomp[MAXTB], btexels[MAXTB], bbytes[MAXTB], nb = 0; int bstore[MAXTB];
     char btype[MAXTB][16], bin[MAXTB][1024], bout[MAXTB][1024];
     FILE *mf = fopen(argv[1], "r");
     if (!mf) die("cannot open %s", argv[1]);
@@ -215,7 +215,7 @@ int main(int argc, char **argv) {
         if (nt < MAXTEX && sscanf(line, "storagetexture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { tstore[nt++] = 1; continue; }
         if (nb < MAXTB) {
             char kind[16];
-            if (sscanf(line, "texelbuffer %*u %u %u %15s %15s %u %1023s %1023s", &bset[nb], &bbind[nb], kind, btype[nb], &btexels[nb], bin[nb], bout[nb]) == 7) {
+            if (sscanf(line, "texelbuffer %*u %u %u %15s %15s %u %u %1023s %1023s", &bset[nb], &bbind[nb], kind, btype[nb], &bcomp[nb], &btexels[nb], bin[nb], bout[nb]) == 8) {
                 if (strcmp(kind, "uniform") && strcmp(kind, "storage")) die("texel buffer kind %s is not uniform or storage", kind);
                 bstore[nb++] = kind[0] == 's';
                 continue;
@@ -261,7 +261,7 @@ int main(int argc, char **argv) {
     Img tex[MAXTEX]; Buf stage[MAXTEX]; Buf tbuf[MAXTB]; VkBufferView tview[MAXTB];
     for (unsigned i = 0; i < nb; i++) {
         unsigned bytes1;
-        VkFormat fmt = texelFormat(btype[i], &bytes1);
+        VkFormat fmt = texelFormat(btype[i], bcomp[i], &bytes1);
         VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(gpd, fmt, &fp);
         VkFormatFeatureFlags need = bstore[i] ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
         if (!(fp.bufferFeatures & need)) refuse("format %d lacks the %s texel buffer feature", (int)fmt, bstore[i] ? "storage" : "uniform");
@@ -410,14 +410,18 @@ static const Fmt *findFmt(const Fmt *t, size_t n, const char *name) {
     die("unknown format %s", name);
 }
 
-static VkFormat texelFormat(const char *type, unsigned *bytes) {
-    static const struct { const char *type; VkFormat format; unsigned bytes; } T[] = {
-        {"float", VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {"half", VK_FORMAT_R16G16B16A16_SFLOAT, 8},
-        {"int", VK_FORMAT_R32G32B32A32_SINT, 16}, {"uint", VK_FORMAT_R32G32B32A32_UINT, 16},
-        {"short", VK_FORMAT_R16G16B16A16_SINT, 8}, {"ushort", VK_FORMAT_R16G16B16A16_UINT, 8},
+static VkFormat texelFormat(const char *type, unsigned components, unsigned *bytes) {
+    static const struct { const char *type; unsigned components; VkFormat format; unsigned bytes; } T[] = {
+        {"float", 1, VK_FORMAT_R32_SFLOAT, 4}, {"float", 2, VK_FORMAT_R32G32_SFLOAT, 8}, {"float", 4, VK_FORMAT_R32G32B32A32_SFLOAT, 16},
+        {"half", 1, VK_FORMAT_R16_SFLOAT, 2}, {"half", 2, VK_FORMAT_R16G16_SFLOAT, 4}, {"half", 4, VK_FORMAT_R16G16B16A16_SFLOAT, 8},
+        {"int", 1, VK_FORMAT_R32_SINT, 4}, {"int", 2, VK_FORMAT_R32G32_SINT, 8}, {"int", 4, VK_FORMAT_R32G32B32A32_SINT, 16},
+        {"uint", 1, VK_FORMAT_R32_UINT, 4}, {"uint", 2, VK_FORMAT_R32G32_UINT, 8}, {"uint", 4, VK_FORMAT_R32G32B32A32_UINT, 16},
+        {"short", 1, VK_FORMAT_R16_SINT, 2}, {"short", 2, VK_FORMAT_R16G16_SINT, 4}, {"short", 4, VK_FORMAT_R16G16B16A16_SINT, 8},
+        {"ushort", 1, VK_FORMAT_R16_UINT, 2}, {"ushort", 2, VK_FORMAT_R16G16_UINT, 4}, {"ushort", 4, VK_FORMAT_R16G16B16A16_UINT, 8},
     };
-    for (size_t i = 0; i < sizeof T / sizeof *T; i++) if (!strcmp(T[i].type, type)) { *bytes = T[i].bytes; return T[i].format; }
-    die("unknown texel buffer type %s", type);
+    for (size_t i = 0; i < sizeof T / sizeof *T; i++)
+        if (!strcmp(T[i].type, type) && T[i].components == components) { *bytes = T[i].bytes; return T[i].format; }
+    die("unknown texel buffer type %s with %u components", type, components);
 }
 
 static uint32_t memTypeAny(uint32_t bits) {

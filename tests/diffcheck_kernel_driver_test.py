@@ -44,7 +44,8 @@ def mutated(path, edits):
 
 
 BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "sampler_modes", "layout_unread_member", "ulp_per_buffer", "threadgroup_argument",
-             "texel_buffer_read", "texel_buffer_write", "texel_buffer_read_write", "texel_buffer_unused")
+             "texel_buffer_read", "texel_buffer_write", "texel_buffer_read_write", "texel_buffer_unused",
+             "texel_buffer_r_read", "texel_buffer_rg_read", "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
 # (probe, edits, expected status): each is a change a real compiler bug could make.
 MUTANTS = [
     # texture: the x and y of a texel fetch swapped
@@ -90,7 +91,25 @@ MUTANTS = [
     ("texel_buffer_read_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
     # texel buffer, read_write: the mirrored read of the read-only buffer is one texel lower
     ("texel_buffer_read_write", [[r"OpBitcast %uint %int_1$", "OpBitcast %uint %int_2"]], "mismatched"),
+    # R texel buffer, read: the float fetch returns its first component twice (a read that fills the missing ones from x)
+    ("texel_buffer_r_read", [[r"(OpImageFetch %v4float %\d+ %\d+\n\s+)OpStore (%\d+) (%\d+)( Aligned 16)",
+                              r"\1%9001 = OpVectorShuffle %v4float \3 \3 0 0 2 3\n OpStore \2 %9001\4"]], "mismatched"),
+    # RG texel buffer, read: the uint fetch returns its second component in the third place as well
+    ("texel_buffer_rg_read", [[r"(OpImageFetch %v4uint %\d+ %\d+\n\s+)OpStore (%\d+) (%\d+)( Aligned 16)",
+                               r"\1%9001 = OpVectorShuffle %v4uint \3 \3 0 1 1 3\n OpStore \2 %9001\4"]], "mismatched"),
+    # R texel buffer, write: the float4 stored into the float buffer has its x and y swapped, and only x is kept
+    ("texel_buffer_r_write", [[r"(OpCompositeConstruct %v4float) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # RG texel buffer, write: the uint4 stored has its y and z swapped, and x and y are kept
+    ("texel_buffer_rg_write", [[r"(OpCompositeConstruct %v4uint %\d+) (%\d+) (%\d+) (%\d+)", r"\1 \3 \2 \4"]], "mismatched"),
+    # R and RG texel buffers, read_write: the R float and the RG float buffer change bindings
+    ("texel_buffer_narrow_read_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
 ]
+
+# Equivalent mutant: components past the texel format are not stored, so swapping z and w of a write to an RG buffer
+# changes no byte on either side, and the harness must not call it a mismatch (else the format is not what is compared).
+# Likewise y and z of a write to an R buffer: if the R directive silently fell back to RGBA, this would change bytes.
+EQUIVALENT = [("texel_buffer_rg_write", [[r"(OpCompositeConstruct %v4uint %\d+ %\d+) (%\d+) (%\d+)", r"\1 \3 \2"]]),
+              ("texel_buffer_r_write", [[r"(OpCompositeConstruct %v4float %\d+) (%\d+) (%\d+)", r"\1 \3 \2"]])]
 
 rc, out, data = run(probe("texture_read"))
 if rc == 77:
@@ -106,6 +125,18 @@ assert run(probe("texture_unused"))[2]["unused"].keys() == {"ignored"}
 for name, edits, status in MUTANTS:
     rc, out, data = mutated(probe(name), edits)
     assert rc == 1 and data["status"] == status, ("mutant not detected", name, edits, rc, out)
+
+for name, edits in EQUIVALENT:
+    rc, out, data = mutated(probe(name), edits)
+    assert rc == 0 and data["status"] == "matched", ("equivalent mutant reported", name, rc, out)
+
+# DIFFCHECK-TEXEL on a name that is no texture_buffer is a typo, not a silent no-op.
+with tempfile.TemporaryDirectory() as d:
+    typo = os.path.join(d, "texel_typo.metal")
+    with open(probe("texel_buffer_r_read")) as src, open(typo, "w") as dst:
+        dst.write(src.read().replace("TEXEL: f 1", "TEXEL: ff 1"))
+    rc, out, data = run(typo)
+    assert rc == 2 and "ff" in out, (rc, out)
 
 # Without the directive the file-wide 4 ULP bound hides the one ULP error: the directive is what catches it.
 with tempfile.TemporaryDirectory() as d:

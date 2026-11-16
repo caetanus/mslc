@@ -10,6 +10,8 @@
   // DIFFCHECK-ULP: <buffer> <n>                    ULP bound for that buffer's float leaves, replacing the one chosen
                                                      from the builtins the source calls (0 = bit-exact); an attachment
                                                      name in graphics. Tightens a buffer a loose neighbour would hide.
+  // DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>       components per texel of that texture_buffer (R, RG or RGBA;
+                                                     4 when absent), so the one- and two-component formats are run
   // DIFFCHECK-UNUSED: <texture> <reason>            the kernel legitimately ignores this texture (otherwise a
                                                      texture the output does not depend on is a failure)
   // DIFFCHECK-EXCLUDE: <buffer> <reason>            skip a buffer's comparison; the reason
@@ -41,7 +43,7 @@ def _point(token):
 
 
 def parse(source):
-    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "ulp": {}, "unused": {}, "geometry": None, "position": None,
+    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "ulp": {}, "texel": {}, "unused": {}, "geometry": None, "position": None,
               "depth": False}
     for line in source.splitlines():
         m = re.match(r"\s*//\s*RUN:\s*(.*)$", line)
@@ -91,6 +93,12 @@ def parse(source):
             if not m:
                 raise ValueError("bad DIFFCHECK-ULP line %r (want <buffer> <whole number>)" % line.strip())
             result["ulp"][m.group(1)] = int(m.group(2))
+            continue
+        if re.match(r"\s*//\s*DIFFCHECK-TEXEL:", line):
+            m = re.match(r"\s*//\s*DIFFCHECK-TEXEL:\s*(\S+)\s+([124])\s*$", line)
+            if not m:
+                raise ValueError("bad DIFFCHECK-TEXEL line %r (want <texture_buffer> 1, 2 or 4)" % line.strip())
+            result["texel"][m.group(1)] = int(m.group(2))
             continue
         m = re.match(r"\s*//\s*DIFFCHECK-UNUSED:\s*(\S+)\s*(.*)$", line)
         if m:
