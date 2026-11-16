@@ -172,5 +172,22 @@ class Verdict(unittest.TestCase):
         self.assertEqual(checks.verdict(cases, True, False, ["t"])[0], "mismatched")
 
 
+class Threadgroup(unittest.TestCase):
+    MINE = [{"metal_index": 2, "spec_id": 3, "element_size": 4, "name": "a"},
+            {"metal_index": 0, "spec_id": 4, "element_size": 16, "name": "b"}]
+
+    def test_lengths_are_bytes_on_apple_and_elements_on_vulkan(self):
+        self.assertEqual(resources.threadgroup_lines(self.MINE, 8, "apple"), ["threadgroup 2 32", "threadgroup 0 128"])
+        self.assertEqual(resources.threadgroup_lines(self.MINE, 8, "mslc"), ["spec 3 8", "spec 4 8"])
+
+    def test_cross_check_compares_index_name_and_size(self):
+        apple = {"threadgroups": [{"index": 0, "name": "b", "size": 16}, {"index": 2, "name": "a", "size": 4}]}
+        self.assertEqual(resources.threadgroup_cross_check(self.MINE, apple), [])
+        apple["threadgroups"][0]["size"] = 12
+        self.assertEqual(len(resources.threadgroup_cross_check(self.MINE, apple)), 1)
+        apple["threadgroups"].pop()
+        self.assertEqual(len(resources.threadgroup_cross_check(self.MINE, apple)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

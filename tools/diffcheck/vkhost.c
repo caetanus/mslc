@@ -12,6 +12,8 @@
 //   buffer <member> <bytes> <input file> <output file>
 //   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file>   (at most 4)
 //   sampler <metal index> <set> <binding>                               (at most 4)
+//   spec <constant id> <value>   a specialization constant besides the local size (mslc's threadgroup
+//                                memory arguments: the element count of their Workgroup array; at most 8)
 // A texture is a 2D RGBA32F sampled image (a storagetexture: a read-only storage image, which is
 // what mslc declares for access::read) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
 // 2 mirrored repeat), as in metalhost. Exit 0 on success, 2 on any Vulkan or file error (never a mismatch: this host
@@ -28,6 +30,7 @@
 
 #define CHK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) die("%s failed: %d", #x, (int)r_); } while (0)
 #define MAXBUF 32
+#define MAXSPEC 8
 
 static void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 #include <stdarg.h>
@@ -176,12 +179,14 @@ int main(int argc, char **argv) {
     unsigned long long bytes[MAXBUF];
     unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], nt = 0, sset[MAXTEX], sbind[MAXTEX], sidx[MAXTEX], ns = 0;
     char tfile[MAXTEX][1024]; int tstore[MAXTEX];
+    unsigned specid[MAXSPEC], specval[MAXSPEC], nspec = 0;
     FILE *mf = fopen(argv[1], "r");
     if (!mf) die("cannot open %s", argv[1]);
     char line[4096];
     while (fgets(line, sizeof line, mf)) {
         if (sscanf(line, "spv %1023s", spv) == 1 || sscanf(line, "entry %255s", entry) == 1) continue;
         if (sscanf(line, "set %u", &set) == 1) continue;
+        if (nspec < MAXSPEC && sscanf(line, "spec %u %u", &specid[nspec], &specval[nspec]) == 2) { nspec++; continue; }
         if (sscanf(line, "local %u %u %u", local, local + 1, local + 2) == 3) continue;
         if (sscanf(line, "groups %u %u %u", groups, groups + 1, groups + 2) == 3) continue;
         if (nbuf < MAXBUF && sscanf(line, "buffer %u %llu %1023s %1023s", &member[nbuf], &bytes[nbuf], in[nbuf], out[nbuf]) == 4) { nbuf++; continue; }
@@ -269,8 +274,10 @@ int main(int argc, char **argv) {
     VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smci.codeSize = codeSize; smci.pCode = code;
     VkShaderModule mod; CHK(vkCreateShaderModule(dev, &smci, NULL, &mod));
-    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
-    VkSpecializationInfo si = {3, me, sizeof local, local};
+    VkSpecializationMapEntry me[3 + MAXSPEC] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+    unsigned sdata[3 + MAXSPEC] = {local[0], local[1], local[2]};
+    for (unsigned i = 0; i < nspec; i++) { me[3 + i] = (VkSpecializationMapEntry){specid[i], (3 + i) * 4, 4}; sdata[3 + i] = specval[i]; }
+    VkSpecializationInfo si = {3 + nspec, me, (3 + nspec) * 4, sdata};
     VkComputePipelineCreateInfo pci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     pci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; pci.stage.module = mod;

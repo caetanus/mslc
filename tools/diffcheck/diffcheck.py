@@ -45,7 +45,7 @@ def run_backend(backend, run, case, textures, tag=""):
         rows.append("buffer %d %d %s %s" % (idx if backend == "apple" else b["member"], run["sizes"][idx],
                                             os.path.join(work, "in-%d-%d.bin" % (case, idx)), out))
         outs[idx] = out
-    extra = resources.lines(textures, run["samplers"])
+    extra = resources.lines(textures, run["samplers"]) + resources.threadgroup_lines(run["threadgroups"], run["local"], backend)
     if backend == "apple":
         text = ["mode run"] + run["lines"] + ["entry " + run["entry"], "local %d 1 1" % run["local"],
                                               "groups %d 1 1" % run["groups"]] + rows + extra
@@ -86,7 +86,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         result.update(status="skipped", reason="grid %d is not a multiple of local size %d" % (params["grid"], local))
         return result
     bindings = reflection["bindings"]
-    unsupported = sorted({b["kind"] for b in bindings if b["kind"] not in ("Buffer", "Texture", "Sampler")})
+    unsupported = sorted({b["kind"] for b in bindings if b["kind"] not in ("Buffer", "Texture", "Sampler", "ThreadgroupMemory")})
     if unsupported:
         result.update(status="skipped", reason="unsupported binding kind: " + ", ".join(unsupported))
         return result
@@ -106,7 +106,9 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     if reasons:
         result.update(status="skipped", reason="unsupported argument: " + "; ".join(reasons))
         return result
-    findings = checks.cross_check(mbuf, apple) + resources.cross_check(bindings, apple)
+    threadgroups = sorted([b for b in bindings if b["kind"] == "ThreadgroupMemory"], key=lambda b: b["metal_index"])
+    findings = (checks.cross_check(mbuf, apple) + resources.cross_check(bindings, apple)
+                + resources.threadgroup_cross_check(threadgroups, apple))
     if findings:
         result.update(status="reflection-mismatch", reason="; ".join(findings))
         return result
@@ -149,7 +151,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         for i, l in sorted(layouts.items()):
             hostenv.write_bytes(os.path.join(work, "in-%d-%d.bin" % (case, i)), data[i])
         run = dict(opts=opts, work=work, lines=lines, spv=spv, entry=entry, local=local, groups=groups, mbuf=mbuf,
-                   set_index=set_index, samplers=samplers, sizes={i: len(d) for i, d in data.items()})
+                   set_index=set_index, samplers=samplers, threadgroups=threadgroups, sizes={i: len(d) for i, d in data.items()})
         outs = {backend: run_backend(backend, run, case, textures) for backend in ("apple", "mslc")}
         if opts.corrupt_mslc:
             name, _, at = opts.corrupt_mslc.partition(":")

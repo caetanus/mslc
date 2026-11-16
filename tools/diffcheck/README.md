@@ -156,10 +156,18 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   so a buffer that must be exact is not loosened by a neighbour fed by `exp` (a graphics attachment
   is named `color0`, ...). It cannot loosen the interpolation tolerance of a graphics attachment.
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
-- Not supported yet in kernel mode, skipped with the reason: threadgroup memory arguments
-  (`[[threadgroup(n)]]`: mslc rejects the attribute, #373), argument buffers, atomics (#374), writable
+- Not supported yet in kernel mode, skipped with the reason: argument buffers, atomics (#374), writable
   textures, non-2D or non-float textures, embedded (`constexpr`) samplers (all #374). Graphics pairs have their
   own mode, below.
+
+## Kernel threadgroup memory arguments
+
+`threadgroup T *p [[threadgroup(n)]]` gets room for one element per thread of the group: Apple's
+`setThreadgroupMemoryLength:atIndex:` is called with `local * element_size` bytes, and the Vulkan host
+writes `local` into the argument's specialization constant (`spec_id` of mslc's `ThreadgroupMemory`
+reflection entry, `spec <id> <value>` in vkhost's manifest). The indices, names and element sizes of
+mslc's reflection are cross-checked against Apple's threadgroup bindings. A kernel must therefore index
+its threadgroup arguments below the local size.
 
 ## Kernel textures and samplers
 

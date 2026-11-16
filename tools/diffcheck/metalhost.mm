@@ -9,6 +9,7 @@
 //   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file>
 //                                                    (run mode; storage: mslc's read-access image; set and binding are
 //   sampler <metal index> <set> <binding>                              vkhost's, ignored here)
+//   threadgroup <metal index> <bytes>   setThreadgroupMemoryLength:atIndex: (run mode)
 // A texture is 2D RGBA32Float, shader read; a sampler is nearest and normalised.
 // Graphics: mode reflect-gfx|draw, see drawMain; reflect-gfx writes {vertex, fragment} binding
 // lists (buffers with layouts, textures, samplers) of the render pipeline.
@@ -84,9 +85,16 @@ static void addLeaves(NSMutableArray *out, NSUInteger base, MTLDataType t, MTLSt
 // drops the vertex descriptor's own buffers.
 static NSDictionary *reflectBindings(NSArray<id<MTLBinding>> *list, BOOL graphics, BOOL resources) {
     g_unsupported = [NSMutableArray array];
-    NSMutableArray *buffers = [NSMutableArray array], *textures = [NSMutableArray array], *samplers = [NSMutableArray array];
+    NSMutableArray *buffers = [NSMutableArray array], *textures = [NSMutableArray array], *samplers = [NSMutableArray array],
+        *threadgroups = [NSMutableArray array];
     for (id<MTLBinding> b in list) {
         if (graphics && [b.name hasPrefix:@"vertexBuffer."]) continue;  // the vertex descriptor's own buffers
+        if (resources && b.type == MTLBindingTypeThreadgroupMemory) {
+            id<MTLThreadgroupBinding> tb = (id<MTLThreadgroupBinding>)b;
+            [threadgroups addObject:@{@"index": @(b.index), @"name": b.name, @"size": @(tb.threadgroupMemoryDataSize),
+                @"alignment": @(tb.threadgroupMemoryAlignment)}];
+            continue;
+        }
         if (resources && b.type == MTLBindingTypeTexture) {
             id<MTLTextureBinding> tb = (id<MTLTextureBinding>)b;
             [textures addObject:@{@"index": @(b.index), @"name": b.name,
@@ -120,7 +128,8 @@ static NSDictionary *reflectBindings(NSArray<id<MTLBinding>> *list, BOOL graphic
         [buffers addObject:@{@"index": @(bb.index), @"name": bb.name, @"access": access[bb.access],
             @"pointer": @(pointer), @"stride": @(stride), @"alignment": @(bb.bufferAlignment), @"leaves": leaves}];
     }
-    return @{@"buffers": buffers, @"textures": textures, @"samplers": samplers, @"unsupported": g_unsupported};
+    return @{@"buffers": buffers, @"textures": textures, @"samplers": samplers, @"threadgroups": threadgroups,
+        @"unsupported": g_unsupported};
 }
 
 static id<MTLLibrary> buildLibrary(id<MTLDevice> device, NSDictionary *m, NSError **error) {
@@ -348,7 +357,7 @@ int main(int argc, char **argv) {
         NSMutableDictionary *m = [NSMutableDictionary dictionary];
         NSMutableArray *bufSpecs = [NSMutableArray array];
         NSMutableDictionary<NSString *, NSMutableArray *> *lists = [NSMutableDictionary dictionary];
-        NSSet *multi = [NSSet setWithArray:@[@"attr", @"color", @"gbuffer", @"texture", @"storagetexture", @"sampler"]];
+        NSSet *multi = [NSSet setWithArray:@[@"attr", @"color", @"gbuffer", @"texture", @"storagetexture", @"sampler", @"threadgroup"]];
         NSString *text = [NSString stringWithContentsOfFile:@(argv[1]) encoding:NSUTF8StringEncoding error:nil];
         if (!text) die(@"cannot read manifest");
         for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
@@ -385,7 +394,7 @@ int main(int argc, char **argv) {
         NSDictionary *bindings = reflectBindings(refl.bindings, NO, YES);
         NSArray *buffers = bindings[@"buffers"];
         NSDictionary *doc = @{@"device": device.name, @"buffers": buffers, @"textures": bindings[@"textures"], @"samplers": bindings[@"samplers"],
-            @"unsupported": bindings[@"unsupported"],
+            @"threadgroups": bindings[@"threadgroups"], @"unsupported": bindings[@"unsupported"],
             @"max_threads": @(pso.maxTotalThreadsPerThreadgroup), @"execution_width": @(pso.threadExecutionWidth)};
         if (m[@"reflection"]) {
             NSData *j = [NSJSONSerialization dataWithJSONObject:doc options:NSJSONWritingSortedKeys error:nil];
@@ -406,6 +415,7 @@ int main(int argc, char **argv) {
             [enc setTexture:t atIndex:[w[1] integerValue]];
             [keep addObject:t];
         }
+        for (NSArray *w in lists[@"threadgroup"]) [enc setThreadgroupMemoryLength:[w[2] integerValue] atIndex:[w[1] integerValue]];
         for (NSArray *w in lists[@"sampler"]) [enc setSamplerState:nearestSampler(device, [w[1] integerValue]) atIndex:[w[1] integerValue]];
         for (NSArray *w in bufSpecs) {
             NSUInteger idx = [w[1] integerValue], n = [w[2] integerValue];

@@ -30,6 +30,23 @@ def cross_check(bindings, apple, label=""):
     return findings
 
 
+def threadgroup_cross_check(threadgroups, apple):
+    """Findings where mslc's ThreadgroupMemory bindings differ from Apple's threadgroup arguments by
+    index, name or element size."""
+    mine = sorted((b["metal_index"], b["name"], b["element_size"]) for b in threadgroups)
+    theirs = sorted((t["index"], t["name"], t["size"]) for t in apple["threadgroups"])
+    return [] if mine == theirs else ["threadgroup arguments differ: mslc %s, Apple %s" % (mine, theirs)]
+
+
+def threadgroup_lines(threadgroups, local, backend):
+    """Manifest lines giving every threadgroup argument room for one element per thread of the group:
+    Apple's setThreadgroupMemoryLength takes the bytes, and mslc's reflection says the Vulkan side is
+    the element count in the argument's spec constant (bytes / element_size)."""
+    if backend == "apple":
+        return ["threadgroup %d %d" % (b["metal_index"], local * b["element_size"]) for b in threadgroups]
+    return ["spec %d %d" % (b["spec_id"], local) for b in threadgroups]
+
+
 def unsupported(entry, apple):
     """Reasons this entry point's textures and samplers cannot be fed (empty: they can)."""
     reasons = ["texture %s access %s" % (b["name"], b.get("texture_access")) for b in entry["bindings"]
