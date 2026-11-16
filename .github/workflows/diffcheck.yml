@@ -51,4 +51,4 @@ jobs:
         run: |
           python3 tools/diffcheck/diffcheck.py --corpus tests/probe-run.txt --jobs 3 \
             --mslc build/mslc --metalhost build/tools/diffcheck/diffcheck-metalhost \
-            --vkhost build/tools/diffcheck/diffcheck-vkhost --min-compared 1050
+            --vkhost build/tools/diffcheck/diffcheck-vkhost --min-compared 1105

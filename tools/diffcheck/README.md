@@ -140,6 +140,9 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   accesses, races, and the Apple quirks listed in the handover (bool-index dynamic stores write
   lanes j and j+2, vector long/ulong to bool, `half(1e-8)`, fast math).
 - `// DIFFCHECK-RANGE: <buffer> <lo> <hi>` bounds the integer leaves of an index buffer.
+- `// DIFFCHECK-FLOAT-RANGE: <buffer> <lo> <hi>` draws the float leaves of a buffer from the integers
+  `lo..hi`, for a float the kernel converts to an index or a loop bound (so the conversion is
+  defined and a `while (x) x -= 1` loop ends).
 - `// RUN: grid=64 local=8 seed=1 cases=3 elems=256` sets the run parameters for the file
   (command-line flags win).
 - Fused multiply-add: Metal contracts `a * b + c` into an fma even in safe math mode, mslc emits
@@ -158,15 +161,56 @@ Triage of the corpus sweeps (2,754 probe kernels at 64 threads, local size 8: 1,
 matched, 71 mismatched, 45 wrote only zeros, 15 errors, the rest skipped). `tests/probe-run.txt` is
 the matched and zero-output files of that sweep (one line per file, so fewer lines than kernels),
 less the probes that read uninitialised memory and four that flaked across repeated runs because
-every thread stores to the same element (a race, not a finding), plus the changes below. Other
-probes with that shape may still flake. Of the 45 zero-output
-probes, 29 say `// DIFFCHECK: writes-zero` (zero by design; 3 of them also run `grid=1 local=1`
-because every thread stores to element 0); 5 were zero only because the random inputs never reached
-the branch, so they bound the input with `DIFFCHECK-RANGE`; 10 race on element 0 and run `grid=1
-local=1`, which is deterministic for an acceptance probe whose result is incidental but would hide
-lane-order errors; 1 reads uninitialised memory and was dropped from the list. Most of the 71
-mismatches are the same race (not all were triaged). They are not in the list; they need a RUN
-line with `grid=1`, or a rewrite that indexes by thread. The 15 errors time out or crash a host.
+every thread stores to the same element (a race, not a finding), plus the changes below. Of the 45
+zero-output probes, 29 say `// DIFFCHECK: writes-zero` (zero by design; 3 of them also run `grid=1
+local=1` because every thread stores to element 0); 5 were zero only because the random inputs never
+reached the branch, so they bound the input with `DIFFCHECK-RANGE`; 10 race on element 0 and run
+`grid=1 local=1`; 1 reads uninitialised memory and was dropped from the list.
+
+The 71 mismatches and 15 errors (#375) are triaged. None was a silent miscompile. 62 are in the list
+now, each with a `RUN`, `DIFFCHECK-RANGE` or `DIFFCHECK-FLOAT-RANGE` line. Only a `RUN` line registers a ctest
+test (55 of them); the other 7 are corpus-only.
+
+- Most (about 45) were the same race: every thread stores to element 0 or to overlapping elements, and
+  the last writer differs between backends. A kernel that stores to fixed elements runs at `grid=1
+  local=1`. Many of them read `thread_position_in_grid` only to pick an element, so a grid of one
+  loses the thread-id coverage (no wrong value is hidden, but lane-order errors are); where the stores
+  do not overlap the probe runs at the largest such grid (the `switch_repair_*` probes at 8,
+  `helper_thread_pointer_*` at 3). `thread_local_array_two_dimensional_struct`
+  is not a race: it reads an uninitialised element at thread 1, so it runs at `grid=1`.
+  `comparison_unsigned`, already in the list, flaked in a repeat run for this reason and now runs at
+  `grid=1`; the other 38 listed probes that store to a constant index while reading a thread id gave
+  the same result at nine seeds.
+- Inputs outside the kernel's valid range: a divisor of 0 (`DIFFCHECK-RANGE`), a bool or vector lane
+  index, a buffer index, a loop bound (`for_condition_from_int`, `ternary_in_*`, `while_loop`,
+  `brace_local_for*`: 13 of the 15 errors, hangs on Apple or lavapipe) and a float used as an array index
+  (`local_array_*`, `FLOAT-RANGE`). `while_loop` and `while_condition_from_float` end with every
+  output zero, so they say `writes-zero`; they are termination checks only (a mutant that just stores
+  zero survives).
+- `bool_from_float_is_unordered_compare`, `bool_vector_from_float_vector_is_unordered_compare`,
+  `condition_from_float_is_unordered_compare` and `logical_and_of_numeric_operands` are not in the list:
+  Apple flushes a denormal in a float compare (`x != 0.0f`) and in `bool(x)`, while mslc keeps it (#377).
+  The edge profile contains denormals, and no grid size or seed keeps them out reliably (a grid that stops
+  before the first denormal passes at one seed and fails at the next). Bring them back with a way to keep
+  denormals out of the inputs.
+
+Not in the list, and why:
+
+- 12 probes that are the #368 fold, below: `brace_local_constexpr_floating`, `brace_local_mixed`,
+  `brace_local_nested`, `cast_vector_converts_componentwise`, `convert_float_width`,
+  `narrow_signed_kinds`, `static_cast_struct_constructor_narrows_argument`,
+  `step_buffer_element_and_vector`, `half_literal_rounding_carries_into_the_exponent`,
+  `construct_broadcast`, `direct_init_broadcast` and `array_member_by_value_helper` (an FMA fusion: it
+  mismatches at 3 threads on seeds 2, 3 and 5). With the #368 branch built they match; add them (grid 1
+  for the racing ones) when it lands.
+- `pp_metal_stdlib_adds_macros`, `pp_metal_matrix_adds_fewer_macros`: Apple's in-memory compile
+  pre-includes the stdlib (below).
+- `struct_local_without_initialiser`, `threadgroup_array_two_dimensional`: read uninitialised memory.
+- `compute_id_vector2_takes_leading_lanes`, `compute_id_ushort_vector_copies_and_passes`: every thread
+  stores its id to element 0, so any grid above one races and a grid of one makes every id zero. Variants
+  that index by thread match.
+- `brace_elision_empty_member_explicit_braces`, `using_declaration_of_stdlib_name_hides_member_function`:
+  lavapipe rejects an empty struct passed by value or built with `OpCompositeConstruct` (#376).
 
 - Inputs that are UB for the kernel. A float input converted to an array index, a `uchar` lane
   index, a loop bound or a store index drawn from the full 32-bit range reads or writes out of
@@ -182,7 +226,9 @@ line with `grid=1`, or a rewrite that indexes by thread. The 15 errors time out 
   reachable from `-I`). `pp_metal_stdlib_adds_macros` matched through that route, which suggests
   `newLibraryWithSource` pre-includes `<metal_stdlib>`; that is the unverified reading of the
   other `pp_metal_*` probe.
-- Lavapipe rejects some valid modules (an empty struct: `vkCreateComputePipelines` -13).
+- Lavapipe rejects some valid modules (an empty struct passed by value: `vkCreateComputePipelines` -13, #376).
+- Apple flushes denormal floats in a float compare and in a float to bool conversion (#377); the
+  edge profile contains denormals, so a probe that compares or converts float inputs can mismatch there.
 - **Not a harness artifact, #368 (open; origin/master emits neither decoration):** lavapipe folds
   `float(half(x))` to `x`, `float(int(x))` to `trunc(x)`, `x * 0` to `0`, and re-associates
   `(x + 1) - 1`, so a half or a negative fraction held in a register, a signed zero, or a cancellation
@@ -194,9 +240,9 @@ Whether to compare through a buffer store by default: not yet. A store forces th
 value that is stored, so it hides exactly the register-held cases above (the reason to look at them),
 and it does not help the other two limits (the `<metal_stdlib>` pre-include and uninitialised reads
 are Apple-side, not folded values). Until #368 lands, keep comparing as written: where a probe's
-mismatch is the #368 fold, exclude the buffer with a reason that names #368. Re-measure when #368 is
-on master (run the corpus and see whether the 5 known fold mismatches disappear); if they do, nothing
-more is needed and no buffer-store mode should be added.
+mismatch is the #368 fold, exclude the buffer with a reason that names #368. Re-measured with the
+#368 branch (not on master yet): the 12 fold probes listed above all match, so nothing more is needed
+and no buffer-store mode should be added. Repeat it once #368 is on master.
 
 ## Tests and CI
 
@@ -209,8 +255,8 @@ a Metal device, and lavapipe needs Mesa installed, so this is a local and opt-in
 when it does not. Unproven on a real runner: read that step's log on the first run (a device named
 under `devices:` and `default: present` means the job runs; `devices: 0` means a self-hosted runner is
 the only way). A failing job-level `continue-on-error` job may still show a red check on the commit;
-that is unverified until the first run. `tests/probe-run.txt` lists the kernel probes that match at the default grid; the job
-requires 1,050 compared.
+that is unverified until the first run. `tests/probe-run.txt` lists the kernel probes that match (at the default grid or the one their `RUN` line names); the job
+requires 1,105 compared (the list compares 1,173 kernels).
 
 A probe in `tests/probes/` opts in with a `// RUN:` line; with the option on it becomes the
 ctest test `diffcheck/probe/<name>` and kills a mutant the disassembly regexes cannot.
