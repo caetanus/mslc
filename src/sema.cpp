@@ -2613,7 +2613,7 @@ namespace {
 		bool inConstantSpace(const Expression& place) const;
 		std::optional<Type> placeType(const Expression& place);
 		std::optional<Type> sizeofPlaceType(const Expression& place);
-		bool sizeofLeavesTyped(const Expression& expression);
+		std::optional<Type> sizeofExpressionType(const Expression& expression);
 		bool namesPointerParameter(const std::string& name) const;
 		uint64_t sizeofOperand(const Expression& operand);
 		bool isVectorPlace(const Expression& place);
@@ -7358,29 +7358,202 @@ namespace {
 		return placeType(place);
 	}
 
-	// Whether every leaf of an arithmetic operand has a type that is known from the source and is not a
-	// packed vector: a packed operand of + or - gives a packed result (Apple: sizeof is 12), which the
-	// value's SPIR-V type cannot say.
-	bool Emitter::sizeofLeavesTyped(const Expression& expression) {
+	// The type of a sizeof operand worked out from the source alone, by C's rules, without building a
+	// value: nothing in the operand runs or is emitted. A packed vector keeps its packed type through
+	// the unary and binary operators (Apple: sizeof is 12). Nothing for an operand whose type is not
+	// certain, so the caller refuses it rather than guess.
+	std::optional<Type> Emitter::sizeofExpressionType(const Expression& expression) {
+		const auto plain = [](const Type& type) {
+			return !type.isPointer && !type.arrayLength && !type.isMatrix() && type.namedType.empty()
+				&& type.enumName.empty() && type.resource == ResourceKind::None && !type.isAtomic
+				&& !type.isAuto && type.scalar != ScalarKind::Void && type.scalar != ScalarKind::Double;
+		};
+		const auto scalarOf = [](ScalarKind kind) { Type type; type.scalar = kind; return type; };
+		// The integer promotions: anything narrower than an int, a bool included, is an int.
+		const auto promoted = [&](Type type) {
+			if (type.vectorWidth == 0 && !isFloatKind(type.scalar)
+				&& (type.scalar == ScalarKind::Bool || promotedKind(type.scalar) != type.scalar)) {
+				type.scalar = ScalarKind::Int;
+			}
+			return type;
+		};
+		// The usual arithmetic conversions of two scalar kinds: a float beats an integer and a float is
+		// the wider of the two, then C's integer rules.
+		const auto commonKind = [](ScalarKind left, ScalarKind right) {
+			const bool leftFloat = isFloatKind(left);
+			const bool rightFloat = isFloatKind(right);
+			if (leftFloat || rightFloat) {
+				return leftFloat && rightFloat ? (left == ScalarKind::Float || right == ScalarKind::Float
+					? ScalarKind::Float : ScalarKind::Half) : leftFloat ? left : right;
+			}
+			const auto promoteInt = [](ScalarKind kind) {
+				return kind == ScalarKind::Bool ? ScalarKind::Int : promotedKind(kind);
+			};
+			return commonIntegerKind(promoteInt(left), promoteInt(right));
+		};
+		// What a binary operator of two plain arithmetic operands gives: scalars meet in the usual
+		// conversions; two vectors of one element type and width give the left one's type, packed or
+		// not (Apple: packed - float3 is 12, float3 - packed is 16); a vector beside a scalar of its own
+		// element type is the vector; anything else is not modelled.
+		const auto arithmetic = [&](const Type& left, const Type& right) -> std::optional<Type> {
+			if (left.isScalar() && right.isScalar()) {
+				return scalarOf(commonKind(left.scalar, right.scalar));
+			}
+			if (left.scalar != right.scalar || left.scalar == ScalarKind::Bool || (left.vectorWidth != right.vectorWidth
+				&& !left.isScalar() && !right.isScalar())) {
+				return std::nullopt;
+			}
+			return left.isScalar() ? right : left;
+		};
+
 		switch (expression.kind) {
-			case ExpressionKind::IntLiteral:
-			case ExpressionKind::FloatLiteral:
-			case ExpressionKind::BoolLiteral:
-			case ExpressionKind::Construct:
-			case ExpressionKind::Sizeof:
-				return true;
+			case ExpressionKind::IntLiteral: return scalarOf(expression.intKind);
+			case ExpressionKind::FloatLiteral: return scalarOf(expression.floatIsHalf ? ScalarKind::Half : ScalarKind::Float);
+			case ExpressionKind::BoolLiteral: return scalarOf(ScalarKind::Bool);
+			case ExpressionKind::Sizeof: return scalarOf(ScalarKind::ULong);
+			case ExpressionKind::Construct: return expression.constructType;
+			case ExpressionKind::InitList:
+				if (expression.namesConcreteStruct && expression.constructType) {
+					return expression.constructType;
+				}
+				return std::nullopt;
 			case ExpressionKind::Identifier:
 			case ExpressionKind::Member:
 			case ExpressionKind::Index: {
-				const std::optional<Type> type = sizeofPlaceType(expression);
-				return type && !type->isPacked && !type->isPointer && !type->arrayLength;
+				if (expression.kind == ExpressionKind::Identifier) {
+					const auto binding = _bindings.find(expression.name);
+					if (binding != _bindings.end() && binding->second.isBuffer) {
+						Type pointer = binding->second.pointeeMsl;
+						pointer.isPointer = true;
+						pointer.arrayLength.reset();
+						pointer.innerArrayLengths.clear();
+						return pointer;
+					}
+					// A helper's pointer parameter is bound like a local array, so a local that hides it
+					// cannot be told apart there. An entry point's is a buffer binding, which a hiding
+					// local is not.
+					if (_helper && namesPointerParameter(expression.name)) {
+						return std::nullopt;
+					}
+				}
+				return sizeofPlaceType(expression);
 			}
-			case ExpressionKind::Unary:
-			case ExpressionKind::Binary:
-				return sizeofLeavesTyped(*expression.left)
-					&& (expression.kind == ExpressionKind::Unary || sizeofLeavesTyped(*expression.right));
+			case ExpressionKind::Conditional: {
+				const std::optional<Type> condition = sizeofExpressionType(*expression.left);
+				if (!condition || !plain(*condition) || !condition->isScalar()) {
+					return std::nullopt;
+				}
+				const std::optional<Type> yes = sizeofExpressionType(*expression.arguments[0]);
+				const std::optional<Type> no = sizeofExpressionType(*expression.arguments[1]);
+				if (yes && no && yes->isPointer && no->isPointer && !yes->arrayLength && !no->arrayLength
+					&& yes->scalar == no->scalar && yes->namedType == no->namedType && yes->vectorWidth == no->vectorWidth
+					&& yes->matrixColumns == no->matrixColumns && yes->isPacked == no->isPacked
+					&& yes->addressSpace == no->addressSpace) {
+					return yes;
+				}
+				if (!yes || !no || !plain(*yes) || !plain(*no)) {
+					return std::nullopt;
+				}
+				if (yes->scalar == no->scalar && yes->vectorWidth == no->vectorWidth) {
+					return yes;
+				}
+				return yes->isScalar() && no->isScalar() ? std::optional<Type>(scalarOf(commonKind(yes->scalar, no->scalar)))
+					: std::nullopt;
+			}
+			case ExpressionKind::Comma: return sizeofExpressionType(*expression.right);
+			case ExpressionKind::Call: {
+				// The return type of the one function the name can find: any overload, template, library
+				// function beside it or argument-dependent lookup would need the arguments' types.
+				if (expression.left->kind != ExpressionKind::Identifier || expression.left->hasTemplateArguments
+					|| _bindings.count(expression.left->name) > 0
+					|| (expression.left->besideStdlib && findMathBuiltin(expression.left->name))) {
+					return std::nullopt;
+				}
+				std::set<std::string> adl;
+				const std::vector<std::string> names = namesOfCall(expression, &adl);
+				if (names.size() != 1 || !adl.empty() || !visibleTemplates(names, adl).empty()) {
+					return std::nullopt;
+				}
+				const std::vector<HelperFunction*> set = helpersNamed(names.front());
+				if (set.size() != 1 || set.front()->definition->parameters.size() != expression.arguments.size()) {
+					return std::nullopt;
+				}
+				const Type& result = set.front()->definition->returnType;
+				return result.scalar == ScalarKind::Void && result.namedType.empty() && !result.isPointer
+					? std::nullopt : std::optional<Type>(result);
+			}
+			case ExpressionKind::Assign: {
+				// The type of the place written; the value is never stored.
+				const ExpressionKind target = expression.left->kind;
+				if (target != ExpressionKind::Identifier && target != ExpressionKind::Member && target != ExpressionKind::Index) {
+					return std::nullopt;
+				}
+				const std::optional<Type> place = sizeofExpressionType(*expression.left);
+				return place && !place->arrayLength && place->resource == ResourceKind::None && !place->isAuto
+					? place : std::nullopt;
+			}
+			case ExpressionKind::Unary: {
+				const std::optional<Type> operand = sizeofExpressionType(*expression.left);
+				const bool incdec = expression.unaryOperator == UnaryOperator::PreIncrement
+					|| expression.unaryOperator == UnaryOperator::PreDecrement
+					|| expression.unaryOperator == UnaryOperator::PostIncrement
+					|| expression.unaryOperator == UnaryOperator::PostDecrement;
+				if (!operand || expression.unaryOperator == UnaryOperator::AddressOf
+					|| !(plain(*operand) || (incdec && operand->isPointer && !operand->arrayLength))) {
+					return std::nullopt;
+				}
+				switch (expression.unaryOperator) {
+					case UnaryOperator::Not: return operand->isScalar() ? std::optional<Type>(scalarOf(ScalarKind::Bool)) : std::nullopt;
+					case UnaryOperator::PreIncrement:
+					case UnaryOperator::PreDecrement:
+					case UnaryOperator::PostIncrement:
+					case UnaryOperator::PostDecrement: {
+						const ExpressionKind target = expression.left->kind;
+						return target == ExpressionKind::Identifier || target == ExpressionKind::Member
+							|| target == ExpressionKind::Index ? operand : std::nullopt;
+					}
+					case UnaryOperator::BitNot:
+						return isFloatKind(operand->scalar) || operand->scalar == ScalarKind::Bool ? std::nullopt
+							: std::optional<Type>(promoted(*operand));
+					default: return promoted(*operand);
+				}
+			}
+			case ExpressionKind::Binary: {
+				const std::optional<Type> left = sizeofExpressionType(*expression.left);
+				const std::optional<Type> right = sizeofExpressionType(*expression.right);
+				if (!left || !right) {
+					return std::nullopt;
+				}
+				// A pointer moved by an integer is that pointer.
+				const bool offset = expression.binaryOperator == BinaryOperator::Add
+					|| expression.binaryOperator == BinaryOperator::Subtract;
+				const auto integer = [&](const Type& type) { return plain(type) && type.isScalar() && !isFloatKind(type.scalar); };
+				if (offset && left->isPointer && !left->arrayLength && integer(*right)) {
+					return left;
+				}
+				if (expression.binaryOperator == BinaryOperator::Add && right->isPointer && !right->arrayLength && integer(*left)) {
+					return right;
+				}
+				if (!plain(*left) || !plain(*right)) {
+					return std::nullopt;
+				}
+				switch (expression.binaryOperator) {
+					case BinaryOperator::Less: case BinaryOperator::LessEqual: case BinaryOperator::Greater:
+					case BinaryOperator::GreaterEqual: case BinaryOperator::Equal: case BinaryOperator::NotEqual:
+					case BinaryOperator::LogicalAnd: case BinaryOperator::LogicalOr:
+						return left->isScalar() && right->isScalar() ? std::optional<Type>(scalarOf(ScalarKind::Bool)) : std::nullopt;
+					case BinaryOperator::ShiftLeft: case BinaryOperator::ShiftRight:
+						return left->isScalar() && right->isScalar() && !isFloatKind(left->scalar) && !isFloatKind(right->scalar)
+							? std::optional<Type>(promoted(*left)) : std::nullopt;
+					case BinaryOperator::Modulo:
+					case BinaryOperator::BitAnd: case BinaryOperator::BitOr: case BinaryOperator::BitXor:
+						return isFloatKind(left->scalar) || isFloatKind(right->scalar) ? std::nullopt : arithmetic(*left, *right);
+					default:
+						return arithmetic(*left, *right);
+				}
+			}
 			default:
-				return false;
+				return std::nullopt;
 		}
 	}
 
@@ -7402,49 +7575,8 @@ namespace {
 			return sizeofType(type, _unit);
 		};
 
-		switch (operand.kind) {
-			case ExpressionKind::IntLiteral: { Type type; type.scalar = operand.intKind; return sized(type); }
-			case ExpressionKind::FloatLiteral: {
-				Type type;
-				type.scalar = operand.floatIsHalf ? ScalarKind::Half : ScalarKind::Float;
-				return sized(type);
-			}
-			case ExpressionKind::BoolLiteral: { Type type; type.scalar = ScalarKind::Bool; return sized(type); }
-			case ExpressionKind::Construct:
-				if (!operand.constructType) {
-					break;
-				}
-				return sized(*operand.constructType);
-			case ExpressionKind::Identifier:
-			case ExpressionKind::Member:
-			case ExpressionKind::Index: {
-				if (operand.kind == ExpressionKind::Identifier && namesPointerParameter(operand.name)) {
-					throw CompileError("sizeof of the pointer parameter \"" + operand.name
-						+ "\" is not lowered; write sizeof(<pointer type>)");
-				}
-				const std::optional<Type> type = sizeofPlaceType(operand);
-				if (!type) {
-					break;
-				}
-				return sized(*type);
-			}
-			case ExpressionKind::Binary:
-			case ExpressionKind::Unary: {
-				const bool changes = operand.kind == ExpressionKind::Unary
-					&& (operand.unaryOperator == UnaryOperator::PreIncrement
-						|| operand.unaryOperator == UnaryOperator::PreDecrement
-						|| operand.unaryOperator == UnaryOperator::PostIncrement
-						|| operand.unaryOperator == UnaryOperator::PostDecrement
-						|| operand.unaryOperator == UnaryOperator::AddressOf);
-				if (changes || !(_helper || _entryPoint) || !sizeofLeavesTyped(operand)) {
-					break;
-				}
-				Id value = InvalidId;
-				discardLifted([&] { value = emitExpression(operand); });
-				return sized(deduceAutoType(Type(), _builder.typeOf(value), "the operand of sizeof"));
-			}
-			default:
-				break;
+		if (const std::optional<Type> type = sizeofExpressionType(operand)) {
+			return sized(*type);
 		}
 		throw CompileError("sizeof of this expression is not lowered: its type is not one mslc reads "
 			"from the declarations; write sizeof(<type>)");
