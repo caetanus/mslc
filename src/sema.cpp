@@ -9467,6 +9467,10 @@ namespace {
 					|| threadgroupIndices.count(&parameter)) {
 					continue;
 				}
+				if (!(parameter.type.isPointer || parameter.isReference)) {
+					throw CompileError("parameter \"" + parameter.name + "\" is a threadgroup value; a parameter in "
+						"the threadgroup address space is a pointer or a reference");
+				}
 				while (taken.count(next)) { ++next; }
 				if (next > 30) {
 					throw CompileError("parameter \"" + parameter.name + "\" is past the last threadgroup index, 30");
@@ -13117,7 +13121,9 @@ namespace {
 		if (left.kind == ExpressionKind::Identifier) {
 			const auto named = _bindings.find(left.name);
 			if (named != _bindings.end() && named->second.pointeeMsl.arrayLength && !named->second.isBuffer) {
-				throw CompileError("array type " + typeName(named->second.pointeeMsl) + " is not assignable");
+				const bool unsized = *named->second.pointeeMsl.arrayLength == UINT32_MAX;
+				throw CompileError(unsized ? "the threadgroup argument \"" + left.name + "\" is not assignable; assign through it"
+					: "array type " + typeName(named->second.pointeeMsl) + " is not assignable");
 			}
 		}
 		if (const auto target = enumOf(left); target && !target->empty() && *target != "<anonymous>") {
