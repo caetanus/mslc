@@ -37,8 +37,31 @@ Also open, tracked in #371:
   execution modes need `shaderSignedZeroInfNanPreserveFloat32` (VUID 06294) and, for mode 16,
   `shaderSignedZeroInfNanPreserveFloat16` (VUID 06293). Mode 16 is module-wide: every entry point
   gets it once any code declares half.
-- `OpFDiv`, `OpFNegate`, `OpFRem`, `OpDot`, `OpMatrixTimes*` and the GLSL.std.450 ext insts (FMix,
-  Smoothstep, ...) are not decorated `NoContraction`.
+- Consumer side, not in this repo: `src/indium` does not exist here, so the property query lives in
+  darlinghq/indium (the bullet above).
+
+Float operations beyond add/sub/mul (#371), measured with `xcrun metal -fno-fast-math -S
+-emit-llvm` (safe math; Apple's default is fast math, where every op below is `fast`). Rule: an
+operation is decorated when Apple's safe AIR shows a plain op or call, and left alone when Apple
+itself emits `llvm.fmuladd` or the op is exact. `a * b + c` is also `fmuladd` in Apple, so the
+#368 decoration on add/mul is deliberately stricter than Apple (see above). Revisiting that
+conservative choice is a separate decision from this table.
+Open gap: Apple's `length`/`normalize`/`distance` rescale by powers of two before squaring, so
+`length(float4(1e30))` is finite there, while a GLSL `Length` that squares first can return inf.
+
+
+| Operation | Apple AIR | mslc |
+|---|---|---|
+| `/` | `fdiv`, no flags | `OpFDiv` NoContraction |
+| `fmod` | `air.fmod` call, no flags | `OpFRem` NoContraction |
+| `dot`, `vector * matrix` | `air.dot` per column | `OpDot`, `OpVectorTimesMatrix` NoContraction |
+| `matrix * scalar` | `fmul`, no flags | `OpMatrixTimesScalar` NoContraction |
+| `vector * scalar` | `fmul`, no flags | `OpFMul` on a splat, already decorated |
+| unary `-` | `fneg`, exact | not decorated: nothing to contract |
+| `matrix * vector`, `matrix * matrix` | `llvm.fmuladd` | not decorated: Apple allows fusing |
+| `smoothstep` | inlined: `fdiv`, `fmul`, `llvm.fmuladd` | ext inst, not decorated: Apple fuses inside it |
+| `mix` | opaque `air.mix` call | ext inst, not decorated |
+| `length`, `normalize`, `distance` | inlined: `air.dot` + `air.sqrt`/`rsqrt` with power-of-two rescaling for range | GLSL.std.450 ext insts, not decorated; open gap (below) |
 
 ## lavapipe cannot execute any mslc module on this machine (RESOLVED, stale)
 

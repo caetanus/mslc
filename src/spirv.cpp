@@ -294,6 +294,12 @@ void Builder::serialize(std::vector<uint8_t>& out) const {
 	// Metal's safe math never folds these, and a NIR driver does unless the result is
 	// NoContraction (exact). Decorated here, over the instructions that survived, so
 	// a discarded emission cannot leave a decoration naming a missing id.
+	// Per operation, from Apple's -fno-fast-math AIR (#371): fdiv, fmul, fmod, air.dot
+	// and the vector*matrix dots carry no fast-math flags, so they are decorated.
+	// Deliberately not decorated: OpFNegate (exact, folding a sign is bit-identical),
+	// OpMatrixTimesVector/OpMatrixTimesMatrix (Apple emits llvm.fmuladd, so fusing
+	// is allowed there) and the GLSL.std.450 ext insts (Apple's intrinsics are opaque
+	// calls, Smoothstep contains fmuladd, and NoContraction on an ext inst is not defined).
 	std::vector<Instruction> noContraction;
 	if (const auto body = _sections.find(Section::Functions); body != _sections.end()) {
 		for (const Instruction& instruction: body->second) {
@@ -305,7 +311,12 @@ void Builder::serialize(std::vector<uint8_t>& out) const {
 				case OpConvertUToF:
 				case OpFAdd:
 				case OpFSub:
-				case OpFMul: {
+				case OpFMul:
+				case OpFDiv:
+				case OpFRem:
+				case OpDot:
+				case OpMatrixTimesScalar:
+				case OpVectorTimesMatrix: {
 					Instruction decoration;
 					decoration.opcode = OpDecorate;
 					decoration.words = { instruction.words[1],
