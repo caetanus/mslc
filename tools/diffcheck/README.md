@@ -163,7 +163,7 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
 ## Kernel threadgroup memory arguments
 
 `threadgroup T *p [[threadgroup(n)]]` gets room for one element per thread of the group: Apple's
-`setThreadgroupMemoryLength:atIndex:` is called with `local * element_size` bytes, and the Vulkan host
+`setThreadgroupMemoryLength:atIndex:` is called with `local * element_size` bytes rounded up to a multiple of 16 (Apple's requirement), and the Vulkan host
 writes `local` into the argument's specialization constant (`spec_id` of mslc's `ThreadgroupMemory`
 reflection entry, `spec <id> <value>` in vkhost's manifest). The indices, names and element sizes of
 mslc's reflection are cross-checked against Apple's threadgroup bindings. A kernel must therefore index

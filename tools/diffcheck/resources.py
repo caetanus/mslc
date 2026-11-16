@@ -40,10 +40,10 @@ def threadgroup_cross_check(threadgroups, apple):
 
 def threadgroup_lines(threadgroups, local, backend):
     """Manifest lines giving every threadgroup argument room for one element per thread of the group:
-    Apple's setThreadgroupMemoryLength takes the bytes, and mslc's reflection says the Vulkan side is
+    Apple's setThreadgroupMemoryLength takes the bytes (a multiple of 16, so rounded up), and mslc's reflection says the Vulkan side is
     the element count in the argument's spec constant (bytes / element_size)."""
     if backend == "apple":
-        return ["threadgroup %d %d" % (b["metal_index"], local * b["element_size"]) for b in threadgroups]
+        return ["threadgroup %d %d" % (b["metal_index"], -(-local * b["element_size"] // 16) * 16) for b in threadgroups]
     return ["spec %d %d" % (b["spec_id"], local) for b in threadgroups]
 
 
