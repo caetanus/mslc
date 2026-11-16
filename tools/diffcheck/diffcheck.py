@@ -34,9 +34,10 @@ import spirvio
 OK, MISMATCH, ERROR, SKIPPED = 0, 1, 2, 3
 
 
-def run_backend(backend, run, case, textures, tag=""):
-    """{metal index: output bytes} of one backend for one case. The inputs are the files
-    in-<case>-<index>.bin; `textures` is resources.seed's list; `tag` keeps repeat runs' files apart."""
+def run_backend(backend, run, case, textures, tag="", texels=()):
+    """{key: output bytes} of one backend for one case: a device buffer under its Metal index, a texel
+    buffer under resources.texel_key. The inputs are the files in-<case>-<index>.bin; `textures` is
+    resources.seed's list and `texels` resources.seed_texels'; `tag` keeps repeat runs' files apart."""
     work, mbuf = run["work"], run["mbuf"]
     rows, outs = [], {}
     for b in mbuf:
@@ -45,7 +46,9 @@ def run_backend(backend, run, case, textures, tag=""):
         rows.append("buffer %d %d %s %s" % (idx if backend == "apple" else b["member"], run["sizes"][idx],
                                             os.path.join(work, "in-%d-%d.bin" % (case, idx)), out))
         outs[idx] = out
-    extra = resources.lines(textures, run["samplers"]) + resources.threadgroup_lines(run["threadgroups"], run["local"], backend)
+    touts = {tb.index: os.path.join(work, "%s%s-out-t%d-%d.bin" % (backend, tag, case, tb.index)) for tb, _, _ in texels}
+    extra = (resources.lines(textures, run["samplers"]) + resources.texel_lines(texels, touts)
+             + resources.threadgroup_lines(run["threadgroups"], run["local"], backend))
     if backend == "apple":
         text = ["mode run"] + run["lines"] + ["entry " + run["entry"], "local %d 1 1" % run["local"],
                                               "groups %d 1 1" % run["groups"]] + rows + extra
@@ -57,23 +60,57 @@ def run_backend(backend, run, case, textures, tag=""):
     manifest = os.path.join(work, "%s%s-%d.txt" % (backend, tag, case))
     hostenv.write_text(manifest, "\n".join(text) + "\n")
     runner(binary, manifest)
-    return {idx: bytearray(hostenv.read_bytes(path)) for idx, path in outs.items()}
+    outs = {idx: bytearray(hostenv.read_bytes(path)) for idx, path in outs.items()}
+    outs.update({resources.texel_key(tb): bytearray(hostenv.read_bytes(touts[tb.index])) for tb, _, _ in texels})
+    return outs
 
 
-def unused_textures(run, params, textures, bindings, compared, apple_outs, profile):
-    """Names of the textures Apple's output does not depend on: with that one texture's texels
-    replaced by others, every compared leaf is unchanged. A texture the kernel never reads would
-    make the whole binding path untested while the outputs match."""
+def unused_textures(run, params, textures, texels, bindings, compared, apple_outs, profile):
+    """Names of the textures and texel buffers Apple's output does not depend on: with that one
+    resource's contents replaced by others, every compared leaf is unchanged. One the kernel never reads
+    would make the whole binding path untested while the outputs match. A write-only texel buffer is an
+    output, not an input, and is not a candidate."""
     names = {b["metal_index"]: b["name"] for b in bindings if b["kind"] == "Texture"}
     unused = []
     for n, (index, set_, binding, path, access) in enumerate(textures):
         alt = os.path.join(run["work"], "alt-tex%d.bin" % index)
         hostenv.write_bytes(alt, resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile))
         swapped = [(i, s, b, alt if i == index else f, a) for i, s, b, f, a in textures]
-        again = run_backend("apple", run, 0, swapped, "-alt%d" % index)
+        again = run_backend("apple", run, 0, swapped, "-alt%d" % index, texels)
         if not any(compare.compare(l, apple_outs[i], again[i], 0) for i, l in compared.items()):
             unused.append(names[index])
+    for n, (tb, path, data) in enumerate(texels):
+        if tb.layout["access"] == "write":
+            continue
+        name, key = tb.layout["name"], resources.texel_key(tb)
+        alt = os.path.join(run["work"], "alt-tb%d.bin" % tb.index)
+        alt_data = inputs.fill_buffer(tb.layout, len(data) // tb.layout["stride"], random.Random(params["seed"] * 1000 + 6007 + n), profile,
+                                      bounds=params["range"].get(name), float_bounds=params["float_range"].get(name))
+        hostenv.write_bytes(alt, alt_data)
+        swapped = [(t, alt if t.index == tb.index else p, alt_data if t.index == tb.index else d) for t, p, d in texels]
+        again = run_backend("apple", run, 0, textures, "-altb%d" % tb.index, swapped)
+        # The buffer's own contents are an output too: a texel the kernel leaves alone keeps its seed and so
+        # differs between the runs. Only a texel the kernel wrote in either run counts.
+        stride = tb.layout["stride"]
+        own = any((apple_outs[key][o:o + stride] != data[o:o + stride] or again[key][o:o + stride] != alt_data[o:o + stride])
+                  and apple_outs[key][o:o + stride] != again[key][o:o + stride] for o in range(0, len(data), stride))
+        if not own and not any(compare.compare(l, apple_outs[i], again[i], 0) for i, l in compared.items() if i != key):
+            unused.append(name)
     return unused
+
+
+def control_holds(groups, mine, apple):
+    """The negative control: in each group of layouts (device buffers, texel buffers) that has a writable
+    one, a copy of mslc's result with one leaf changed must compare unequal to Apple's, or the comparison
+    could not have told a miscompile from a match. False when nothing could be perturbed at all."""
+    held = []
+    for g in groups:
+        fired = checks.perturb(g, mine, apple)
+        if fired:
+            copy, name, _ = fired
+            index = next(i for i, l in g.items() if l["name"] == name)
+            held.append(bool(compare.compare(g[index], apple[index], copy[index], 0)))
+    return bool(held) and all(held)
 
 
 def check_entry(opts, source, spv, reflection, entry, params, work, includes):
@@ -86,7 +123,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         result.update(status="skipped", reason="grid %d is not a multiple of local size %d" % (params["grid"], local))
         return result
     bindings = reflection["bindings"]
-    unsupported = sorted({b["kind"] for b in bindings if b["kind"] not in ("Buffer", "Texture", "Sampler", "ThreadgroupMemory")})
+    unsupported = sorted({b["kind"] for b in bindings if b["kind"] not in ("Buffer", "Texture", "Sampler", "ThreadgroupMemory", "TextureBuffer")})
     if unsupported:
         result.update(status="skipped", reason="unsupported binding kind: " + ", ".join(unsupported))
         return result
@@ -123,7 +160,8 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     if findings:
         result.update(status="reflection-mismatch", reason="; ".join(findings))
         return result
-    if not any(l["access"] != "read" for l in layouts.values()):
+    tplan = resources.texel_plan(bindings, apple)
+    if not any(l["access"] != "read" for l in layouts.values()) and not any(tb.layout["access"] != "read" for tb in tplan):
         result.update(status="skipped", reason="no writable buffer to compare")
         return result
     if local > apple["max_threads"]:
@@ -133,9 +171,11 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     elements = params.get("elems") or max(64, 4 * params["grid"])
     ulp = compare.ulp_bound_for_source(text)
     excluded = dict(params["exclude"])
-    result["buffers"] = sorted(l["name"] for l in layouts.values())
+    tlayouts = {resources.texel_key(tb): tb.layout for tb in tplan}
+    result["buffers"] = sorted([l["name"] for l in layouts.values()] + [l["name"] for l in tlayouts.values()])
     result["textures"] = sorted(t["name"] for t in apple["textures"])
     compared = {i: l for i, l in layouts.items() if l["name"] not in excluded}
+    tcompared = {i: l for i, l in tlayouts.items() if l["name"] not in excluded}
 
     profiles = [(opts.profiles[c % len(opts.profiles)], False) for c in range(params["cases"])]
     if opts.sentinel:
@@ -152,32 +192,29 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
             hostenv.write_bytes(os.path.join(work, "in-%d-%d.bin" % (case, i)), data[i])
         run = dict(opts=opts, work=work, lines=lines, spv=spv, entry=entry, local=local, groups=groups, mbuf=mbuf,
                    set_index=set_index, samplers=samplers, threadgroups=threadgroups, sizes={i: len(d) for i, d in data.items()})
-        outs = {backend: run_backend(backend, run, case, textures) for backend in ("apple", "mslc")}
+        texels = resources.seed_texels(tplan, elements, rng, profile, os.path.join(work, "case%d-" % case), sentinel, opts.poison_padding,
+                                       params["range"], params["float_range"], case)
+        data.update({resources.texel_key(tb): d for tb, _, d in texels})
+        outs = {backend: run_backend(backend, run, case, textures, texels=texels) for backend in ("apple", "mslc")}
         if opts.corrupt_mslc:
             name, _, at = opts.corrupt_mslc.partition(":")
-            for i, l in layouts.items():
+            for i, l in {**layouts, **tlayouts}.items():
                 if l["name"] == name:
                     outs["mslc"][i][int(at)] ^= 0xff
         case_diffs = []
-        for i, lay in sorted(layouts.items()):
+        for i, lay in sorted({**layouts, **tlayouts}.items()):
             if lay["name"] in excluded:
                 continue
             for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], params["ulp"].get(lay["name"], ulp)):
                 case_diffs.append(d.to_json())
-        nonzero = nonzero or checks.written_nonzero(compared, data, outs["apple"]) or checks.written_nonzero(compared, data, outs["mslc"])
-        # Negative control: a copy of the mslc result with one leaf of a compared buffer changed
-        # must differ from Apple's, or the comparison above could not have told a miscompile from
-        # a match. Excluded buffers are not candidates: perturbing one would test nothing.
-        control = checks.perturb(compared, outs["mslc"], outs["apple"])
-        control_ok = False
-        if control is not None:
-            copy, name, _ = control
-            index = next(i for i, l in layouts.items() if l["name"] == name)
-            control_ok = bool(compare.compare(layouts[index], outs["apple"][index], copy[index], 0))
+        both = {**compared, **tcompared}
+        nonzero = nonzero or checks.written_nonzero(both, data, outs["apple"]) or checks.written_nonzero(both, data, outs["mslc"])
+        # Negative control (control_holds): excluded buffers are not candidates, perturbing one would test nothing.
+        control_ok = control_holds([compared, tcompared], outs["mslc"], outs["apple"])
         result["cases"].append({"case": case, "profile": profile, "diffs": case_diffs[:16],
                                 "diff_count": len(case_diffs), "negative_control": control_ok})
         if case == 0:
-            unused = unused_textures(run, params, textures, bindings, compared, outs["apple"], profile)
+            unused = unused_textures(run, params, textures, texels, bindings, {**compared, **tcompared}, outs["apple"], profile)
     declared = dict(params["unused"])
     undeclared = sorted(set(unused) - set(declared))
     result["status"], result["reason"] = checks.verdict(result["cases"], nonzero, params["writes_zero"], undeclared)
@@ -261,7 +298,10 @@ def check_file(opts, path, std=None):
             }
             sub = os.path.join(work, e["name"])
             os.makedirs(sub)
-            results.append(check_entry(opts, path, spv, e, e["name"], params, sub, includes))
+            try:
+                results.append(check_entry(opts, path, spv, e, e["name"], params, sub, includes))
+            except hosts.Refused as refused:
+                results.append({"entry": e["name"], "status": "skipped", "reason": str(refused), "cases": []})
         results += unknown_directives(opts, d, results)
         return results
     finally:

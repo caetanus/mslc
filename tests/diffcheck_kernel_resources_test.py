@@ -142,10 +142,49 @@ class Resources(unittest.TestCase):
 
     def test_cross_check(self):
         mine = [{"kind": "Texture", "metal_index": 0, "name": "t"}, {"kind": "Sampler", "metal_index": 0, "name": "s"}]
-        good = {"textures": [{"index": 0, "name": "t"}], "samplers": [{"index": 0, "name": "s"}]}
+        good = {"textures": [{"index": 0, "name": "t", "type": "2d"}], "samplers": [{"index": 0, "name": "s"}]}
         self.assertEqual(resources.cross_check(mine, good), [])
-        bad = {"textures": [{"index": 1, "name": "t"}], "samplers": []}
+        bad = {"textures": [{"index": 1, "name": "t", "type": "2d"}], "samplers": []}
         self.assertEqual(len(resources.cross_check(mine, bad)), 2)
+
+    TEXEL = {"kind": "TextureBuffer", "metal_index": 3, "name": "tb", "descriptor": {"set": 1, "binding": 4},
+             "descriptor_type": "StorageTexelBuffer", "texture_access": "ReadWrite"}
+    APPLE_TEXEL = {"index": 3, "name": "tb", "type": "texturebuffer", "data": "ushort", "access": "readwrite"}
+
+    def test_texel_buffer_plan(self):
+        plan = resources.texel_plan([self.TEXEL], {"textures": [self.APPLE_TEXEL]})
+        self.assertEqual([(t.index, t.set, t.binding, t.uniform, t.scalar) for t in plan], [(3, 1, 4, False, "ushort")])
+        lay = plan[0].layout
+        self.assertEqual((lay["name"], lay["access"], lay["stride"]), ("tb", "readwrite", 8))
+        self.assertEqual([(l["off"], l["scalar"]) for l in lay["leaves"]], [(0, "ushort"), (2, "ushort"), (4, "ushort"), (6, "ushort")])
+        self.assertLess(resources.texel_key(plan[0]), 0)  # never a device buffer's Metal index
+
+    def test_texel_buffer_seed_is_deterministic_and_lines(self):
+        plan = resources.texel_plan([self.TEXEL], {"textures": [self.APPLE_TEXEL]})
+        with tempfile.TemporaryDirectory() as d:
+            a = resources.seed_texels(plan, 16, random.Random(5), "edge", os.path.join(d, "a-"))
+            b = resources.seed_texels(plan, 16, random.Random(5), "edge", os.path.join(d, "b-"))
+            self.assertEqual(a[0][2], b[0][2])
+            self.assertEqual(len(a[0][2]), (16 + 4 * 3) * 8)  # 16 texels, 4 per Metal index, the case number
+            with open(a[0][1], "rb") as f:
+                self.assertEqual(f.read(), bytes(a[0][2]))
+        self.assertEqual(resources.texel_lines(a, {3: "out.bin"}),
+                         ["texelbuffer 3 1 4 storage ushort 28 %s out.bin" % a[0][1]])
+
+    def test_texel_buffer_cross_check(self):
+        good = {"textures": [self.APPLE_TEXEL], "samplers": []}
+        self.assertEqual(resources.cross_check([self.TEXEL], good), [])
+        # a texture_buffer and a 2D texture are different kinds even at one index
+        self.assertEqual(len(resources.cross_check([dict(self.TEXEL, kind="Texture")], good)), 2)
+        # mslc declares a sampled texel buffer where the source says read_write
+        wrong = dict(self.TEXEL, descriptor_type="UniformTexelBuffer", texture_access="Read")
+        self.assertIn("read_write", " ".join(resources.cross_check([wrong], good)).replace("readwrite", "read_write"))
+        self.assertEqual(len(resources.cross_check([wrong], good)), 1)
+
+    def test_texel_buffer_unsupported(self):
+        entry = {"bindings": [self.TEXEL], "embedded_samplers": []}
+        self.assertEqual(resources.unsupported(entry, {"textures": [self.APPLE_TEXEL]}), [])
+        self.assertIn("element type other", "; ".join(resources.unsupported(entry, {"textures": [dict(self.APPLE_TEXEL, data="other")]})))
 
 
 class Directives(unittest.TestCase):
