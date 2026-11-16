@@ -682,3 +682,20 @@ texel buffer, and kernel mode skips textures altogether (#366; texel buffers are
 Apple's. Refused, though Apple accepts them: texture atomics on a texture_buffer, and an array of
 them. Refused like Apple: access::sample, an int or float index, a lod, get_height,
 get_num_mip_levels, sample and the other sampling methods, and a char or vector element type.
+
+## Texture and sampler locals are names, not values (#358)
+
+`texture2d<float> b = a;`, `auto b = a;` and `sampler t = s;` (also `const`, `thread`, an alias of an
+alias, a local named like a file-scope sampler, an alias of a helper's own parameter) bind the new name
+to the descriptor the old one has: no variable, no binding and no reflection entry is added. The
+initialiser has to be a bare name, of the same kind, element type, depth, multisampling and access
+(Apple refuses a mismatch too). Apple treats a texture or sampler as a run-time value, so what it
+accepts and mslc refuses is everything that would make the descriptor a run-time choice, each with a
+diagnostic: assigning to a texture or sampler local or parameter (`b = a2;`, also `sampler t; t = s;`), an initialiser that is not a name (`c ? a : a2`), a
+texture local with no initialiser or a default-constructed one, a self-initialised one, a pointer, an
+array or a reference to a texture, a texture as a struct field, a texture local in a `for` initialiser
+or beside a second declarator, `auto` from a conditional, a copy of a sampler at file scope, and a
+template parameter deduced from a texture (`template T q = t;`). Other Apple forms refused:
+brace or paren initialisation of a texture or sampler local (`b{t}`, `b(t)`, `sampler u(s)`,
+`= {s}`), `thread auto& b = t;`, and a struct texture member picked by a conditional. A dead chain (`sampler u = t;` never sampled) still lists
+the embedded sampler it names, which Apple would not record.
