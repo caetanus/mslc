@@ -541,8 +541,11 @@ for a size mslc cannot give with certainty. Apple accepts, and mslc refuses:
   `S{...}`, and a call of the one function its name finds. Still refused: a call whose name has more
   than one function, a template or a library function beside it; `?:` of arrays or of different
   structs; pointer arithmetic other than `p + n`, `n + p`, `p - n`; `&x`; a vector with a scalar
-  of another type (`f3 * 2`), vector comparisons and shifts; a shift, `%` or bitwise operator of a
-  float (Apple rejects them too); a pointer parameter of a helper function in an operand that is
+  of another type (`f3 * 2`), vector comparisons, shifts, `!` and `&&`, and every matrix arithmetic
+  form (`m * m`, `m * v`, `v * m`, `m * 2.0f`); before #370 these were built and discarded and sized
+  correctly, so they are a regression in reach, kept refused until their typing is modelled; a shift,
+  `%` or bitwise operator of a float (Apple rejects them too); a vector assignment from a scalar
+  (`f3 = f`) or a vector compound assignment (`f3 *= 2`); a pointer parameter of a helper function in an operand that is
   more than the bare name (it is bound like a local array).
 - Operands Apple rejects are refused too, not sized: a compound assignment whose operator the operands
   do not take (`i <<= f`), `++`/`--` of a bool, a write to a const object, a struct assigned to an
