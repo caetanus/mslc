@@ -9468,6 +9468,8 @@ namespace {
 					continue;
 				}
 				if (!(parameter.type.isPointer || parameter.isReference)) {
+					const ParameterAttributes& a = parameter.attributes;
+					if (a.stageIn || a.builtin || a.colorIndex || a.textureIndex || a.samplerIndex) { continue; }
 					throw CompileError("parameter \"" + parameter.name + "\" is a threadgroup value; a parameter in "
 						"the threadgroup address space is a pointer or a reference");
 				}
