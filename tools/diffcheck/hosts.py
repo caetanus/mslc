@@ -27,6 +27,17 @@ class HostError(Exception):
     """A host failed for a reason that is not a result (bad manifest, Vulkan error)."""
 
 
+class Refused(HostError):
+    """A host cannot do what the manifest asks on this device (a texel buffer format or feature it
+    lacks): the file is skipped with the reason, never passed or failed."""
+
+
+def _refusal(stderr):
+    """The reason when a host's stderr says `unsupported: <reason>`, else None."""
+    m = re.search(r"^(?:metalhost|vkhost): unsupported: (.*)$", stderr, re.M)
+    return m.group(1) if m else None
+
+
 def _built(source, name, compile_cmd):
     digest = hashlib.sha256(hostenv.read_bytes(source)).hexdigest()[:12]
     out_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "diffcheck-hosts")
@@ -82,6 +93,8 @@ def run_metal(binary, manifest_path):
             raise Unavailable("no Metal device")
         if "Apple compile failed" in r.stderr or "pipeline failed" in r.stderr:
             raise HostError("apple: " + r.stderr.strip().splitlines()[0])
+        if _refusal(r.stderr):
+            raise Refused("unsupported: Apple: " + _refusal(r.stderr))
         raise HostError(r.stderr.strip() or "metalhost exit %d" % r.returncode)
     return r.stdout
 
@@ -94,6 +107,8 @@ def run_vulkan(binary, manifest_path):
     if r.returncode != 0:
         if "no Vulkan device" in r.stderr:
             raise Unavailable("no Vulkan device")
+        if _refusal(r.stderr):
+            raise Refused("unsupported: lavapipe: " + _refusal(r.stderr))
         raise HostError("vkhost: " + (r.stderr.strip() or "exit %d" % r.returncode))
     if "llvmpipe" not in r.stdout:
         raise HostError("vkhost ran on %r, not lavapipe" % r.stdout.strip())

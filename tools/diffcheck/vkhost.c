@@ -14,9 +14,16 @@
 //   sampler <metal index> <set> <binding>                               (at most 4)
 //   spec <constant id> <value>   a specialization constant besides the local size (mslc's threadgroup
 //                                memory arguments: the element count of their Workgroup array; at most 8)
+//   texelbuffer <metal index> <set> <binding> uniform|storage <type> <texels> <input file> <output file>
+//                                                                       (at most 8)
 // A texture is a 2D RGBA32F sampled image (a storagetexture: a read-only storage image, which is
 // what mslc declares for access::read) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
-// 2 mirrored repeat), as in metalhost. Exit 0 on success, 2 on any Vulkan or file error (never a mismatch: this host
+// 2 mirrored repeat), as in metalhost. A texel buffer is a VkBufferView of <texels> RGBA texels of <type>
+// (float half int uint short ushort: R32G32B32A32_SFLOAT, R16G16B16A16_SFLOAT, ..._SINT, ..._UINT) over a
+// buffer filled from the input file, a UNIFORM_TEXEL_BUFFER descriptor (sampled) or a STORAGE_TEXEL_BUFFER one,
+// and its bytes are written to the output file after the dispatch. A device without the format feature or
+// the format-less storage image read and write features exits 2 with "unsupported: <reason>", which the
+// driver reports as a skip. Exit 0 on success, 2 on any Vulkan or file error (never a mismatch: this host
 // compares nothing). The device name goes to stdout as "device: ...".
 //
 // Details taken from the audited PR #148 harness: the address block's memory is sized
@@ -39,7 +46,15 @@ static void die(const char *fmt, ...) {
     va_end(ap); exit(2);
 }
 
+// A feature or format this device lacks: the driver reports a skip with the reason, not an error.
+static void refuse(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+static void refuse(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt); fprintf(stderr, "vkhost: unsupported: "); vfprintf(stderr, fmt, ap); fputc('\n', stderr);
+    va_end(ap); exit(2);
+}
 static VkDevice dev;
+static VkPhysicalDevice gpd;
+static VkPhysicalDeviceFeatures gfeatures;
 static VkPhysicalDeviceMemoryProperties mp;
 
 static uint32_t memType(uint32_t bits) {
@@ -108,6 +123,7 @@ static uint32_t initDevice(VkQueueFlags queueFlag) {
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &v11; v11.pNext = &v12; v12.pNext = &v13;
     vkGetPhysicalDeviceFeatures2(pd, &f2);
+    gpd = pd; gfeatures = f2.features;
     if (!v12.bufferDeviceAddress) die("device lacks bufferDeviceAddress");
     if (!v13.maintenance4) die("device lacks maintenance4 (LocalSizeId)");
     float prio = 1.0f;
@@ -122,6 +138,8 @@ static uint32_t initDevice(VkQueueFlags queueFlag) {
 // ---- textures and samplers, shared by the compute and the draw path ----
 
 #define MAXTEX 4
+#define MAXTB 8
+static VkFormat texelFormat(const char *type, unsigned *bytes);
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Img;
 static Img makeImage(VkFormat f, unsigned w, unsigned h, VkImageUsageFlags usage, VkImageAspectFlags aspect);
 static VkImageMemoryBarrier imgBarrier(VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
@@ -159,6 +177,7 @@ static void recordTextureUpload(VkCommandBuffer cmd, Img t, Buf stage, unsigned 
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, consumer, 0, 0, NULL, 0, NULL, 1, &rd);
 }
 
+static void writeFile(const char *path, const void *p, size_t n);
 static int drawMain(const char *manifest);
 
 // A graphics manifest starts with "mode draw"; a compute one has no mode line.
@@ -180,6 +199,8 @@ int main(int argc, char **argv) {
     unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], nt = 0, sset[MAXTEX], sbind[MAXTEX], sidx[MAXTEX], ns = 0;
     char tfile[MAXTEX][1024]; int tstore[MAXTEX];
     unsigned specid[MAXSPEC], specval[MAXSPEC], nspec = 0;
+    unsigned bset[MAXTB], bbind[MAXTB], btexels[MAXTB], bbytes[MAXTB], nb = 0; int bstore[MAXTB];
+    char btype[MAXTB][16], bin[MAXTB][1024], bout[MAXTB][1024];
     FILE *mf = fopen(argv[1], "r");
     if (!mf) die("cannot open %s", argv[1]);
     char line[4096];
@@ -192,6 +213,14 @@ int main(int argc, char **argv) {
         if (nbuf < MAXBUF && sscanf(line, "buffer %u %llu %1023s %1023s", &member[nbuf], &bytes[nbuf], in[nbuf], out[nbuf]) == 4) { nbuf++; continue; }
         if (nt < MAXTEX && sscanf(line, "texture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { tstore[nt++] = 0; continue; }
         if (nt < MAXTEX && sscanf(line, "storagetexture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { tstore[nt++] = 1; continue; }
+        if (nb < MAXTB) {
+            char kind[16];
+            if (sscanf(line, "texelbuffer %*u %u %u %15s %15s %u %1023s %1023s", &bset[nb], &bbind[nb], kind, btype[nb], &btexels[nb], bin[nb], bout[nb]) == 7) {
+                if (strcmp(kind, "uniform") && strcmp(kind, "storage")) die("texel buffer kind %s is not uniform or storage", kind);
+                bstore[nb++] = kind[0] == 's';
+                continue;
+            }
+        }
         if (ns < MAXTEX && sscanf(line, "sampler %u %u %u", &sidx[ns], &sset[ns], &sbind[ns]) == 3) { ns++; continue; }
         if (line[0] != '\n') die("bad manifest line: %s", line);
     }
@@ -219,15 +248,36 @@ int main(int argc, char **argv) {
     unsigned maxset = nbuf ? set : 0;
     for (unsigned i = 0; i < nt; i++) if (tset[i] > maxset) maxset = tset[i];
     for (unsigned i = 0; i < ns; i++) if (sset[i] > maxset) maxset = sset[i];
+    for (unsigned i = 0; i < nb; i++) if (bset[i] > maxset) maxset = bset[i];
     if (maxset >= 8) die("descriptor set %u too large", maxset);
-    unsigned nsets = nbuf || nt || ns ? maxset + 1 : 0;
-    VkDescriptorSetLayoutBinding lb[8][2 * MAXTEX + 1]; unsigned nlb[8] = {0};
+    unsigned nsets = nbuf || nt || ns || nb ? maxset + 1 : 0;
+    VkDescriptorSetLayoutBinding lb[8][2 * MAXTEX + MAXTB + 1]; unsigned nlb[8] = {0};
     if (nbuf) lb[set][nlb[set]++] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
     for (unsigned i = 0; i < nt; i++) lb[tset[i]][nlb[tset[i]]++] = (VkDescriptorSetLayoutBinding){tbind[i], tstore[i] ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
     for (unsigned i = 0; i < ns; i++) lb[sset[i]][nlb[sset[i]]++] = (VkDescriptorSetLayoutBinding){sbind[i], VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    for (unsigned i = 0; i < nb; i++) lb[bset[i]][nlb[bset[i]]++] = (VkDescriptorSetLayoutBinding){bbind[i], bstore[i] ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
     VkDescriptorSetLayout dsl[8]; VkDescriptorSet dset[8];
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    Img tex[MAXTEX]; Buf stage[MAXTEX];
+    Img tex[MAXTEX]; Buf stage[MAXTEX]; Buf tbuf[MAXTB]; VkBufferView tview[MAXTB];
+    for (unsigned i = 0; i < nb; i++) {
+        unsigned bytes1;
+        VkFormat fmt = texelFormat(btype[i], &bytes1);
+        VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(gpd, fmt, &fp);
+        VkFormatFeatureFlags need = bstore[i] ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
+        if (!(fp.bufferFeatures & need)) refuse("format %d lacks the %s texel buffer feature", (int)fmt, bstore[i] ? "storage" : "uniform");
+        if (bstore[i] && !(gfeatures.shaderStorageImageReadWithoutFormat && gfeatures.shaderStorageImageWriteWithoutFormat))
+            refuse("the device has no shaderStorageImageRead/WriteWithoutFormat, which a storage texel buffer needs");
+        VkPhysicalDeviceProperties dp; vkGetPhysicalDeviceProperties(gpd, &dp);
+        if (btexels[i] > dp.limits.maxTexelBufferElements) refuse("%u texels exceed maxTexelBufferElements %u", btexels[i], dp.limits.maxTexelBufferElements);
+        bbytes[i] = btexels[i] * bytes1;
+        tbuf[i] = makeBuf(bbytes[i], bstore[i] ? VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT : VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, 0);
+        size_t n; void *data = slurp(bin[i], &n);
+        if (n != bbytes[i]) die("%s is %zu bytes, manifest says %u", bin[i], n, bbytes[i]);
+        fillBuf(tbuf[i], data, n); free(data);
+        VkBufferViewCreateInfo bvi = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
+        bvi.buffer = tbuf[i].buf; bvi.format = fmt; bvi.range = VK_WHOLE_SIZE;
+        CHK(vkCreateBufferView(dev, &bvi, NULL, &tview[i]));
+    }
     if (nsets) {
         for (unsigned s = 0; s < nsets; s++) {
             VkDescriptorSetLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -235,14 +285,15 @@ int main(int argc, char **argv) {
             CHK(vkCreateDescriptorSetLayout(dev, &lci, NULL, &dsl[s]));
         }
         plci.setLayoutCount = nsets; plci.pSetLayouts = dsl;
-        VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAXTEX}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAXTEX}, {VK_DESCRIPTOR_TYPE_SAMPLER, MAXTEX}};
+        VkDescriptorPoolSize ps[6] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAXTEX}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAXTEX}, {VK_DESCRIPTOR_TYPE_SAMPLER, MAXTEX},
+                                      {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, MAXTB}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, MAXTB}};
         VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pci.maxSets = nsets; pci.poolSizeCount = 4; pci.pPoolSizes = ps;
+        pci.maxSets = nsets; pci.poolSizeCount = 6; pci.pPoolSizes = ps;
         VkDescriptorPool pool; CHK(vkCreateDescriptorPool(dev, &pci, NULL, &pool));
         VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dai.descriptorPool = pool; dai.descriptorSetCount = nsets; dai.pSetLayouts = dsl;
         CHK(vkAllocateDescriptorSets(dev, &dai, dset));
-        VkWriteDescriptorSet wr[1 + 2 * MAXTEX]; unsigned nw = 0;
+        VkWriteDescriptorSet wr[1 + 2 * MAXTEX + MAXTB]; unsigned nw = 0;
         VkDescriptorBufferInfo dbi; VkDescriptorImageInfo ii[MAXTEX], si[MAXTEX];
         if (nbuf) {
             Buf blk = makeBuf(8 * nbuf, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 0);
@@ -264,6 +315,11 @@ int main(int argc, char **argv) {
             wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             wr[nw].dstSet = dset[sset[i]]; wr[nw].dstBinding = sbind[i]; wr[nw].descriptorCount = 1;
             wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[nw++].pImageInfo = &si[i];
+        }
+        for (unsigned i = 0; i < nb; i++) {
+            wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr[nw].dstSet = dset[bset[i]]; wr[nw].dstBinding = bbind[i]; wr[nw].descriptorCount = 1;
+            wr[nw].descriptorType = bstore[i] ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER; wr[nw++].pTexelBufferView = &tview[i];
         }
         if (nw) vkUpdateDescriptorSets(dev, nw, wr, 0, NULL);
     }
@@ -312,6 +368,10 @@ int main(int argc, char **argv) {
         if (!f || fwrite(m, 1, bytes[i], f) != bytes[i]) die("cannot write %s", out[i]);
         fclose(f); vkUnmapMemory(dev, bufs[i].mem);
     }
+    for (unsigned i = 0; i < nb; i++) {
+        void *m; CHK(vkMapMemory(dev, tbuf[i].mem, 0, VK_WHOLE_SIZE, 0, &m));
+        writeFile(bout[i], m, bbytes[i]); vkUnmapMemory(dev, tbuf[i].mem);
+    }
     return 0;
 }
 
@@ -348,6 +408,16 @@ static const Fmt CFMT[] = {
 static const Fmt *findFmt(const Fmt *t, size_t n, const char *name) {
     for (size_t i = 0; i < n; i++) if (!strcmp(t[i].name, name)) return &t[i];
     die("unknown format %s", name);
+}
+
+static VkFormat texelFormat(const char *type, unsigned *bytes) {
+    static const struct { const char *type; VkFormat format; unsigned bytes; } T[] = {
+        {"float", VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {"half", VK_FORMAT_R16G16B16A16_SFLOAT, 8},
+        {"int", VK_FORMAT_R32G32B32A32_SINT, 16}, {"uint", VK_FORMAT_R32G32B32A32_UINT, 16},
+        {"short", VK_FORMAT_R16G16B16A16_SINT, 8}, {"ushort", VK_FORMAT_R16G16B16A16_UINT, 8},
+    };
+    for (size_t i = 0; i < sizeof T / sizeof *T; i++) if (!strcmp(T[i].type, type)) { *bytes = T[i].bytes; return T[i].format; }
+    die("unknown texel buffer type %s", type);
 }
 
 static uint32_t memTypeAny(uint32_t bits) {
