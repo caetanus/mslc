@@ -368,6 +368,7 @@ private:
 	bool tryParseHelperFunction();
 	void parseTemplateDeclaration();
 	void skipBalanced(TokenKind open, TokenKind close);
+	void skipFunctionAttribute();
 	size_t _functionOrder = 0;
 	void parseGlobalDeclaration();
 	VariableDeclaration parseGlobalDeclarator(VariableDeclaration declaration);

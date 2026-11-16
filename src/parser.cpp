@@ -1357,6 +1357,30 @@ TemplateArgument Parser::parseTemplateArgument() {
 	return argument;
 }
 
+// "__attribute__((...))" ahead of a helper's return type, as METAL_FUNC expands to. The ones that
+// only steer inlining or diagnostics change no value and are dropped; any other is refused, since
+// ignoring one that matters (noreturn, aligned) would compile a different program.
+void Parser::skipFunctionAttribute() {
+	advance();
+	const size_t first = _position;
+	skipBalanced(TokenKind::LParen, TokenKind::RParen);
+	int depth = 0;
+	for (size_t i = first; i < _position; ++i) {
+		if (_tokens[i].kind == TokenKind::LParen) {
+			++depth;
+		} else if (_tokens[i].kind == TokenKind::RParen) {
+			--depth;
+		} else if (depth == 2 && (_tokens[i - 1].kind == TokenKind::LParen || _tokens[i - 1].kind == TokenKind::Comma)) {
+			const std::string name(_tokens[i].text);
+			if (name != "always_inline" && name != "__always_inline__" && name != "noinline" && name != "__noinline__"
+				&& name != "unused" && name != "__unused__" && name != "used" && name != "__used__") {
+				throw CompileError("the function attribute \"" + name + "\" is not lowered; only always_inline, "
+					"noinline, unused and used are accepted and dropped");
+			}
+		}
+	}
+}
+
 bool Parser::tryParseHelperFunction() {
 	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
 		return false;
@@ -1366,13 +1390,20 @@ bool Parser::tryParseHelperFunction() {
 	FunctionDecl decl;
 	decl.line = line();
 
-	try {
-		// inline, static and constexpr in any order, ahead of the return type.
-		while (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
+	// inline, static, constexpr and attributes in any order, ahead of the return type. A refused
+	// attribute throws here, outside the try below, so that it is not read as "not a function".
+	for (;;) {
+		if (atKeyword("__attribute__") && lookahead().kind == TokenKind::LParen) {
+			skipFunctionAttribute();
+		} else if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
 			decl.isLocal = true;
 			advance();
+		} else {
+			break;
 		}
+	}
 
+	try {
 		decl.returnType = parseType();
 		if (kind() != TokenKind::Identifier) {
 			_position = start;
