@@ -1175,3 +1175,15 @@ probes/while_loop.metal
 probes/widen_across_signedness.metal
 probes/widen_int.metal
 probes/wider_rank_beats_signedness_in_a_comparison.metal
+probes/brace_local_constexpr_floating.metal
+probes/brace_local_mixed.metal
+probes/brace_local_nested.metal
+probes/cast_vector_converts_componentwise.metal
+probes/convert_float_width.metal
+probes/narrow_signed_kinds.metal
+probes/static_cast_struct_constructor_narrows_argument.metal
+probes/step_buffer_element_and_vector.metal
+probes/half_literal_rounding_carries_into_the_exponent.metal
+probes/construct_broadcast.metal
+probes/direct_init_broadcast.metal
+probes/array_member_by_value_helper.metal

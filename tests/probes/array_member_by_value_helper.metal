@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=3 local=3
 //
 // A struct with an array member passed to a helper by value, after being copied
 // out of a constant reference and edited.

@@ -244,13 +244,6 @@ test (55 of them); the other 7 are corpus-only.
 
 Not in the list, and why:
 
-- 12 probes that are the #368 fold, below: `brace_local_constexpr_floating`, `brace_local_mixed`,
-  `brace_local_nested`, `cast_vector_converts_componentwise`, `convert_float_width`,
-  `narrow_signed_kinds`, `static_cast_struct_constructor_narrows_argument`,
-  `step_buffer_element_and_vector`, `half_literal_rounding_carries_into_the_exponent`,
-  `construct_broadcast`, `direct_init_broadcast` and `array_member_by_value_helper` (an FMA fusion: it
-  mismatches at 3 threads on seeds 2, 3 and 5). With the #368 branch built they match; add them (grid 1
-  for the racing ones) when it lands.
 - `pp_metal_stdlib_adds_macros`, `pp_metal_matrix_adds_fewer_macros`: Apple's in-memory compile
   pre-includes the stdlib (below).
 - `struct_local_without_initialiser`, `threadgroup_array_two_dimensional`: read uninitialised memory.
@@ -295,7 +288,7 @@ when it does not. Unproven on a real runner: read that step's log on the first r
 under `devices:` and `default: present` means the job runs; `devices: 0` means a self-hosted runner is
 the only way). A failing job-level `continue-on-error` job may still show a red check on the commit;
 that is unverified until the first run. `tests/probe-run.txt` lists the kernel probes that match (at the default grid or the one their `RUN` line names); the job
-requires 1,105 compared (the list compares 1,173 kernels).
+requires 1,105 compared (the list compares 1,185 kernels).
 
 A probe in `tests/probes/` opts in with a `// RUN:` line; with the option on it becomes the
 ctest test `diffcheck/probe/<name>` and kills a mutant the disassembly regexes cannot.
