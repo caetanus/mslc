@@ -56,6 +56,9 @@ enum class ResourceKind {
 	Texture2DArray,
 	Texture1DArray,
 	TextureCubeArray,
+	// texture_buffer<T, access>: a one-dimensional texel buffer, read by integer index, with no
+	// mip levels, no sampler and no sampling.
+	TextureBuffer,
 	Sampler,
 };
 
@@ -140,7 +143,14 @@ struct Type {
 	bool isTexture() const {
 		return resource == ResourceKind::Texture1D || resource == ResourceKind::Texture2D
 			|| resource == ResourceKind::TextureCube || resource == ResourceKind::Texture3D || resource == ResourceKind::Texture2DArray
-			|| resource == ResourceKind::Texture1DArray || resource == ResourceKind::TextureCubeArray;
+			|| resource == ResourceKind::Texture1DArray || resource == ResourceKind::TextureCubeArray
+			|| resource == ResourceKind::TextureBuffer;
+	}
+	// A texture lowered to a storage image. A texture_buffer that is only read is a sampled
+	// texel buffer instead, fetched by index, so that its descriptor is a uniform texel buffer.
+	bool isStorageTexture() const {
+		return textureAccess != TextureAccess::Sample
+			&& !(resource == ResourceKind::TextureBuffer && textureAccess == TextureAccess::Read);
 	}
 };
 

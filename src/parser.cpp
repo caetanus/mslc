@@ -3985,6 +3985,7 @@ void Parser::parseResourceType(Type& type) {
 		{ "texture2d_array", ResourceKind::Texture2DArray },
 		{ "texture1d_array", ResourceKind::Texture1DArray },
 		{ "texturecube_array", ResourceKind::TextureCubeArray },
+		{ "texture_buffer", ResourceKind::TextureBuffer },
 	};
 	struct Multisampled { ResourceKind kind; bool depth; };
 	static const std::map<std::string_view, Multisampled> multisampled = {
@@ -4000,7 +4001,7 @@ void Parser::parseResourceType(Type& type) {
 	const bool isDepth = depth != depthTextures.end() || (isMultisampled && ms->second.depth);
 	if (!isMultisampled && depth == depthTextures.end() && color == textures.end()) {
 		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture1d, texture2d, texturecube, "
-			"texture3d, texture2d_array, texture1d_array and texturecube_array, depth2d, depth2d_array, depthcube and "
+			"texture3d, texture2d_array, texture1d_array, texturecube_array and texture_buffer, depth2d, depth2d_array, depthcube and "
 			"depthcube_array, texture2d_ms, texture2d_ms_array, depth2d_ms and depth2d_ms_array, and sampler");
 	}
 
@@ -4033,7 +4034,9 @@ void Parser::parseResourceType(Type& type) {
 			"sampled types float, half, int, uint, short and ushort");
 	}
 
-	std::string access = "sample";
+	// Apple's texture_buffer is access::read unless it says otherwise, and has no sampled form.
+	const bool isBuffer = color != textures.end() && color->second == ResourceKind::TextureBuffer;
+	std::string access = isBuffer ? "read" : "sample";
 	bool accessSpelled = false;
 	if (match(TokenKind::Comma)) {
 		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
@@ -4071,6 +4074,10 @@ void Parser::parseResourceType(Type& type) {
 	}
 
 	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
+	if (isBuffer && access == "sample") {
+		throw CompileError("texture_buffer<" + component + ", access::sample> is invalid: a texture_buffer has no "
+			"sampler, and takes access::read, access::write or access::read_write");
+	}
 	type.resource = isMultisampled ? ms->second.kind : depth != depthTextures.end() ? depth->second : color->second;
 	type.isDepth = isDepth;
 	type.isMultisampled = isMultisampled;

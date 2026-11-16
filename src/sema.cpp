@@ -1280,8 +1280,12 @@ Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sample
 	const bool oneD = kind == ResourceKind::Texture1D || kind == ResourceKind::Texture1DArray;
 	const bool arrayed = kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture1DArray
 		|| kind == ResourceKind::TextureCubeArray;
+	const bool buffer = kind == ResourceKind::TextureBuffer;
 	if (oneD) {
 		requireCapability(sampled == 2 ? spirv::Capability::Image1D : spirv::Capability::Sampled1D);
+	}
+	if (buffer) {
+		requireCapability(sampled == 2 ? spirv::Capability::ImageBuffer : spirv::Capability::SampledBuffer);
 	}
 	if (kind == ResourceKind::TextureCubeArray) {
 		requireCapability(spirv::Capability::ImageCubeArray);
@@ -1291,7 +1295,7 @@ Id TypeTable::imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sample
 	}
 	return _builder.emitDecl(spirv::OpTypeImage, { scalar(sampledType),
 		cube ? spirv::Dim::Cube : kind == ResourceKind::Texture3D ? spirv::Dim::Dim3D
-			: oneD ? spirv::Dim::Dim1D : spirv::Dim::Dim2D,
+			: buffer ? spirv::Dim::Buffer : oneD ? spirv::Dim::Dim1D : spirv::Dim::Dim2D,
 		depth ? 1u : sampled == 2 ? 0u : 2u, arrayed ? 1u : 0u, multisampled ? 1u : 0u, sampled,
 		static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 }
@@ -6817,7 +6821,7 @@ namespace {
 	}
 
 	Id Emitter::resourcePointee(const Type& type) {
-		if (type.textureAccess != TextureAccess::Sample) {
+		if (type.isStorageTexture()) {
 			return _types.storageImage(type.resource, type.textureAccess, textureSampledKind(type.scalar));
 		}
 		return type.isTexture() ? _types.image(type.resource, textureSampledKind(type.scalar), type.isDepth, type.isMultisampled) : _types.samplerType();
@@ -9932,9 +9936,10 @@ namespace {
 			const uint32_t binding = _nextBinding++;
 			const Id imageType = resourcePointee(entry.parameter->type);
 			const Id variable = declareDescriptorVariable(imageType, binding);
+			const bool texelBuffer = entry.parameter->type.resource == ResourceKind::TextureBuffer;
 			if (entry.parameter->type.textureAccess == TextureAccess::Write) {
 				_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(spirv::Decoration::NonReadable) });
-			} else if (entry.parameter->type.textureAccess == TextureAccess::Read) {
+			} else if (entry.parameter->type.isStorageTexture() && entry.parameter->type.textureAccess == TextureAccess::Read) {
 				_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(spirv::Decoration::NonWritable) });
 			}
 
@@ -9946,9 +9951,14 @@ namespace {
 			bound.pointeeMsl = entry.parameter->type;
 			_bindings[entry.parameter->name] = bound;
 
-			addReflectionEntry("{ \"kind\": \"Texture\", \"metal_index\": "
+			// A texel buffer is its own kind, so that a consumer that binds every "Texture" as an
+			// image view skips it rather than binding the wrong descriptor type.
+			addReflectionEntry(std::string("{ \"kind\": \"") + (texelBuffer ? "TextureBuffer" : "Texture")
+				+ "\", \"metal_index\": "
 				+ std::to_string(entry.metalIndex)
 				+ ", \"descriptor\": " + descriptorJson(binding)
+				+ (texelBuffer ? std::string(", \"descriptor_type\": \"")
+					+ (entry.parameter->type.isStorageTexture() ? "StorageTexelBuffer" : "UniformTexelBuffer") + "\"" : std::string())
 				+ ", \"texture_access\": \""
 				+ (entry.parameter->type.textureAccess == TextureAccess::Write ? "Write"
 					: entry.parameter->type.textureAccess == TextureAccess::Read ? "Read"
@@ -10299,6 +10309,10 @@ namespace {
 		if (texture.pointeeMsl.isMultisampled) {
 			return emitMultisampledCall(call, texture);
 		}
+		if (kind == ResourceKind::TextureBuffer && method != "read" && method != "get_width") {
+			throw CompileError("a texture_buffer has read, write and get_width only; \"" + method
+				+ "\" is not a texture_buffer method");
+		}
 		const bool sized = method == "get_width" || method == "get_height"
 			|| (method == "get_depth" && kind == ResourceKind::Texture3D)
 			|| (method == "get_array_size" && isArrayKind(kind));
@@ -10371,6 +10385,7 @@ namespace {
 		switch (kind) {
 			case ResourceKind::Texture1D: return 1;
 			case ResourceKind::Texture1DArray: return 1;
+			case ResourceKind::TextureBuffer: return 1;
 			case ResourceKind::TextureCubeArray: return 3;
 			case ResourceKind::Texture2D: return 2;
 			case ResourceKind::Texture2DArray: return 2;
@@ -10843,7 +10858,10 @@ namespace {
 	Id Emitter::emitTextureRead(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
 		const ResourceKind kind = texture.pointeeMsl.resource;
-		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample;
+		const bool storage = texture.pointeeMsl.isStorageTexture();
+		if (kind == ResourceKind::TextureBuffer && arguments.size() != 1) {
+			throw CompileError("read on a texture_buffer takes one coordinate: a texture_buffer has no mip levels");
+		}
 		const size_t layers = storage ? layerArguments(kind) : isArrayKind(kind) ? 1 : 0;
 		const bool arrayed = layers > 0;
 		const size_t fixed = 1 + layers;
@@ -10877,6 +10895,12 @@ namespace {
 				_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4), { storageImage, coordinate }));
 		}
 
+		if (kind == ResourceKind::TextureBuffer) {
+			// Dim Buffer takes no Lod operand.
+			return texturePixels(texture, _builder.emitTyped(spirv::OpImageFetch,
+				_types.vector(textureSampledKind(texture.pointeeMsl.scalar), 4),
+				{ loadFrom(texture.id, texture.pointeeType), coordinate }));
+		}
 		if (isOneDimensional(kind) && arguments.size() == fixed + 1) {
 			requireTexture1DLevelZero(*arguments[fixed], "read");
 		}
@@ -10944,9 +10968,11 @@ namespace {
 	// 1 and 2 of the size), of level 0 or of the lod given.
 	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component) {
 		const std::string& name = call.left->memberName;
+		const bool buffer = texture.pointeeMsl.resource == ResourceKind::TextureBuffer;
 		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample || texture.pointeeMsl.isMultisampled;
 		if (storage && !call.arguments.empty()) {
-			throw CompileError(texture.pointeeMsl.isMultisampled
+			throw CompileError(buffer ? name + " takes no arguments: a texture_buffer has no mip levels"
+				: texture.pointeeMsl.isMultisampled
 				? name + " takes no arguments: a multisampled texture has no mip levels"
 				: std::string("mip arguments are unsupported on access::")
 					+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures; " + name + " takes no arguments");
@@ -10972,7 +10998,7 @@ namespace {
 		const Id size = _builder.emitTyped(storage ? spirv::OpImageQuerySize : spirv::OpImageQuerySizeLod,
 			_types.vector(ScalarKind::UInt, textureSizeWidth(texture.pointeeMsl.resource)),
 			storage ? std::vector<uint32_t>{ image } : std::vector<uint32_t>{ image, lod });
-		if (texture.pointeeMsl.resource == ResourceKind::Texture1D) {
+		if (texture.pointeeMsl.resource == ResourceKind::Texture1D || buffer) {
 			return size;
 		}
 		const uint32_t index = component == SizeComponent::ArraySize && texture.pointeeMsl.resource == ResourceKind::Texture1DArray
