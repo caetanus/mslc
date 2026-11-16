@@ -464,7 +464,7 @@ Apple accepts the first five, which are refused loudly. It also rejects the last
 - A struct with an array member is brace-initialised with the array in its own braces (`A x{{1,2},3}`, designators
   included). Still refused where Apple accepts: brace elision into the array member (`A x{1,2,3}`), a
   struct member that is an array of structs ("an array of structs field in value struct is not lowered yet"),
-  indexing a temporary (`S{{1,2},3}.a[1]`), a braced return (`return {1,2};`, for any struct), and the
+  indexing a temporary (`S{{1,2},3}.a[1]`), a braced return from an entry point (a helper's `return {1,2};` works, #362), and the
   parenthesised copy `A z(A{{1},2})` ("constructing a A is not lowered yet", as for any struct).
 - File-scope `constant` structs with a positional or array-member initialiser (a plain `constant P g = {1, 4};` gets the same "initialised by field name" error; designators on a plain struct work), which Apple accepts: `constant Q g =
   {{1,2,3},4};` ("initialised by field name, so a has to be named"), `constant Q g{{1,2,3},4};` ("needs an
@@ -699,3 +699,40 @@ template parameter deduced from a texture (`template T q = t;`). Other Apple for
 brace or paren initialisation of a texture or sampler local (`b{t}`, `b(t)`, `sampler u(s)`,
 `= {s}`), `thread auto& b = t;`, and a struct texture member picked by a conditional. A dead chain (`sampler u = t;` never sampled) still lists
 the embedded sampler it names, which Apple would not record.
+
+## `metal::array<T, N>` (#362)
+
+`array<T, N>` (also `metal::array`, and a `typedef` of it) is read by the parser as the array `T[N]` with
+`Type::isStdArray` set, an array of arrays as a multi-dimensional one. Layout is `T[N]`'s (sizeof, member
+offsets and buffer round trips were compared with Apple's compiler by value, with a negative control). What it adds
+over a C array is value semantics, all compared by readback against Apple: a copy, `a = b`, `a = {1,2,3}`,
+`array<T,N>{...}`, `= {{1,2,3}}`, a by-value parameter, a `thread` reference parameter, a return (also a
+braced `return {...};` for any helper), an element of a returned array (`f()[i]`), a struct member as a whole, a
+file-scope `constant` array, a threadgroup local, `size()`, `max_size()`, `empty()`, `front()`, `back()`
+(folded by the parser for a declared array, so `a.size()` is an array length or a loop bound).
+
+Apple accepts, and mslc refuses (each is a loud error):
+
+- `device`, `constant` or `threadgroup` pointers and references to an array (`device array<float,4>* b`), and any
+  `array<T,N>` entry point parameter: a buffer holds the array in a struct (which works).
+- `thread array<T,N>*` helper parameters, `array<T,N> a[2]` (an array of them), and a member of that kind.
+- `auto b = a;`, `a.data()`, `a.fill()` (Apple has none), `a == b` (Apple rejects it too), `array<T,0>` (Apple
+  gives it the size of one element), a constant index past the end (Apple takes it, as undefined behaviour).
+- `array<T,N>` in a function template signature (class template argument deduction is #341), a `using` alias,
+  class template argument deduction (`array a = {1.0f}`: Apple rejects it too).
+- `array<bool,N>` and `array<packed_float3,N>` as a member of a struct that lives in a buffer (the existing
+  array-member layout limit; a struct used only as a local value with one compiles), an array
+  of structs as a member of a struct, brace elision into the array member of a struct (`W w = {1,2}`), and a
+  member of a temporary indexed (`mk().a[i]`).
+- A matrix element of an array of matrices written through (`c[1][0][0] = x`, as for a C array).
+- `alignof(array<...>)`; `f().size()`, `f().back()` and the other member calls on anything but a declared
+  object (the parser folds only a declared name, element or member); `array<A,2> n = {a, b}` (arrays as
+  elements of a braced list); `typedef array<float,3> v3; v3 m[2];`; `array<float,3> a{...}` and `b(a)`
+  (brace and paren initialisation of a declaration); the chained assignment `b = a = c`.
+
+Accepted though Apple rejects or reports them differently: an unqualified `array<float,3>` without
+`using namespace metal`, `metal::array` without the include, `volatile array<...>`, and a file's own
+`struct array` or `constant int array` beside `using namespace metal` (Apple reports the name ambiguous).
+
+mslc zero-fills `array<T,N> a;` where Apple leaves it uninitialised; a read before a write differs only where
+Apple's value is undefined.
