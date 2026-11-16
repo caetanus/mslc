@@ -9499,9 +9499,9 @@ namespace {
 	}
 
 	// MSL does not require [[buffer(n)]] on an entry point's device or
-	// constant parameters: an unbinding parameter's index is its position
-	// among the binding parameters, with builtins skipped. add.metal relies on
-	// this, since none of its pointers carry an attribute.
+	// constant parameters: an unbinding parameter takes the lowest free buffer
+	// index (declareParameters). add.metal relies on this, since none of its
+	// pointers carry an attribute.
 	std::vector<const Parameter*> assignImplicitBindings(const FunctionDecl& entryPoint) {
 		std::vector<const Parameter*> bound;
 
@@ -9527,6 +9527,26 @@ namespace {
 	void Emitter::declareParameters() {
 		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(*_entryPoint);
 		std::vector<std::pair<size_t, const Parameter*>> resources;
+
+		// An unattributed buffer takes the lowest index that no [[buffer(n)]] anywhere in the list
+		// claims and no earlier unattributed buffer took, not its position among them.
+		std::map<const Parameter*, uint32_t> implicitBufferIndices;
+		{
+			std::set<uint32_t> taken;
+			for (const Parameter& parameter: _entryPoint->parameters) {
+				if (parameter.attributes.bufferIndex) { taken.insert(*parameter.attributes.bufferIndex); }
+			}
+			uint32_t next = 0;
+			for (const Parameter* parameter: implicitlyBound) {
+				while (taken.count(next)) { ++next; }
+				if (next > 30) {
+					throw CompileError("no 'buffer' resource location is available for parameter \""
+						+ parameter->name + "\": every index up to 30 is taken");
+				}
+				implicitBufferIndices[parameter] = next;
+				taken.insert(next);
+			}
+		}
 
 		// Apple numbers the threadgroup arguments apart from the buffers: an explicit
 		// [[threadgroup(n)]] keeps n, and one without takes the lowest free index, in order.
@@ -9831,19 +9851,18 @@ namespace {
 				continue;
 			}
 
-			// An unbinding parameter takes the next index among the binding
-			// parameters, which is what Metal does.
+			// An unbinding parameter takes the lowest buffer index no attribute claims.
 			uint32_t bindingIndex = 0;
 			if (parameter.attributes.bufferIndex) {
 				bindingIndex = *parameter.attributes.bufferIndex;
 			} else {
-				const auto it = std::find(implicitlyBound.begin(), implicitlyBound.end(), &parameter);
-				if (it == implicitlyBound.end()) {
+				const auto it = implicitBufferIndices.find(&parameter);
+				if (it == implicitBufferIndices.end()) {
 					throw CompileError("parameter \"" + parameter.name + "\" has no [[buffer]], "
 						"[[texture]], [[sampler]] or builtin attribute, and no address space mslc "
 						"can bind, so there is nothing to bind it to");
 				}
-				bindingIndex = static_cast<uint32_t>(it - implicitlyBound.begin());
+				bindingIndex = it->second;
 			}
 
 		// A threadgroup pointer with no [[buffer]] is an argument of its own and was

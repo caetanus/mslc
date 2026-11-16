@@ -178,6 +178,24 @@ Refused, though Apple accepts it: a reference (`threadgroup T &`), an atomic or 
 the argument to a helper function, and pointer arithmetic on it (`p + 1`, `*(p + 1)`). Apple itself rejects a duplicate index, an index above 30, `[[buffer]]` together with
 `[[threadgroup]]`, an array-pointer pointee, and the argument in a vertex or fragment function.
 
+## Implicit buffer indices are the lowest free index (#379)
+
+An attribute-less `device`/`constant` buffer parameter takes the lowest `metal_index` that no
+`[[buffer(n)]]` in the parameter list claims and no earlier attribute-less buffer took, as Apple does
+(read from `air.location_index`; the same rule in kernel, vertex and fragment functions, with
+`[[stage_in]]`, textures and samplers numbered apart). Before, it took its position among the
+attribute-less buffers, so `(device float *out [[buffer(0)]], device float *in)` reflected `in` at 0
+where Apple binds 1. Only the reflection's `metal_index` changes; the SPIR-V, the `member` and the
+descriptors do not, because the buffers' members are numbered by parameter order. A consumer that
+bound such buffers by the old `metal_index` placed them where Apple code never reads them. A program
+needing an index above 30 is refused, as Apple refuses it.
+
+Checked against Apple by name over `tests/**/*.metal` (a capped sweep that stopped early, through
+`tests/probes/buffer_implicit_*`; `pp_macro_expansion_bomb_rejected.metal` makes Apple's compiler run
+away and is skipped): before the fix the only mismatches were the new `buffer_implicit_*` probes
+(8 buffers); after it, none. A byte-compare of reflection and SPIR-V over all `tests/**/*.metal`
+against the previous build changed only those probes.
+
 ## An anonymous enum's enumerator converts to a named enum (#261)
 
 `typedef enum { TA, TB } Anon; constant Mode km = TB;` (and the same through an
