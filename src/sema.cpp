@@ -6266,7 +6266,11 @@ namespace {
 			if (!deduceTemplateArguments(*candidate.declaration, *candidate.pattern, candidate.given, arguments, deduced)) {
 				continue;
 			}
-			candidates.push_back(&templateInstance(*candidate.declaration, std::move(deduced)).helper);
+			try {
+				candidates.push_back(&templateInstance(*candidate.declaration, std::move(deduced)).helper);
+			} catch (const SubstitutionFailure&) {
+				// The signature with these arguments is ill-formed (an enable_if): not a candidate.
+			}
 		}
 
 		std::vector<std::pair<HelperFunction*, std::vector<ConversionCost>>> viable;
@@ -6378,7 +6382,11 @@ namespace {
 			} else if (parameter.isType) {
 				argument.type.namedType = templateMarker(parameter);
 			} else if (parameter.hasDefault) {
-				argument = templateDefault(declaration, i, arguments);
+				try {
+					argument = templateDefault(declaration, i, arguments);
+				} catch (const SubstitutionFailure&) {
+					return nullptr;
+				}
 				if (!fitsTemplateConstant(parameter.kind, argument.value)) {
 					return nullptr;
 				}
@@ -6395,7 +6403,12 @@ namespace {
 		}
 		std::unique_ptr<FunctionDecl>& slot = _patterns[key];
 		if (!slot) {
-			slot = std::make_unique<FunctionDecl>(instantiateTemplate(declaration, arguments, false));
+			try {
+				slot = std::make_unique<FunctionDecl>(instantiateTemplate(declaration, arguments, false));
+			} catch (const SubstitutionFailure&) {
+				_patterns.erase(key);
+				return nullptr;
+			}
 		}
 		return slot.get();
 	}
@@ -6479,7 +6492,11 @@ namespace {
 				if (!parameter.hasDefault) {
 					return false;
 				}
-				deduced[j] = templateDefault(declaration, j, deduced);
+				try {
+					deduced[j] = templateDefault(declaration, j, deduced);
+				} catch (const SubstitutionFailure&) {
+					return false;
+				}
 			} else if (!parameter.isType && deduced[j].unbound) {
 				return false;
 			}

@@ -17,6 +17,14 @@ namespace mslc {
 // the emitter knows: a parameter is free to be called "position".
 bool isMSLBuiltinName(std::string_view name);
 
+// A template argument that makes a template's declaration ill-formed (an enable_if that is not
+// satisfied). During overload resolution it removes that template from the candidates, as in C++
+// (SFINAE); anywhere else it is an error like any other.
+class SubstitutionFailure: public CompileError {
+public:
+	using CompileError::CompileError;
+};
+
 // One instance of a function template as an ordinary helper: the template's tokens re-parsed
 // with the arguments bound, one per template parameter and in order. With withBody false only
 // the signature is read, so that a call can be ranked before an instance is committed to.
@@ -369,10 +377,15 @@ private:
 	void parseTemplateDeclaration();
 	void skipBalanced(TokenKind open, TokenKind close);
 	void skipFunctionAttribute();
-	// The <type_traits> predicates (is_same, is_floating_point ...), folded where the types are known.
+	// The <type_traits> subset (is_same, is_floating_point, enable_if, make_scalar ...), folded
+	// where the types are known.
 	void closeAngle(const char* what);
 	std::string libraryName(const std::string& resolved) const;
 	ExpressionPtr tryParseTraitValue();
+	void parseTraitType(const std::string& name, Type& type);
+	bool _noGreater = false;
+	bool _inEnableIf = false;
+	bool _dependentCondition = false;
 	size_t _functionOrder = 0;
 	void parseGlobalDeclaration();
 	VariableDeclaration parseGlobalDeclarator(VariableDeclaration declaration);

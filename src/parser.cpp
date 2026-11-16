@@ -1283,6 +1283,13 @@ FunctionDecl instantiateTemplate(const FunctionTemplate& declaration,
 	Parser parser(declaration.tokens);
 	try {
 		return parser.parseInstance(declaration, arguments, withBody);
+	} catch (const SubstitutionFailure& failure) {
+		// Only the signature is a substitution: a failure in the body, which a chosen instance reads, is an error.
+		if (!withBody) {
+			throw;
+		}
+		throw CompileError("in the function template \"" + declaration.name + "\" (declared at line "
+			+ std::to_string(declaration.line) + "), which a call instantiates: " + failure.what());
 	} catch (const CompileError& error) {
 		throw CompileError("in the function template \"" + declaration.name + "\" (declared at line "
 			+ std::to_string(declaration.line) + "), which a call instantiates: " + error.what());
@@ -1319,6 +1326,8 @@ TemplateArgument templateDefault(const FunctionTemplate& declaration, size_t ind
 		if (!parser.at(TokenKind::EndOfFile)) {
 			throw CompileError("unexpected \"" + std::string(parser.current().text) + "\"");
 		}
+	} catch (const SubstitutionFailure&) {
+		throw;
 	} catch (const CompileError& error) {
 		throw CompileError(what + " is not lowered: " + error.what());
 	}
@@ -1527,8 +1536,81 @@ ExpressionPtr Parser::tryParseTraitValue() {
 	auto expression = std::make_unique<Expression>();
 	expression->kind = ExpressionKind::BoolLiteral;
 	expression->line = startLine;
-	expression->boolValue = traitHolds(trait, operands, _unit);
+	try {
+		expression->boolValue = traitHolds(trait, operands, _unit);
+	} catch (const DependentTrait&) {
+		if (!_inEnableIf) {
+			throw;
+		}
+		_dependentCondition = true;
+		expression->boolValue = true;
+	}
 	return expression;
+}
+
+// enable_if, enable_if_t, make_scalar and make_scalar_t, the name consumed and "<" next.
+void Parser::parseTraitType(const std::string& name, Type& type) {
+	const bool alias = name.size() > 2 && name.compare(name.size() - 2, 2, "_t") == 0;
+	const bool enableIf = name.rfind("enable_if", 0) == 0;
+	expect(TokenKind::Less, ("after \"" + name + "\"").c_str());
+	Type result;
+	if (enableIf) {
+		const bool outerNoGreater = std::exchange(_noGreater, true);
+		const bool outerInside = std::exchange(_inEnableIf, true);
+		const bool outerDependent = std::exchange(_dependentCondition, false);
+		const ExpressionPtr condition = parseConditional();
+		_noGreater = outerNoGreater;
+		_inEnableIf = outerInside;
+		// A condition that names a type parameter being deduced holds for now: the instance's own
+		// signature is read again with the type, and that read decides.
+		const bool holds = _dependentCondition || evaluateConstant(*condition, false) != 0;
+		_dependentCondition = outerDependent;
+		result.scalar = ScalarKind::Void;
+		if (match(TokenKind::Comma)) {
+			result = parseType();
+		}
+		closeAngle(("to close \"" + name + "<\"").c_str());
+		if (!holds) {
+			throw SubstitutionFailure("enable_if is not satisfied");
+		}
+	} else {
+		const Type operand = parseType();
+		closeAngle(("to close \"" + name + "<\"").c_str());
+		if (isDeductionMarker(operand)) {
+			if (!_inEnableIf) {
+				throw DependentTrait("make_scalar depends on a type that is not deduced yet");
+			}
+			type = operand;
+			if (!alias) {
+				expect(TokenKind::ColonColon, ("after \"" + name + "<...>\"").c_str());
+				advance();
+			}
+			return;
+		}
+		if (operand.isPointer || operand.arrayLength || operand.resource != ResourceKind::None || operand.isAtomic
+			|| operand.addressSpace != AddressSpace::None) {
+			throw CompileError("make_scalar of a pointer, array, texture, sampler, atomic or address-space-qualified "
+				"type is not lowered");
+		}
+		result = operand;
+		result.isConst = false;
+		if (result.matrixColumns == 0 && result.namedType.empty() && result.enumName.empty()) {
+			result.vectorWidth = 0;
+			result.isPacked = false;
+		}
+	}
+	if (!alias) {
+		expect(TokenKind::ColonColon, ("after \"" + name + "<...>\"").c_str());
+		if (!atKeyword("type")) {
+			throw CompileError("expected \"type\" after \"" + name + "<...>::\"");
+		}
+		advance();
+	}
+	const Type qualifiers = type;
+	type = result;
+	type.isConst = type.isConst || qualifiers.isConst;
+	type.isConstexpr = qualifiers.isConstexpr;
+	type.addressSpace = qualifiers.addressSpace;
 }
 
 // "__attribute__((...))" ahead of a helper's return type, as METAL_FUNC expands to. The ones that
@@ -4084,9 +4166,8 @@ void Parser::parseDeclaratorStars(Type& type) {
 
 Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	Type type;
-	if (atKeyword("typename")) {
-		throw CompileError("a dependent type written with \"typename\" is not lowered");
-	}
+	const size_t typenameAt = _position;
+	bool traitType = false;
 
 	// MSL writes the address space and the const qualifier in either order, and
 	// both orders are ordinary: "device const float*" and "const device Vertex *"
@@ -4107,6 +4188,11 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 		}
 	}
 
+	// "typename" before a name only ever introduces a trait's type ("typename enable_if<C>::type").
+	const bool typenameKeyword = atKeyword("typename");
+	if (typenameKeyword) {
+		advance();
+	}
 	size_t nameTokens = 0;
 	std::string name;
 	if (kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) {
@@ -4117,8 +4203,18 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 			advance();
 		}
 	};
+	std::string library = name.empty() ? std::string() : libraryName(name);
+	traitType = (library == "enable_if" || library == "enable_if_t" || library == "make_scalar"
+		|| library == "make_scalar_t") && lookahead(nameTokens).kind == TokenKind::Less;
+	if (typenameKeyword && !traitType) {
+		_position = typenameAt;
+		throw CompileError("a dependent type written with \"typename\" is not lowered");
+	}
 
-	if (kind() == TokenKind::Identifier && current().text == "auto") {
+	if (traitType) {
+		consumeName();
+		parseTraitType(library, type);
+	} else if (kind() == TokenKind::Identifier && current().text == "auto") {
 		if (!allowAuto) {
 			throw CompileError("\"auto\" is only lowered for a local variable, where the initialiser gives the type");
 		}
@@ -5895,12 +5991,21 @@ ExpressionPtr Parser::parseEquality() {
 	return parseBinaryLevel([](Parser& p) { return p.parseRelational(); }, { { TokenKind::Equal, BinaryOperator::Equal }, { TokenKind::NotEqual, BinaryOperator::NotEqual } });
 }
 
+// Inside the angle brackets of a trait's argument a ">" closes the list, so it is no operator there
+// (C++ reads it the same way); a parenthesised operand is a fresh expression.
 ExpressionPtr Parser::parseRelational() {
+	if (_noGreater) {
+		return parseBinaryLevel([](Parser& p) { return p.parseShift(); }, { { TokenKind::Less, BinaryOperator::Less },
+			{ TokenKind::LessEqual, BinaryOperator::LessEqual }, { TokenKind::GreaterEqual, BinaryOperator::GreaterEqual } });
+	}
 	return parseBinaryLevel([](Parser& p) { return p.parseShift(); }, { { TokenKind::Less, BinaryOperator::Less }, { TokenKind::LessEqual, BinaryOperator::LessEqual },
 		  { TokenKind::Greater, BinaryOperator::Greater }, { TokenKind::GreaterEqual, BinaryOperator::GreaterEqual } });
 }
 
 ExpressionPtr Parser::parseShift() {
+	if (_noGreater) {
+		return parseBinaryLevel([](Parser& p) { return p.parseAdditive(); }, { { TokenKind::ShiftLeft, BinaryOperator::ShiftLeft } });
+	}
 	return parseBinaryLevel([](Parser& p) { return p.parseAdditive(); }, { { TokenKind::ShiftLeft, BinaryOperator::ShiftLeft }, { TokenKind::ShiftRight, BinaryOperator::ShiftRight } });
 }
 
@@ -5960,6 +6065,12 @@ ExpressionPtr Parser::parseSizeof() {
 				expression->line = startLine;
 				expression->intKind = ScalarKind::ULong;
 				expression->isSizeof = true;
+				if (isDeductionMarker(type) && !type.isPointer && _inEnableIf) {
+					// An enable_if condition read before T is deduced: the read with T decides.
+					_dependentCondition = true;
+					expression->intValue = 1;
+					return expression;
+				}
 				expression->intValue = sizeofType(type, _unit);
 				return expression;
 			}
@@ -6450,7 +6561,9 @@ ExpressionPtr Parser::parsePrimary() {
 
 	if (at(TokenKind::LParen)) {
 		advance();
+		const bool outerNoGreater = std::exchange(_noGreater, false);
 		auto expression = parseExpression();
+		_noGreater = outerNoGreater;
 		expect(TokenKind::RParen, "to close a parenthesised expression");
 		return expression;
 	}

@@ -7,7 +7,7 @@
 // DISASM: %int_86 = OpConstant %int 86
 // DISASM: %int_90 = OpConstant %int 90
 // DISASM: %int_128 = OpConstant %int 128
-// DISASM: %int_213 = OpConstant %int 213
+// DISASM: %int_245 = OpConstant %int 245
 // DISASM: %int_777 = OpConstant %int 777
 // DISASM: %int_555 = OpConstant %int 555
 // DISASM: %int_333 = OpConstant %int 333
@@ -47,7 +47,7 @@ constant int k_packed_float3 = CODE(packed_float3);
 constant int k_constfloat = CODE(const float);
 constant int kSame = (is_same<float, float>::value ? 1 : 0) + (is_same<float, float3>::value ? 2 : 0)
 	+ (is_same<float3, float3>::value ? 4 : 0) + (is_same<const float, float>::value ? 8 : 0)
-	+ (is_const<const float>::value ? 16 : 0)
+	+ (is_const<const float>::value ? 16 : 0) + (is_same<make_scalar_t<float3>, float>::value ? 32 : 0)
 	+ (is_same_v<S, S> ? 64 : 0) + (is_enum<En>::value ? 128 : 0);
 constant int kEnumScalar = is_scalar<En>::value ? 777 : 888;
 constant int kBoolUnsigned = is_unsigned<bool>::value ? 555 : 666;

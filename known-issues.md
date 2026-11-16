@@ -524,6 +524,27 @@ measured with `xcrun metal` and `mslc` on the same source.
 - `one(ds[0].a)` for a `device` buffer `ds` (x14): Apple says "no matching function" (cannot bind a reference
   in address space 'device'); mslc says the argument is not a variable of this function.
 
+## enable_if defaults and type traits (#341, slice 3)
+
+- Folded, measured against Apple: `is_same`, `is_floating_point`, `is_integral`, `is_arithmetic`, `is_signed`,
+  `is_unsigned`, `is_scalar`, `is_vector`, `is_class`, `is_enum`, `is_const` (as `::value` or `_v`) and the types
+  `enable_if`, `enable_if_t`, `make_scalar`, `make_scalar_t`. Metal's traits differ from C++'s (a vector is
+  floating point, integral, signed or unsigned by its element; a matrix is only a class). Any other `is_*<...>`,
+  `is_convertible` included, and a trait of a pointer, array, texture, sampler, atomic or address-space type
+  is a diagnostic.
+- An unsatisfied `enable_if` in a default, a return type or a parameter drops the template from the call's
+  candidates. A condition that names a type parameter still being deduced is assumed satisfied while the
+  signature is read for deduction and decided when it is read again with the type.
+- Refused: `enable_if` as a non-type parameter's type (`typename enable_if<C, int>::type = 0`), as a
+  statement-level local's type (`enable_if_t<C, int> y = 1;`), and a non-type default that reads a type
+  parameter (`bool B = is_same<T, float>::value`), which is evaluated before the type is deduced.
+- Not diagnosed (mslc is more lenient than Apple, no wrong value): two templates of one name and signature
+  that differ only in their defaults, or a default repeated on a redeclaration (Apple: "template parameter
+  redefines default argument"); an `enable_if<false>` or an undeclared trait in a template that is never
+  instantiated (Apple rejects it at the definition).
+- A function attribute ahead of a helper's return type is dropped for `always_inline`, `noinline`, `unused` and
+  `used` (METAL_FUNC) and refused for any other; it is read in that position only.
+
 ## Function template instantiation: what is refused or approximated (#341, slice 2)
 
 Each of these is a diagnostic, not a silent pick, except where it says "approximated".
@@ -543,7 +564,7 @@ Each of these is a diagnostic, not a silent pick, except where it says "approxim
   anywhere else either.
 - Deduction from an enum, from a pointer that is not a local array, and from a texture is refused.
 - Not lowered: `vec<T, N>` and other template-id types in a signature, `typename T::type`, trailing return
-  types, default function arguments, enum-typed non-type parameters, `enable_if` defaults (slice 3).
+  types, default function arguments, enum-typed non-type parameters.
 - A constant used in a function body above its declaration (`float g() { return K; } constant float K = 5.0f;`)
   is accepted for a plain helper and for an instance, where Apple reports an undeclared identifier. This is
   older than templates (the file-scope constants a function sees are not limited to the ones above it).
