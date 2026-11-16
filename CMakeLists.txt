@@ -53,6 +53,13 @@ target_link_libraries(mslc-builder-test PRIVATE mslc)
 add_test(NAME api/spirv-builder COMMAND mslc-builder-test)
 
 find_program(PYTHON3 python3)
+add_executable(mslc-locale-test tests/locale_api.cpp)
+target_include_directories(mslc-locale-test PRIVATE src)
+target_link_libraries(mslc-locale-test PRIVATE mslc)
+add_test(NAME api/locale COMMAND ${PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_locale.py
+	$<TARGET_FILE:mslc-locale-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/locale_floats.metal)
+set_tests_properties(api/locale PROPERTIES SKIP_RETURN_CODE 77)
+
 add_test(NAME tools/check-ids-multiword-entry-name
 	COMMAND ${PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ids_test.py $<TARGET_FILE:mslc-cli>
 		${CMAKE_CURRENT_SOURCE_DIR}/tools/check_ids.py

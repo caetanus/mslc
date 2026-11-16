@@ -1,4 +1,5 @@
 #include "lexer.h"
+#include "numeric_locale.h"
 
 #include <cctype>
 #include <cstdlib>
@@ -425,7 +426,7 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 
 			if (isFloat) {
 				token.kind = TokenKind::FloatLiteral;
-				token.floatValue = std::strtod(std::string(token.text).c_str(), nullptr);
+				token.floatValue = parseFloatLiteral(std::string(token.text).c_str());
 			} else {
 				token.kind = TokenKind::IntegerLiteral;
 				readInteger(token);

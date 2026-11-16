@@ -1,5 +1,13 @@
 # Known issues
 
+## Process locale (fixed)
+
+Float literal conversion uses a private C numeric locale; embedded callers may adopt
+a comma-decimal process locale without changing shader constants. Sampler LOD reflection
+numbers also use the classic locale, including when the caller changes the global C++
+locale. Neither path changes the caller's locale. Hexadecimal floating literals remain
+unsupported by the lexer on this branch; the conversion itself retains C `strtod` semantics.
+
 ## Vexing parse: unused function-looking declarations are rejected, `v(1.0)` calls are not modelled (#356)
 
 `float3 v(float(a));` declares a function in C++ and in Apple's compiler, so a later `v.x` or

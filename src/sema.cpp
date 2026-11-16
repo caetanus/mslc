@@ -9,6 +9,9 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <iomanip>
+#include <locale>
+#include <sstream>
 #include <set>
 
 namespace mslc {
@@ -10056,11 +10059,12 @@ namespace {
 		_reflection += "\t\t\t\t" + entry + "\n";
 	}
 
-	// A lod_clamp bound as a JSON number: the shortest decimal form of the float.
+	// A lod_clamp bound as a JSON number with nine significant digits.
 	static std::string lodNumber(float value) {
-		char text[32];
-		std::snprintf(text, sizeof text, "%.9g", static_cast<double>(value));
-		return text;
+		std::ostringstream text;
+		text.imbue(std::locale::classic());
+		text << std::setprecision(9) << static_cast<double>(value);
+		return text.str();
 	}
 
 	std::string Emitter::descriptorJson(uint32_t binding) const {
