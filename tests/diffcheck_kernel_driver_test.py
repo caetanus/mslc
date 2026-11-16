@@ -43,7 +43,7 @@ def mutated(path, edits):
     return run(path, mslc_cmd=MUTATE, env=env)
 
 
-BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "sampler_modes", "layout_unread_member", "ulp_per_buffer")
+BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "sampler_modes", "layout_unread_member", "ulp_per_buffer", "threadgroup_argument")
 # (probe, edits, expected status): each is a change a real compiler bug could make.
 MUTANTS = [
     # texture: the x and y of a texel fetch swapped
@@ -65,6 +65,12 @@ MUTANTS = [
     ("texture_read", [[r"OpDecorate (%\w+) ArrayStride 16", r"OpDecorate \1 ArrayStride 32"]], "reflection-mismatch"),
     # per-buffer ULP: an exactly rounded result off by one ULP in a file with an inexact builtin
     ("ulp_per_buffer", [[r"OpConstant %float 3$", "OpConstant %float 3.0000002"]], "mismatched"),
+    # threadgroup argument: the spec constant that sizes the first argument's array is no longer the id the reflection names
+    ("threadgroup_argument", [[r"SpecId 3$", "SpecId 9"]], "mismatched"),
+    # threadgroup argument: a thread reads the wrong neighbour's slot
+    ("threadgroup_argument", [[r"(OpIAdd %uint %\d+) %uint_1$", r"\1 %uint_3"]], "mismatched"),
+    # threadgroup argument: the memory is per invocation (Private) and not shared by the group
+    ("threadgroup_argument", [[r"(OpTypePointer) Workgroup", r"\1 Private"], [r"(OpVariable %\S+) Workgroup", r"\1 Private"]], "mismatched"),
 ]
 
 rc, out, data = run(probe("texture_read"))
@@ -87,7 +93,7 @@ with tempfile.TemporaryDirectory() as d:
     loose = os.path.join(d, "ulp_loose.metal")
     with open(probe("ulp_per_buffer")) as src, open(loose, "w") as dst:
         dst.write("".join(l for l in src if "DIFFCHECK-ULP" not in l))
-    rc, out, data = mutated(loose, MUTANTS[-1][1])
+    rc, out, data = mutated(loose, next(edits for name, edits, _ in MUTANTS if name == "ulp_per_buffer"))
     assert rc == 0 and data["status"] == "matched", ("the bound is no longer file-wide", rc, out)
 
 # A texture the output does not depend on fails unless declared; a written texture and an unknown name are refused.
