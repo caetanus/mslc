@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // constexpr int m = ::n reads the file-scope n even though a runtime local n hides it.
 #include <metal_stdlib>
 using namespace metal;

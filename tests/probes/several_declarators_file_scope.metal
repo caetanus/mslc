@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: OpFAdd
 // Each file-scope declarator takes its own initialiser and sees the ones before it;
 // the qualifiers are shared. clang C++ reference semantics (no Apple toolchain here).

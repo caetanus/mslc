@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: OpTypeArray %_arr_v2float_uint_2 %uint_2
 // thread on an array of arrays of vectors and on an array of structs.
 struct Pair { float x; int y; };

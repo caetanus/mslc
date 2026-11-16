@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // uchar b[1] = {::n}: the file-scope n (3) is a constant that fits, though a runtime local n hides the name.
 #include <metal_stdlib>
 using namespace metal;

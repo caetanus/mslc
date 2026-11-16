@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM: OpConstant %ulong 48
 // DISASM: OpConstant %ulong 16
 // DISASM-MATCH: OpIAdd %ulong %ulong_16 %[0-9]+
